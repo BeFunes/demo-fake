@@ -13,7 +13,6 @@ jobs:
           root: ~/project
           paths:
             - node_modules
-
   test:
     docker:
       - image: cimg/node:17.9.1
@@ -23,7 +22,7 @@ jobs:
           at: ~/project
       - run:
           name: Run tests
-          command: npm test
+          command: npm tests
       - store_test_results:
           path: junit.xml
 
@@ -48,15 +47,9 @@ workflows:
   install-and-test:
     jobs:
       - install
-      - install
-      - install
-      - approve:
-          type: approval
-          requires:
-            - install
       - test:
           requires:
-            - approve
-      - store-artifacts:
-          requires:
-            - approve
+            - install
+      # - store-artifacts:
+      #     requires:
+      #       - install
