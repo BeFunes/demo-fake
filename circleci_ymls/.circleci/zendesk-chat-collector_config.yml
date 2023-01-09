@@ -1,0 +1,31 @@
+version: 2
+jobs:
+  analyze:
+    docker:
+      - image: circleci/node:10.13.0-stretch
+    steps:
+      - checkout
+      - run:
+          name: DECODE Google Spreadsheet Token
+          command: |
+            echo $GOOGLE_CREDENTIALS | base64 --decode | sed -e 's/\\//g' > credentials.json
+            echo $GOOGLE_TOKEN_JSON | base64 --decode | sed -e 's/\\//g' > token.json
+      - run:
+          command: |
+            yarn install && yarn start
+
+workflows:
+  version: 2
+  # build_and_test:
+  #   jobs:
+  #     - analyze
+  nightly:
+    triggers:
+      - schedule:
+          cron: "0 0 1 * *"
+          filters:
+            branches:
+              only:
+                - master
+    jobs:
+      - analyze

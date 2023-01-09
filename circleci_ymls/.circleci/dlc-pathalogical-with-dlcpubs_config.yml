@@ -1,0 +1,46 @@
+version: 2.1
+
+# the dlcpubs stuff is implemented as an inline orb
+orbs:
+  dlcpubs:
+    commands:
+      setup:
+        steps:
+          - run:
+              name: "Setup DLCPUBS"
+              command: |
+                # install the plugin
+                cd /tmp
+                curl https://storage.googleapis.com/cogs-dlcpubs-dist/26f1e63e-2590-4922-9551-8213cf9d5d11/dlcpubs-dist.tar.gz | tar -zxvf -
+                cd dlcpubs-dist/plugin
+                sudo mkdir /mnt/volumes
+                sudo docker plugin create dlcpubs .
+                sudo docker plugin enable dlcpubs
+
+                # stop the current docker
+                sudo /etc/init.d/docker stop
+
+                # download the current files we manually preserve between runs
+                sudo -E /tmp/dlcpubs-dist/dlcpubs-setup
+
+                # reconfigure dockerd to run dlcpubs and restart
+                sudo -E -- bash -c 'echo "{\"experimental\":true,\"storage-driver\":\"dlcpubs\",\"storage-opts\":[\"debug=$CIRCLECI_DLCPUBS_DEBUG\",\"bucket=$CIRCLECI_BUCKET_NAME\",\"creds=$CIRCLECI_BUCKET_CREDENTIALS\"]}" > /etc/docker/daemon.json'
+                sudo /etc/init.d/docker start
+      teardown:
+        steps:
+          - run:
+              name: "Teardown DLCPUBS"
+              command: |
+                sudo -E /tmp/dlcpubs-dist/dlcpubs-teardown
+
+# here's the main code.  It's really basic as all the logic is in the orb
+jobs:
+  build:
+    machine:
+      image: circleci/classic:latest
+
+    steps:
+      - dlcpubs/setup
+      - checkout
+      - run: docker build .
+      - dlcpubs/teardown

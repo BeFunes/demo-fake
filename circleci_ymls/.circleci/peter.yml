@@ -1,0 +1,32 @@
+version: 2.1
+ 
+orbs:
+  ccinode: circleci/node@5
+ 
+jobs:
+  some_kind_of_test:
+    description: |
+      Probably irrelevant to this situation.
+    executor:
+      name: ccinode/default
+    steps:
+      - ccinode/install-packages
+ 
+workflows:
+  build:
+    jobs:
+      - ccinode/run:
+          name: 'Build'
+          npm-run: 'build'
+      - some_kind_of_test:
+          requires:
+            - Compile
+          name: 'Other Test'
+      - ccinode/test:
+          requires:
+            - Compile
+          name: 'Unit Tests'
+          test-results-for: 'jest'
+          version: '16.18.0'
+
+# VS Code Extension Version: 1.4.0

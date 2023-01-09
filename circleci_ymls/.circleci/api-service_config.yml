@@ -1,0 +1,297 @@
+version: 2.1
+
+orbs:
+  scotty: cci-releng/scotty-orb@0.0.2
+
+references:
+  defaults: &defaults
+    docker:
+      - image: clojure:lein-2.8.1
+      - image: rabbitmq:3.8.9-management-alpine
+    working_directory: ~/api-service
+
+  ccc_image: &ccc_image circleci/command-convenience:0.1
+
+jobs:
+  install_dependencies:
+    <<: *defaults
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v2-jars-{{ checksum "project.clj" }}
+            - v2-jars-
+      - run:
+          command: lein deps
+      - save_cache:
+          key: v2-jars-{{ checksum "project.clj" }}
+          paths:
+            - /root/.m2
+
+  check:
+    <<: *defaults
+    steps:
+      - checkout
+      - run:
+          name: Making sure we do not spit PII accidentally
+          command: scripts/piifind -p "billing-detail|billingDetail|account-detail|accountDetail" .
+      - restore_cache:
+          keys:
+            - v2-jars-{{ checksum "project.clj" }}
+            - v2-jars-
+      - run:
+          name: Check for compile errors
+          command: lein check
+
+      - run:
+          name: Check schema documentation
+          command: lein run -m circleci.api-service.validation
+
+      - run:
+          name: Check for blacklisted NS
+          command: lein blacklist
+
+      - run:
+          name: Pedantic Abort
+          command: |
+            lein update-in : assoc :pedantic? :abort -- deps :tree
+
+  test:
+    <<: *defaults
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - v2-jars-{{ checksum "project.clj" }}
+            - v2-jars-
+
+      - run:
+          name: Run tests
+          command: lein test --plugin profiling --plugin junit-xml --junit-xml-file target/test-results/results.xml
+
+      - store_test_results:
+          path: target/test-results
+
+  coverage:
+    <<: *defaults
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - v2-jars-{{ checksum "project.clj" }}
+            - v2-jars-
+
+      - run:
+          name: Run code coverage
+          command: |
+            set -x
+            lein test \
+              --plugin cloverage \
+              --cov-ns-exclude-regex dev \
+              --cov-ns-exclude-regex user
+
+      - store_artifacts:
+          path: target/coverage
+
+  build:
+    <<: *defaults
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v2-jars-{{ checksum "project.clj" }}
+            - v2-jars-
+      - run:
+          name: Generate Docs
+          command: lein run -m circleci.api-service.docs
+      - store_artifacts:
+          path: index.html
+      - run:
+          command: |
+            LEIN_SNAPSHOTS_IN_RELEASE=true lein uberjar
+      - run:
+          command: |
+            mkdir deploy
+            cp target/api-service-*-standalone.jar deploy/api-service-standalone.jar
+      - persist_to_workspace:
+          root: .
+          paths:
+            - deploy/api-service-standalone.jar
+
+  test-container-build:
+    working_directory: ~/api-service
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: api-service
+          CONTAINER_ORG: circleci
+          DEPLOY_CLOJURE_JARFILE: deploy/api-service-standalone.jar
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run:
+          name: Dry publish docker image for Twistlock scanning
+          command: publish
+          environment:
+            DOCKER_REGISTRY: none
+      - store_artifacts:
+          path: ccc-image-scan-results
+
+  publish:
+    working_directory: /root/api-service
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: api-service
+          DOCKER_REGISTRY: all
+          DOCKER_EXPOSE_PORTS: "80 443 8585 6010"
+          DEPLOY_CLOJURE_JARFILE: deploy/api-service-standalone.jar
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run: publish
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.tag
+
+  deploy:
+    working_directory: /root/api-service
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: api-service
+          VALUES_FILE: /root/api-service/circle-helm-charts/production/values.yml
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run: deploy
+
+  canary:
+    working_directory: /root/api-service
+    environment:
+      ROLLBAR_ENVIRONMENT: canary
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: api-service
+          DOCKER_REGISTRY: all
+          DOCKER_EXPOSE_PORTS: "80 443 8585 6010"
+          DEPLOY_CLOJURE_JARFILE: deploy/api-service-standalone.jar
+          RELEASE_VERSION: v1-canary
+          VALUES_FILE: canary.yml
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run: /deploy/merge-values circle-helm-charts/production/values.yml circle-helm-charts/production/canary-override.yml > canary.yml
+      - setup_remote_docker
+      - run: publish
+      - run: deploy
+
+workflows:
+  version: 2
+  weekly-scheduled-deploy:
+    when:
+      and:
+        - equal: [scheduled_pipeline, << pipeline.trigger_source >>]
+        - equal: ["deploy-weekly", << pipeline.schedule.name >>]
+    jobs:
+      - install_dependencies
+      - build:
+          requires:
+            - install_dependencies
+      - test:
+          requires:
+            - install_dependencies
+      - coverage:
+          requires:
+            - install_dependencies
+      - check:
+          requires:
+            - install_dependencies
+      - test-container-build:
+          context: org-global
+          requires:
+            - build
+            - test
+            - check
+  build_test_deploy:
+    jobs:
+      - install_dependencies
+      - test:
+          requires:
+            - install_dependencies
+      - coverage:
+          requires:
+            - install_dependencies
+      - check:
+          requires:
+            - install_dependencies
+      - build:
+          requires:
+            - install_dependencies
+      - test-container-build:
+          context: org-global
+          requires:
+            - build
+          filters:
+            branches:
+              ignore:
+                - master
+                - /^server-\d\..+/
+      - publish:
+          context: org-global
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-\d\..+/
+          requires:
+            - check
+            - test
+            - coverage
+            - build
+      - deploy:
+          context: org-global
+          requires:
+            - publish
+          filters:
+            branches:
+              only: master
+      - scotty/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          promotion_component_list: "circleci/api-service"
+          requires:
+            - publish
+      - canary:
+          context: org-global
+          filters:
+            branches:
+              only: canary
+          requires:
+            - check
+            - test
+            - coverage
+            - build

@@ -1,0 +1,88 @@
+version: 2.1
+
+workflows:
+  main-workflow:
+    jobs:
+      - lint:
+          context: github-readonly
+      - test:
+          context: github-readonly
+      - build:
+          context: github-readonly
+
+executors:
+  default:
+    macos:
+      xcode: &macimage "13.3.1"
+
+jobs:
+  lint:
+    macos:
+      xcode: *macimage
+    resource_class: macos.x86.medium.gen2
+    environment:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+    steps:
+      - setup
+      - run:
+          name: generate
+          command: ./do generate
+      - run:
+          name: go tidy
+          command: ./do go-mod-tidy
+      - run:
+          name: verify no changes
+          command: git diff --ignore-matching-lines='Generated on ' --exit-code
+      - run: ./do lint-report
+      - store_results
+
+  build:
+    macos:
+      xcode: *macimage
+    resource_class: large
+    environment:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+    steps:
+      - setup
+      - run: ./do generate
+      - run: ./do build
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target
+
+  test:
+    macos:
+      xcode: *macimage
+    resource_class: macos.x86.medium.gen2
+    environment:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+    steps:
+      - setup
+      - run:
+          name: run tests
+          command: ./do test ./...
+      - store_results
+
+commands:
+  setup:
+    steps:
+      - run: git config --global url."https://$GITHUB_USER:$GITHUB_TOKEN@github.com/circleci/".insteadOf "https://github.com/circleci/"
+      - checkout
+      - run: brew install go@1.18
+      - run: go mod download
+      - run: ./do install-devtools
+
+  store_results:
+    steps:
+      - run:
+          name: Strip ANSI codes from xunit output
+          when: always
+          command: |
+            # The test output produces ANSI codes, which the XML writer converts into annoying
+            # \0xfffd characters - we'll strip these out to make the XML a bit more readable
+            sed -i 's/�\[[0-9;]*[a-zA-Z]//g' test-reports/*.xml || true
+      - store_artifacts:
+          path: test-reports
+      - store_test_results:
+          path: test-reports

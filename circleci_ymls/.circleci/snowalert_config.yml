@@ -1,0 +1,57 @@
+version: 2.1
+
+references:
+  project: &project snowalert
+  dir: &dir ~/snowalert
+  ccc-job: &ccc-job
+
+executors:
+  ccc:
+    working_directory: *dir
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: *project
+          DOCKER_REGISTRY: ecr
+          NAMESPACE: data
+          DOCKERFILE_PATH: "./Dockerfile"
+          DEPLOY_CONTAINER_NAME: "183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/snowalert"
+
+commands:
+  publish:
+    description: Run cci publish to building and push the docker container.
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: publish
+      - store_artifacts:
+          path: ccc-image-scan-results
+
+jobs:
+  publish-branch:
+    executor: ccc
+    steps:
+      - publish
+  publish-latest:
+    executor: ccc
+    steps:
+      - publish
+    environment:
+      CONTAINER_VERSION: latest
+
+workflows:
+  commit:
+    jobs:
+      # staging and dev deploy
+      - publish-branch:
+          context: org-global
+      # prod deploy
+      - publish-latest:
+          context: org-global
+          filters:
+            branches:
+              only:
+                - master

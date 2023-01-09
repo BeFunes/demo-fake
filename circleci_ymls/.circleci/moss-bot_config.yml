@@ -1,0 +1,84 @@
+version: 2.1
+
+orbs:
+  codecov: codecov/codecov@3.2.2
+
+jobs:
+  publish-and-deploy-service:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: moss-bot
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: all
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/moss-bot
+          VALUES_FILE: k8s-values.yaml
+          NAMESPACE: sre
+          TWISTLOCK_ENFORCE: false
+    working_directory: ~/moss-bot
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: publish
+      - run: deploy
+  prisma-scan:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: moss-bot
+          DOCKERFILE_PATH: Dockerfile
+    working_directory: ~/moss-bot
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: scan
+  unittest:
+    machine:
+      image: ubuntu-2004:202010-01
+    steps:
+      - checkout
+      - run:
+          name: Unit Test
+          command: |
+            make test
+      - codecov/upload:
+          file: coverage.xml
+
+workflows:
+  version: 2
+  test-publish-deploy:
+    jobs:
+      - unittest:
+          context: moss-bot
+      - prisma-scan:
+          context: org-global
+      - publish-and-deploy-service:
+          context: org-global
+          filters:
+            branches:
+              only: master
+          requires:
+            - unittest
+
+  weekly-rebuild:
+    jobs:
+      - unittest:
+          context: moss-bot
+      - publish-and-deploy-service:
+          context: org-global
+          requires:
+            - unittest
+    triggers:
+      - schedule:
+          cron: "0 2 * * 1" # Every Monday at 2am
+          filters:
+            branches:
+              only:
+                - master

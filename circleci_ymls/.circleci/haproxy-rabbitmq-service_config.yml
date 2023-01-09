@@ -1,0 +1,82 @@
+version: 2.1
+
+executors:
+  default:
+    docker:
+      - image: "183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/helm-deployerer:0.1"
+        aws_auth:
+          aws_access_key_id: $ECR_AWS_ACCESS_KEY_ID
+          aws_secret_access_key: $ECR_AWS_SECRET_ACCESS_KEY
+
+commands:
+  deploy:
+    parameters:
+      release_name:
+        type: string
+      dry_run:
+        type: boolean
+        default: false
+      helm_args:
+        type: string
+    steps:
+      - run:
+          name: deploy
+          command: |
+            HELM_CHART="./" \
+            NAMESPACE="sre" \
+            RELEASE_NAME="<< parameters.release_name >>" \
+            DRY_RUN="<< parameters.dry_run >>" \
+            HELM_ARGS='{<< parameters.helm_args >>}' \
+            deploy
+
+jobs:
+  deploy-prod:
+    executor: default
+    steps:
+      - checkout
+      - deploy:
+          release_name: "rabbit-prod-external"
+          helm_args: '"config.backendHostname": "rabbit-prod-rabbitmq-ha-discovery.sre.svc.cluster.local"'
+
+  deploy-dev:
+    executor: default
+    steps:
+      - checkout
+      - deploy:
+          release_name: "rabbit-dev-external"
+          helm_args: '"config.backendHostname": "rabbit-dev-rabbitmq-ha-discovery.sre.svc.cluster.local"'
+
+  dry-run:
+    executor: default
+    steps:
+      - checkout
+      - deploy:
+          release_name: "rabbit-dev-external"
+          helm_args: '"config.backendHostname": "rabbit-dev-rabbitmq-ha-discovery.sre.svc.cluster.local"'
+          dry_run: true
+      - store_artifacts:
+          path: /tmp/package
+
+workflows:
+  version: 2
+  install-haproxy-service:
+    jobs:
+      - deploy-prod:
+          context: org-global
+          filters:
+            branches:
+              only: master
+
+      - deploy-dev:
+          context: org-global
+          filters:
+            branches:
+              only: deploy-dev
+
+      - dry-run:
+          context: org-global
+          filters:
+            branches:
+              ignore: 
+                - deploy-dev
+                - master

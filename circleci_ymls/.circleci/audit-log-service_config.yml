@@ -1,0 +1,176 @@
+version: 2.1
+
+orbs:
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+
+references:
+  ccc-image: &ccc-image
+    circleci/command-convenience:0.1
+
+
+jobs:
+  build-and-test:
+    docker:
+      - image: circleci/clojure-service:0.7-dev
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+      - image: rabbitmq:3.6
+        name: rabbitmq
+    steps:
+      - checkout
+      - restore_cache:
+          key: audit-log-service-{{ checksum "project.clj" }}
+      - run: lein cljfmt check
+      - run: lein test
+      - save_cache:
+          paths:
+            - ~/.m2
+            - ~/.lein
+          key: audit-log-service-{{ checksum "project.clj" }}
+      - store_test_results:
+          path: target/test-results
+      - store_artifacts:
+          path: target/coverage
+      - run:
+          name: Upload Coverage Results
+          command: codecov-upload
+      - run:
+          name: Build the uberjar
+          command: |
+            lein uberjar
+            mv -v target/uberjar/audit-log-service*-standalone.jar target/uberjar/audit-log-service-standalone.jar
+          environment:
+            LEIN_SNAPSHOTS_IN_RELEASE: "true"
+      - persist_to_workspace:
+          root: .
+          paths:
+            - "target/uberjar/audit-log-service-standalone.jar"
+
+  test-container-build:
+    docker:
+      - image: *ccc-image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: audit-log-service
+          DOCKER_REGISTRY: none
+          DEPLOY_CLOJURE_JARFILE: "target/uberjar/audit-log-service-standalone.jar"
+    working_directory: /root/audit-log-service
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /root/audit-log-service
+      - setup_remote_docker
+      - run: publish
+
+  publish:
+    docker:
+      - image: *ccc-image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: audit-log-service
+          DEPLOY_CLOJURE_JARFILE: "target/uberjar/audit-log-service-standalone.jar"
+          DOCKER_REGISTRY: all
+    working_directory: /root/audit-log-service
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: /root/audit-log-service
+      - run: publish
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.tag
+
+  deploy:
+    docker:
+      - image: *ccc-image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: audit-log-service
+          VALUES_FILE: kubernetes.yaml
+    working_directory: /root/audit-log-service
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: /root/audit-log-service
+      - run: deploy
+
+  deploy-canary:
+    docker:
+      - image: *ccc-image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: audit-log-service
+          VALUES_FILE: canary.yaml
+          RELEASE_VERSION: canary
+    working_directory: /root/audit-log-service
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: /root/audit-log-service
+      - run: /deploy/merge-values kubernetes.yaml canary-overrides.yaml > canary.yaml
+      - run: deploy
+
+workflows:
+  version: 2
+  build-test-publish-deploy:
+    jobs:
+      - build-and-test:
+          context: org-global
+      - test-container-build:
+          requires:
+            - build-and-test
+          context: org-global
+          filters:
+            branches:
+              ignore:
+                - main
+                - canary
+      - publish:
+          requires:
+            - build-and-test
+          context: org-global
+          filters:
+            branches:
+              only:
+                - main
+                - canary
+                - /^server-\d\..+/
+      - deploy:
+          requires:
+            - publish
+          context: org-global
+          filters:
+            branches:
+              only:
+                - main
+      - deploy-canary:
+          requires:
+            - publish
+          context: org-global
+          filters:
+            branches:
+              only: canary
+      - scotty-orb/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          promotion_component_list: "circleci/audit-log-service"
+          requires:
+            - publish
+          filters:
+            branches:
+              only:
+                - main  
+                - /^server-\d\..+/

@@ -1,0 +1,15 @@
+version: 2
+
+workflows:
+  version: 2
+  test:
+    jobs:
+      - check-links
+
+jobs:
+  check-links:
+    docker:
+      - image: raviqqe/liche:0.1.1
+    steps:
+      - checkout
+      - run: /liche -r -d. -x '(^https?:\/\/)|(\.repl)' .

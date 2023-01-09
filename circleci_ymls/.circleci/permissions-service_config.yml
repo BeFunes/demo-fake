@@ -1,0 +1,448 @@
+version: 2.1
+
+orbs:
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+
+references:
+  docker_images: &docker_images
+    - image: circleci/clojure-service:0.8-dev
+      auth:
+        username: $DOCKER_HUB_USER
+        password: $DOCKER_HUB_PASSWORD
+    - image: postgres:12.4-alpine
+      environment:
+        POSTGRES_USER: root
+        POSTGRES_HOST_AUTH_METHOD: trust
+
+  working_directory: &working_directory
+    working_directory: ~/permissions-service
+
+  ccc_image: &ccc_image
+    image: circleci/command-convenience:0.1
+    auth:
+      username: $DOCKER_HUB_USER
+      password: $DOCKER_HUB_PASSWORD
+
+jobs:
+  test-service:
+    docker: *docker_images
+
+    <<: *working_directory
+
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - v1-jars-{{ checksum "service/project.clj" }}
+            - v1-jars-
+
+      - run:
+          name: Run migrations
+          command: ./db-migrator/dev/run_flyway.sh ./db-migrator migrate
+          environment:
+            DATABASE_HOST: localhost
+            DATABASE_NAME: root
+            DATABASE_USER: root
+            DATABASE_SCHEMAS: permissions
+
+      - run:
+          name: Test service
+          working_directory: service
+          command: lein test
+          environment:
+            ENV: :test
+            DB__PASSWORD: ""
+            DB__PORT_NUMBER: 5432
+            DB__USERNAME: root
+            DB__JDBC_URL: "jdbc:postgresql://localhost:5432/root?currentSchema=permissions"
+
+      - store_test_results:
+          path: service/target/test-results
+
+      - run: cd service && lein uberjar
+
+      - save_cache:
+          key: v1-jars-{{ checksum "service/project.clj" }}
+          paths:
+            - ~/.m2
+
+      - persist_to_workspace:
+          root: service/target
+          paths:
+            - uberjar
+
+  test-client:
+    docker: *docker_images
+
+    <<: *working_directory
+
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - v1-client-jars-{{ checksum "client/project.clj" }}
+            - v1-client-jars-
+
+      - run:
+          name: Testing client
+          working_directory: client
+          command: lein test
+
+      - store_test_results:
+          path: client/target/test-results
+
+      - run: cd client && lein uberjar
+
+      - save_cache:
+          key: v1-client-jars-{{ checksum "client/project.clj" }}
+          paths:
+            - ~/.m2
+
+  publish-migrator-dry-run:
+    docker:
+      - <<: *ccc_image
+        environment:
+          NAME: permissions-service-migrator
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: none
+
+    <<: *working_directory
+
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: cd db-migrator && publish
+      - store_artifacts:
+          path: db-migrator/ccc-image-scan-results
+
+  publish-migrator:
+    docker:
+      - <<: *ccc_image
+        environment:
+          NAME: permissions-service-migrator
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: all
+
+    <<: *working_directory
+
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: cd db-migrator && publish
+      - persist_to_workspace:
+          root: .
+          paths:
+            - db-migrator/docker_image.tag
+      - store_artifacts:
+          path: db-migrator/ccc-image-scan-results
+
+  deploy-migrator:
+    docker:
+      - <<: *ccc_image
+        environment:
+          NAME: permissions-service-migrator
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/permissions-service-migrator
+          VALUES_FILE: k8s-values.yaml
+
+    <<: *working_directory
+
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run: cd db-migrator && deploy
+
+  publish-service-dry-run:
+    docker:
+      - <<: *ccc_image
+        environment:
+          NAME: permissions-service
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: none
+
+    <<: *working_directory
+
+    steps:
+      - checkout
+      - attach_workspace:
+          at: service/target
+      - run: apk --no-cache add zip
+      - run:
+          name: Cleaning confidential data from uberjar
+          command: |
+            zip -d ./service/target/uberjar/permissions-service-*-standalone.jar \
+              'project.clj' \
+              'META-INF/*/project.clj' \
+              'META-INF/leiningen/amazonica/amazonica/README.md'
+      - setup_remote_docker
+      - run: cd service && publish
+      - store_artifacts:
+          path: service/ccc-image-scan-results
+
+  publish-service:
+    docker:
+      - <<: *ccc_image
+        environment:
+          NAME: permissions-service
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: all
+
+    <<: *working_directory
+
+    steps:
+      - checkout
+      - attach_workspace:
+          at: service/target
+      - run: apk --no-cache add zip
+      - run:
+          name: Cleaning confidential data from uberjar
+          command: |
+            zip -d ./service/target/uberjar/permissions-service-*-standalone.jar \
+              'project.clj' \
+              'META-INF/*/project.clj' \
+              'META-INF/leiningen/amazonica/amazonica/README.md'
+      - setup_remote_docker
+      - run: cd service && publish
+      - persist_to_workspace:
+          root: .
+          paths:
+            - service/docker_image.tag
+      - store_artifacts:
+          path: service/ccc-image-scan-results
+
+  deploy-service:
+    docker:
+      - <<: *ccc_image
+        environment:
+          NAME: permissions-service
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/permissions-service
+          VALUES_FILE: k8s-values.yaml
+
+    <<: *working_directory
+
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run: cd service && deploy
+
+  publish-client:
+    docker: *docker_images
+
+    <<: *working_directory
+
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - v1-client-jars-{{ checksum "client/project.clj" }}
+            - v1-client-jars-
+      - run:
+          name: Deploying client
+          working_directory: client
+          command: |
+            lein deploy circle-s3
+
+  deploy-service-canary:
+    docker:
+      - <<: *ccc_image
+        environment:
+          NAME: permissions-service
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: all
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/permissions-service
+          RELEASE_VERSION: canary1
+          VALUES_FILE: k8s-canary-values.yaml
+
+    <<: *working_directory
+
+    steps:
+      - checkout
+
+      - attach_workspace:
+          at: service/target
+
+      - run: apk --no-cache add zip
+
+      - run:
+          name: Cleaning confidential data from uberjar
+          command: |
+            zip -d ./service/target/uberjar/permissions-service-*-standalone.jar \
+              'project.clj' \
+              'META-INF/*/project.clj' \
+              'META-INF/leiningen/amazonica/amazonica/README.md'
+
+      - setup_remote_docker
+      - run:
+          name: Merge Canary values
+          command: /deploy/merge-values service/k8s-values.yaml service/canary-overrides.yaml > service/k8s-canary-values.yaml
+      - run: cd service && publish
+      - run: cd service && deploy
+      - store_artifacts:
+          path: service/ccc-image-scan-results
+
+  check-schema:
+    <<: *working_directory
+    docker: *docker_images
+    steps:
+      - checkout
+      - run:
+          name: Add Postgres Debian repository
+          command: |
+            echo "deb http://apt.postgresql.org/pub/repos/apt/ buster-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
+              && curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add -
+      - run:
+          name: Install PostgreSQL client
+          command: |
+            apt-get update \
+              && apt-get upgrade -y \
+              && apt-get install postgresql-client-12
+      - run:
+          name: Run DB migrations
+          command: ./db-migrator/dev/run_flyway.sh ./db-migrator migrate
+          environment:
+            DATABASE_HOST: localhost
+            DATABASE_NAME: root
+            DATABASE_USER: root
+            DATABASE_SCHEMAS: permissions
+            DATABASE_SCHEMA_TABLE: schema_version
+      - run:
+          name: Dump migrated schema
+          command: |
+            FILENAME="schema-after.sql" PG_DUMP_COMMAND="pg_dump --host=localhost" \
+              ./scripts/dump-schema
+      - run:
+          name: Check that schema.sql accounts for migrations
+          command: |
+            # If the `diff` exit code is not zero, the schema.sql file is
+            # out-of date. Generate the schema.sql file locally with
+            # ./scripts/dump-schema and check in to source control.
+            diff --ignore-blank-lines schema.sql schema-after.sql
+      - store_artifacts:
+          path: ./schema-after.sql
+
+workflows:
+  version: 2
+  build_test_deploy:
+    jobs:
+      - check-schema:
+          context: org-global
+
+      - test-service:
+          context: org-global
+
+      - test-client:
+          context: org-global
+
+      - publish-client:
+          context: org-global
+          requires:
+            - test-client
+          filters:
+            branches:
+              only:
+                - main
+                - /^server-\d.*/
+
+      - publish-migrator-dry-run:
+          context: org-global
+          requires:
+            - check-schema
+            - test-service
+            - test-client
+          filters:
+            branches:
+              ignore:
+                - main
+                - /^server-\d.*/
+
+      - publish-migrator:
+          context: org-global
+          requires:
+            - check-schema
+            - test-service
+            - test-client
+          filters:
+            branches:
+              only:
+                - main
+                - /^server-\d.*/
+
+      - deploy-migrator:
+          context: org-global
+          requires:
+            - publish-migrator
+          filters:
+            branches:
+              only:
+                - main
+
+      - publish-service-dry-run:
+          context: org-global
+          requires:
+            - check-schema
+            - test-service
+            - test-client
+          filters:
+            branches:
+              ignore:
+                - main
+                - /^server-\d.*/
+                - /canary/.*/
+
+      - publish-service:
+          context: org-global
+          requires:
+            - check-schema
+            - test-service
+            - test-client
+          filters:
+            branches:
+              only:
+                - main
+                - /^server-\d.*/
+                - /canary/.*/
+
+      - scotty-orb/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          requires:
+            - publish-migrator
+            - publish-service
+          promotion_component_list: "circleci/permissions-service circleci/permissions-service-migrator"
+          filters:
+            branches:
+              only:
+                - main
+                - /^server-\d.*/
+
+      - deploy-service:
+          context: org-global
+          requires:
+            - publish-service
+            - deploy-migrator
+            - publish-client
+          filters:
+            branches:
+              only:
+                - main
+
+      - deploy-service-canary:
+          context: org-global
+          requires:
+            - publish-service
+          filters:
+            branches:
+              only: /canary/.*/
+
+experimental:
+  notify:
+    branches:
+      only:
+        - main

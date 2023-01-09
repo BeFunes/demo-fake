@@ -1,0 +1,74 @@
+version: 2.1
+
+executors:
+  python:
+    docker:
+      - image: python:3.9
+    environment:
+      POETRY_VIRTUALENVS_PATH: /virtualenvs/envs
+      POETRY_CACHE_DIR: /virtualenvs/cache
+
+commands:
+  setup-python-dependencies:
+    description: Setup the python environment for testing and linting
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - poetry-cache-{{ arch }}-{{ .Branch }}-{{ checksum "poetry.lock" }}
+            - poetry-cache-{{ arch }}-{{ .Branch }}
+            - poetry-cache
+      - restore_cache:
+          keys:
+            - pip-cache-{{ arch }}-{{ .Branch }}
+            - pip-cache
+      - run: echo "export PATH=$PATH:$HOME/.local/bin" >> $BASH_ENV
+      - run: pip install --user poetry
+      - run: poetry install
+      - save_cache:
+          key: poetry-cache-{{ arch }}-{{ .Branch }}-{{ checksum "poetry.lock" }}
+          paths: /virtualenvs
+      - save_cache:
+          key: pip-cache-{{ arch }}-{{ .Branch }}
+          paths: ~/.local
+
+jobs:
+  lint:
+    executor: python
+    steps:
+      - setup-python-dependencies
+      - run: poetry run pylint scanner tests
+      - run: poetry run black --check scanner tests
+  test:
+    executor: python
+    steps:
+      - setup-python-dependencies
+      - run: poetry run pytest
+  scanner:
+    executor: python
+    steps:
+      - setup-python-dependencies
+      - run: poetry run python -m scanner.scanner
+
+workflows:
+  testing-workflow:
+    jobs:
+      - lint
+      - test
+      - scanner:
+          context:
+            - github-scanner
+  data-collection-workflow:
+    jobs:
+      - lint
+      - test
+      - scanner:
+          context:
+            - github-scanner
+    triggers:
+      - schedule:
+          cron: "0 15 * * *"
+          filters:
+            branches:
+              only:
+                - main

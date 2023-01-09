@@ -1,0 +1,36 @@
+version: 2.1
+
+orbs:
+  zappa: borb/zappa@0.1.0
+
+jobs:
+  run_tests:
+    executor:
+      name: zappa/python
+      version: "3.9"
+    steps:
+      - checkout
+      - run: pipenv install -d
+      - run: pipenv run python -m unittest test
+
+workflows:
+  deploy-demo:
+    jobs:
+      - zappa/zappa-deploy:
+          name: "Deploy to CCI"
+          context: lambda-deploy-cci
+          stage: live
+          python_version: "3.9"
+          filters:
+            branches:
+              only: master
+          settings_file: zappa_settings/cci.json
+      - zappa/zappa-deploy:
+          name: "Deploy development version"
+          context: lambda-deploy-legacy
+          stage: dev
+          python_version: "3.9"
+          filters:
+            branches:
+              only: dev
+      - run_tests

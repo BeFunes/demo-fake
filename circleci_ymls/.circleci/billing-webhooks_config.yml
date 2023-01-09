@@ -1,0 +1,176 @@
+version: 2.0
+
+references:
+  ccc_image: &ccc_image
+    circleci/command-convenience:0.1
+
+  docker_images: &docker_images
+    - image: circleci/clojure-service:0.6-dev
+      auth:
+        username: $DOCKER_HUB_USER
+        password: $DOCKER_HUB_PASSWORD
+
+  uberjar: &uberjar
+    target/billing-webhooks-standalone.jar
+
+jobs:
+  linting:
+    working_directory: ~/project
+    docker: *docker_images
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-deps-{{ checksum "project.clj" }}
+            - v1-deps
+      - run: lein deps
+      - save_cache:
+          paths:
+            - ~/.m2
+          key: v1-deps-{{ checksum "project.clj" }}
+      - run: lein check
+      - run: lein eastwood
+
+  test-container-build:
+    working_directory: ~/project
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: billing-webhooks
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: none
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace: {at: ~/project}
+      - run: publish
+      - store_artifacts:
+          path: ccc-image-scan-results
+
+  build-uberjar:
+    working_directory: ~/project
+    docker: *docker_images
+    steps:
+      - checkout: {path: ~/project}
+      - restore_cache:
+          keys:
+            - v1-deps-{{ checksum "project.clj" }}
+            - v1-deps
+      - run:
+          name: Build Uberjar
+          command: |
+            lein uberjar
+            cp -v target/billing-webhooks-*-standalone.jar target/billing-webhooks-standalone.jar
+      - persist_to_workspace:
+          root: .
+          paths:
+            - *uberjar
+  test:
+    docker: *docker_images
+    working_directory: ~/project
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-deps-{{ checksum "project.clj" }}
+            - v1-deps
+      - run: lein cloverage --codecov --junit
+      - store_test_results: {path: target}
+      - run:
+          name: Upload Coverage Results
+          command: codecov-upload
+
+  deploy:
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: billing-webhooks
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: ecr
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/billing-webhooks
+          VALUES_FILE: k8s-values.yml
+
+    working_directory: ~/project
+
+    steps:
+      - checkout: {path: ~/project}
+      - setup_remote_docker
+      - attach_workspace: {at: ~/project}
+      - run: publish
+      - run: deploy
+      - store_artifacts:
+          path: ccc-image-scan-results
+
+  # push your feature branch to the "canary" branch to get it deployed to a single pod
+  # run `helm delete billing-webhooks-v1-canary` on kubectl when you have
+  # confirmed your change is safe (or not) to kill it
+  deploy-canary:
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: billing-webhooks
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: ecr
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/billing-webhooks
+          VALUES_FILE: k8s-canary.yml
+          RELEASE_VERSION: v1-canary
+
+    working_directory: ~/project
+
+    steps:
+      - checkout: {path: ~/project}
+      - setup_remote_docker
+      - attach_workspace: {at: ~/project}
+      - run: publish
+      - run: deploy
+      - store_artifacts:
+          path: ccc-image-scan-results
+
+workflows:
+  version: 2
+  build_test_deploy:
+    jobs:
+      - linting:
+          context: org-global
+      - build-uberjar:
+          context: org-global
+          requires:
+            - linting
+      - test-container-build:
+          context: org-global
+          requires:
+            - build-uberjar
+          filters:
+            branches:
+              ignore:
+                - master
+                - canary
+      - test:
+          context: org-global
+          requires:
+            - build-uberjar
+      - deploy:
+          context: org-global
+          requires:
+            - test
+          filters:
+            branches:
+              only: master
+      - deploy-canary:
+          context: org-global
+          requires:
+            - test
+          filters:
+            branches:
+              only: canary

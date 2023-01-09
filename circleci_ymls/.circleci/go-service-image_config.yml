@@ -1,0 +1,90 @@
+version: 2.1
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: go-service
+          DOCKERFILE_TARGET: dev
+          DOCKERFILE_PATH: Dockerfile
+          MAJOR_VERSION: "0.1"
+
+jobs:
+  build-test:
+    executor: ccc
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Set consistent version for testing
+          command: |
+            echo "export CONTAINER_VERSION=test" >> "${BASH_ENV}"
+      - run:
+          name: Build the dev container
+          command: publish
+          environment:
+            DOCKER_REGISTRY: none
+            # this image is just for correctness testing; scanning is done separately
+            TWISTLOCK_ENFORCE: false
+            ENFORCE_SCAN: BYPASS
+      - run:
+          name: Ensure taskfile is installed
+          command: |
+            docker run circleci/go-service:test-dev task --version
+      - run:
+          name: Ensure golangci-lint is installed
+          command: |
+            docker run circleci/go-service:test-dev golangci-lint --version
+      - run:
+          name: Ensure gotestsum is installed
+          command: |
+            docker run circleci/go-service:test-dev gotestsum --version
+  scan:
+    executor: ccc
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: scan
+
+  publish:
+    executor: ccc
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Publish
+          command: |
+            if [[ "$CIRCLE_BRANCH" != "main" ]]; then
+              branch="$(echo "$CIRCLE_BRANCH" | tr '/A-Z' '-a-z' | sed 's/^[0-9-]\+//')"
+              export MAJOR_VERSION="${branch:-experimental}"
+            fi
+            publish
+          environment:
+            DOCKER_REGISTRY: dockerhub
+
+workflows:
+  version: 2
+  build-test-publish:
+    jobs:
+      - build-test:
+          context: org-global
+      - scan:
+          context: org-global
+          filters:
+            branches:
+              ignore:
+                - main
+                - /experimental/.*/
+      - publish:
+          context: org-global
+          requires:
+            - build-test
+          filters:
+            branches:
+              only:
+                - main
+                - /experimental/.*/

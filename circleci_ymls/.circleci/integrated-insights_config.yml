@@ -1,0 +1,171 @@
+version: 2.1
+
+commands:
+  setup:
+    steps:
+      - checkout
+      - run:
+          name: 'Login to npm'
+          command:
+            echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ../.npmrc
+      - run: yarn install --frozen-lockfile
+
+executors:
+  node:
+    docker:
+      - image: circleci/node:14.17.3
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+jobs:
+  scan:
+    executor:
+      name: ccc
+    environment:
+      NAME: integrated-insights
+      DOCKERFILE_PATH: Dockerfile
+      EXTRA_DOCKER_BUILD_ARGS: --build-arg NPM_TOKEN
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker:
+          version: 19.03.13
+      - run: scan
+
+  build:
+    executor: node
+    steps:
+      - setup
+      - run:
+          name: Build distribution files
+          command: yarn build
+      - persist_to_workspace:
+          root: .
+          paths:
+            - dist
+
+  test:
+    executor: node
+    steps:
+      - setup
+      - attach_workspace:
+          at: .
+      - run:
+          name: Run Tests
+          command: yarn test:ci
+      - store_test_results:
+          path: /tmp/test-results
+
+  lint:
+    executor: node
+    steps:
+      - setup
+      - attach_workspace:
+          at: .
+      - run:
+          name: Lint source code
+          command: yarn lint
+      - run:
+          name: Check prettier
+          command: yarn prettier
+
+  chromatic:
+    executor: node
+    steps:
+      - setup
+      - run:
+          name: Run Chromatic build
+          command: |
+            if [ "${CIRCLE_BRANCH}" != "main" ];
+            then
+              yarn chromatic
+            else
+              # We know any changes that make it to main *must* have been approved
+              yarn chromatic --auto-accept-changes
+            fi
+  publish-canary:
+    executor: node
+    steps:
+      - setup
+      - attach_workspace:
+          at: .
+      - run:
+          name: Publish npm Package
+          command: |
+            name="$(jq --raw-output .name package.json)"
+            version="$(jq --raw-output .version package.json)-canary.$(git rev-parse --short HEAD)"
+            full_identifier="$name@$version"
+            echo "Checking for published version..."
+            if [ $(yarn -s info $full_identifier --json 2>&1 | jq -s '.[0].type == "error" or .[0].data.dist == null') == "true" ]
+            then
+              echo "Publishing $full_identifier…"
+              yarn version --no-git-tag-version --new-version $version
+              yarn publish --tag canary
+            else
+              echo "$full_identifier already published. Doing nothing."
+            fi
+  publish-release:
+    executor: node
+    steps:
+      - setup
+      - attach_workspace:
+          at: .
+      - run:
+          name: Publish npm Package
+          # Check for the current version in the registry, and if it's not
+          # found, publish it. We know the version is not yet in the registry if
+          # `yarn info` returns no `dist` field. (Also, if `yarn info` returns
+          # an error, it may be because the package has never been published.)
+          command: |
+            name="$(jq --raw-output .name package.json)"
+            version="$(jq --raw-output .version package.json)"
+            full_identifier="$name@$version"
+            echo "Checking for published version..."
+            if [ $(yarn -s info $full_identifier --json 2>&1 | jq -s '.[0].type == "error" or .[0].data.dist == null') == "true" ]
+            then
+              echo "Publishing $full_identifier…"
+              yarn publish
+            else
+              echo "$full_identifier already published. Doing nothing."
+            fi
+workflows:
+  test-and-publish:
+    jobs:
+      - scan:
+          context: [org-global, web-ui-npm]
+      - build:
+          context: design-system
+      - test:
+          context: design-system
+          requires:
+            - build
+      - lint:
+          context: design-system
+          requires:
+            - build
+      - chromatic:
+          context: [design-system, integrated-insights]
+      - publish-canary:
+          context: design-system
+          filters:
+            branches:
+              ignore:
+                - main
+                - /^renovate\/.*/ # Ignore Renovate branches as they cause canary errors
+          requires:
+            - build
+      - publish-release:
+          context: design-system
+          filters:
+            branches:
+              only: main
+          requires:
+            - scan
+            - lint
+            - test
+            - chromatic

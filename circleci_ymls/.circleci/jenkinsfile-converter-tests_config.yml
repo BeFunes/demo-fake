@@ -1,0 +1,16 @@
+version: 2.1
+orbs:
+  python: circleci/python@1.0.0
+workflows:
+  main:
+    jobs:
+      - python/test:
+          pkg-manager: pipenv
+          test-tool: pytest
+          post-steps:
+            - store_artifacts:
+                path: ~/project/tests/test_data_responses
+                destination: responses
+            - store_artifacts:
+                path: ~/project/tests/test_data
+                destination: requests

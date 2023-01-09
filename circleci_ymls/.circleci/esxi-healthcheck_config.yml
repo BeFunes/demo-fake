@@ -1,0 +1,53 @@
+version: 2.1
+
+executors:
+  cimg-python:
+    # Lifted from the python orb
+    # (orbs do not support changing the working directory, so it wont work with a monorepo)
+    description: The official CircleCI CIMG Python Docker image.
+    docker:
+      - image: 'cimg/python:<< parameters.tag >>'
+    parameters:
+      tag:
+        description: The `cimg/python` Docker image version tag.
+        type: string
+
+jobs:
+  test-python:
+    parameters:
+      project:
+        description: "Directory under ./projects that contains the Python project to test"
+        type: string
+      py_version:
+        description: "Python version"
+        type: string
+    executor:
+      name: cimg-python
+      tag: << parameters.py_version >>
+    steps:
+      - checkout
+      - run:
+          name: Install pytest
+          working_directory: ~/project
+          command: pip install pytest
+      - run:
+          name: Install << parameters.project >> dependencies
+          working_directory: ~/project
+          command: |
+              pip install -r requirements.txt
+      - run:
+          name: Run << parameters.project >> tests
+          working_directory: ~/project
+          command: pytest -v -s -rP
+
+workflows:
+  version: 2
+  test-publish-deploy:
+    jobs:
+      - test-python:
+          matrix:
+            parameters:
+              py_version:
+                - "3.5.9"
+              project:
+                - esxi_healthcheck

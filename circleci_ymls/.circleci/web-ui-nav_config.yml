@@ -1,0 +1,158 @@
+version: 2.1
+
+orbs:
+  web-ui-orb: sandbox/web-ui-orb@3.9.0
+
+references:
+  version_js: &version_js 3
+
+commands:
+  setup:
+    steps:
+      - checkout
+      - web-ui-orb/restore-js-deps:
+          cache_version: *version_js
+  login:
+    steps:
+      - run: echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
+
+executors:
+  node:
+    docker:
+      - image: circleci/node:14.17.6
+    working_directory: /home/circleci/web-ui
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+jobs:
+  build:
+    executor: node
+    steps:
+      - setup
+      - run:
+          name: Build distribution files
+          command: yarn build
+      - persist_to_workspace:
+          root: .
+          paths:
+            - dist
+
+  prettier:
+    executor: node
+    steps:
+      - setup
+      - run:
+          name: Check prettier
+          command: yarn prettier:ci
+
+  chromatic:
+    executor: node
+    steps:
+      - setup
+      - run:
+          name: Run Chromatic build
+          command: |
+            if [ "${CIRCLE_BRANCH}" != "main" ];
+            then
+              yarn chromatic
+            else
+              # We know any changes that make it to main *must* have been approved
+              yarn chromatic --auto-accept-changes
+            fi
+
+  publish-prerelease:
+    executor: node
+    steps:
+      - setup
+      - attach_workspace:
+          at: .
+      - login
+      - run:
+          name: Publish npm Package
+          command: |
+            name="$(jq --raw-output .name package.json)"
+            version="$(jq --raw-output .version package.json)-prerelease.$(git rev-parse --short HEAD)"
+            full_identifier="$name@$version"
+            echo "Checking for published version..."
+            if [ $(yarn -s info $full_identifier --json 2>&1 | jq -s '.[0].type == "error" or .[0].data.dist == null') == "true" ]
+            then
+              echo "Publishing $full_identifier…"
+              yarn version --no-git-tag-version --new-version $version
+              yarn publish --tag prerelease
+            else
+              echo "$full_identifier already published. Doing nothing."
+            fi
+
+  publish-release:
+    executor: node
+    steps:
+      - setup
+      - attach_workspace:
+          at: .
+      - login
+      - run:
+          name: Publish npm Package
+          # Check for the current version in the registry, and if it's not
+          # found, publish it. We know the version is not yet in the registry if
+          # `yarn info` returns no `dist` field. (Also, if `yarn info` returns
+          # an error, it may be because the package has never been published.)
+          command: |
+            name="$(jq --raw-output .name package.json)"
+            version="$(jq --raw-output .version package.json)"
+            full_identifier="$name@$version"
+            echo "Checking for published version..."
+            if [ $(yarn -s info $full_identifier --json 2>&1 | jq -s '.[0].type == "error" or .[0].data.dist == null') == "true" ]
+            then
+              echo "Publishing $full_identifier…"
+              yarn publish
+            else
+              echo "$full_identifier already published. Doing nothing."
+            fi
+
+workflows:
+  test-and-publish:
+    jobs:
+      - web-ui-orb/dependencies:
+          name: dependencies
+          context: web-ui-npm
+          cache_version_js_dependencies: *version_js
+      - build:
+          context: web-ui-npm
+          requires:
+            - dependencies
+      - web-ui-orb/test:
+          name: test-and-lint
+          cache_version_js_dependencies: *version_js
+          codecov: false
+          requires:
+            - dependencies
+      - prettier:
+          context: web-ui-npm
+          requires:
+            - dependencies
+      - chromatic:
+          context: web-ui-npm
+          requires:
+            - dependencies
+      - publish-prerelease:
+          context: design-system
+          filters:
+            branches:
+              ignore:
+                - main
+                - /^renovate\/.*/ # Ignore Renovate branches as they cause prerelease errors
+          requires:
+            - build
+            - test-and-lint
+      - publish-release:
+          context: design-system
+          filters:
+            branches:
+              only: main
+          requires:
+            - build
+            - test-and-lint

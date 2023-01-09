@@ -1,0 +1,95 @@
+version: 2.1
+
+orbs:
+  shellcheck: circleci/shellcheck@3.1.0
+
+workflows:
+  primary:
+    jobs:
+      - shellcheck/check:
+          name: shellcheck-bin-dir
+          dir: ./bin
+          pattern: '*'
+      - shellcheck/check:
+          name: shellcheck-scripts-dir
+          dir: ./scripts
+          pattern: '*'
+      - test-cci-debug
+      - test-scripts-bb
+      - ccc:
+          name: build
+          post-steps:
+            - run: scan
+          context: org-global
+          filters:
+            branches:
+              ignore: main
+      - ccc:
+          name: publish
+          post-steps:
+            - run: publish
+          context: org-global
+          filters:
+            branches:
+              only: main
+          requires:
+            - shellcheck-bin-dir
+            - shellcheck-scripts-dir
+            - test-cci-debug
+            - test-scripts-bb
+
+  scheduled:
+    jobs:
+      - ccc:
+          name: scheduled-publish
+          post-steps:
+            - run: publish
+          context: org-global
+    triggers:
+      - schedule:
+          # once a week on tuesday morning
+          cron: "24 7 * * 2"
+          filters:
+            branches:
+              only:
+                - main
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    environment:
+      NAME: prod-tools
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: dockerhub
+      TWISTLOCK_ENFORCE: false
+
+jobs:
+  ccc:
+    executor: ccc
+    steps:
+      - checkout
+      - setup_remote_docker
+  test-cci-debug:
+    docker:
+      - image: golang:1.18
+    steps:
+      - checkout
+      - run:
+          working_directory: cci-debug
+          command: |
+            # Create placeholders where embedded files are expected
+            mkdir -p cmd/bin/ pkg/localreport/async-profiler/
+            touch cmd/bin/localreport pkg/localreport/async-profiler/placeholder
+            go test ./...
+  test-scripts-bb:
+    docker:
+      - image: babashka/babashka:0.7.8
+    steps:
+      - checkout
+      - run:
+          working_directory: scripts.bb
+          command: ./run-tests.clj

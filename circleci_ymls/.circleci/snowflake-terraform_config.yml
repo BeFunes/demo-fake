@@ -1,0 +1,174 @@
+version: 2.1
+
+references:
+  dir: &dir ~/snowflake-terraform
+  permifrost_dir: &permifrost_dir ~/snowflake-terraform/permifrost
+
+executors:
+  terraform:
+    docker:
+      - image: circleci/terraform:1.0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    working_directory: ~/src
+  python:
+    parameters:
+      directory:
+        type: string
+    docker:
+      - image: python:3.9.9
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    environment:
+      POETRY_VIRTUALENVS_PATH: /<<parameters.directory>>/virtualenvs/envs
+      POETRY_CACHE_DIR: /<<parameters.directory>>/virtualenvs/cache
+
+
+commands:
+  setup-user-pass:
+    steps:
+      - run:
+          name: Setup env vars
+          command: |
+            echo 'export PERMISSION_BOT_USER=$SNOWFLAKE_USER' >> $BASH_ENV
+            echo 'export PERMISSION_BOT_PASSWORD=$SNOWFLAKE_PASSWORD' >> $BASH_ENV
+  setup-python-dependencies:
+    parameters:
+      directory:
+        type: string
+    steps:
+      - restore_cache:
+          keys:
+            - poetry-cache-v1-{{ arch }}-{{ .Branch }}-{{ checksum "poetry.lock" }}
+            - poetry-cache-v1-{{ arch }}-{{ .Branch }}
+            - poetry-cache-v1
+      - run: echo "export PATH=$HOME/.poetry/bin:$PATH" >> $BASH_ENV
+      - run: curl -sSL https://raw.githubusercontent.com/python-poetry/poetry/master/get-poetry.py | python -
+      - run: poetry install
+      - save_cache:
+          key: poetry-cache-v1-{{ arch }}-{{ .Branch }}-{{ checksum "poetry.lock" }}
+          paths: /<<parameters.directory>>/virtualenvs
+
+
+jobs:
+  permifrost-lint:
+    executor:
+      name: python
+      directory: permifrost
+    working_directory: *permifrost_dir
+    steps:
+      - checkout:
+          path: *dir
+      - setup-python-dependencies:
+          directory: permifrost
+      - run: poetry run yamllint permifrost.yaml
+  permifrost-dry-run:
+    executor:
+      name: python
+      directory: permifrost
+    environment:
+      PERMISSION_BOT_ACCOUNT: nxa13674.us-east-1
+      PERMISSION_BOT_WAREHOUSE: XSMALL_WAREHOUSE
+      PERMISSION_BOT_ROLE: SECURITYADMIN
+      PERMISSION_BOT_DATABASE: SNOWFLAKE
+    working_directory: *permifrost_dir
+    steps:
+      - checkout:
+          path: *dir
+      - setup-python-dependencies:
+          directory: permifrost
+      - setup-user-pass
+      - run:
+          command: poetry run permifrost run permifrost.yaml --dry --diff
+          no_output_timeout: 30m
+  permifrost-run:
+    executor:
+      name: python
+      directory: permifrost
+    environment:
+      PERMISSION_BOT_ACCOUNT: nxa13674.us-east-1
+      PERMISSION_BOT_WAREHOUSE: XSMALL_WAREHOUSE
+      PERMISSION_BOT_ROLE: SECURITYADMIN
+      PERMISSION_BOT_DATABASE: SNOWFLAKE
+    working_directory: *permifrost_dir
+    steps:
+      - checkout:
+          path: *dir
+      - setup-python-dependencies:
+          directory: permifrost
+      - setup-user-pass
+      - run:
+          command: poetry run permifrost run permifrost.yaml
+          no_output_timeout: 50m
+
+  terraform-format:
+    executor: terraform
+    steps:
+      - checkout
+      - run: terraform fmt -check -diff -recursive terraform/
+  terraform-plan:
+    executor: terraform
+    steps:
+      - checkout
+      - run: terraform -chdir=terraform init
+      - run: terraform -chdir=terraform plan
+  terraform-plan-and-apply:
+    executor: terraform
+    steps:
+      - checkout
+      - run: terraform -chdir=terraform init
+      - run: terraform -chdir=terraform refresh
+      - run: terraform -chdir=terraform plan
+      - run: terraform -chdir=terraform apply -auto-approve
+
+workflows:
+  commit:
+    jobs:
+
+      ## permifrost
+      - permifrost-lint:
+          context: org-global
+          filters:
+            branches:
+                ignore: main
+      - permifrost-dry-run:
+          context:
+            - org-global
+            - data-platform-snowflake-terraform
+          filters:
+            branches:
+                ignore: main
+      - permifrost-run:
+          context:
+            - org-global
+            - data-platform-snowflake-terraform
+          requires:
+            - terraform-plan-and-apply
+          filters:
+            branches:
+                only: main
+
+      ## terraform
+      - terraform-format:
+          context:
+            - org-global
+      - terraform-plan:
+          filters:
+            branches:
+                ignore: main
+          requires:
+            - terraform-format
+          context:
+            - org-global
+            - data-platform-snowflake-terraform
+      - terraform-plan-and-apply:
+          filters:
+            branches:
+                only: main
+          requires:
+            - terraform-format
+          context:
+            - org-global
+            - data-platform-snowflake-terraform

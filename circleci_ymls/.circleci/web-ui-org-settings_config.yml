@@ -1,0 +1,116 @@
+version: 2.1
+
+orbs:
+  web-ui-orb: sandbox/web-ui-orb@3.10.1
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+
+references:
+  version_js: &version_js 5
+  version_cypress: &version_cypress 1
+  optimizely_sdk_key: &optimizely_sdk_key GfYszBpMkefBSwiiEkH3b3
+  hostname: &hostname app.circleci.com
+
+workflows:
+  version: 2
+
+  build-test-and-deploy:
+    jobs:
+      - web-ui-orb/dependencies:
+          name: dependencies
+          context: web-ui-npm
+          cache_version_js_dependencies: *version_js
+          cache_version_cypress_dependencies: *version_cypress
+      - web-ui-orb/storybook-build:
+          name: storybook-build
+          build_storybook_command: NODE_ENV=test yarn build-storybook -s ./src
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+      - web-ui-orb/test:
+          name: test
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+      - web-ui-orb/chromatic-snapshot:
+          name: chromatic-snapshot
+          cache_version_js_dependencies: *version_js
+          requires:
+            - storybook-build
+      - web-ui-orb/test-production-docker-image:
+          name: test-production-docker-image
+          image_name: web-ui-org-settings
+          cache_version_js_dependencies: *version_js
+          optimizely_sdk_key: *optimizely_sdk_key
+          hostname: *hostname
+          requires:
+            - dependencies
+          context: [org-global, web-ui-npm]
+      - web-ui-orb/build-and-deploy-static:
+          cache_version_js_dependencies: *version_js
+          name: build-and-deploy-static
+          bucket_name: circleci-web-ui-org-settings-assets/settings/organization
+          build_dir: .next
+          cdn_url: https://assets-org-settings.circleci.com/settings/organization
+          context: [web-ui-org-settings, web-ui-npm, web-ui-datadog]
+          filters:
+            branches:
+              only:
+                - master
+                - canary
+          requires:
+            - dependencies
+      - web-ui-orb/build-and-publish-container:
+          name: publish
+          image_name: web-ui-org-settings
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [org-global, web-ui-npm]
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-\d\..+/
+          requires:
+            - test
+            - build-and-deploy-static
+            - test-production-docker-image
+      - web-ui-orb/deploy-container:
+          name: deploy
+          image_name: web-ui-org-settings
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [org-global, web-ui-npm]
+          filters:
+            branches:
+              only: master
+          requires:
+            - publish
+      - scotty-orb/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          promotion_component_list: 'circleci/web-ui-org-settings'
+          requires:
+            - publish
+      - web-ui-orb/build-and-publish-container:
+          name: publish-canary
+          image_name: web-ui-org-settings
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [org-global, web-ui-npm]
+          filters:
+            branches:
+              only: canary
+          requires:
+            - test
+            - build-and-deploy-static
+            - test-production-docker-image
+      - web-ui-orb/deploy-container:
+          name: deploy-canary
+          image_name: web-ui-org-settings
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [org-global, web-ui-npm]
+          release_version: canary
+          values_file: k8s-canary-values.yml
+          requires:
+            - publish-canary

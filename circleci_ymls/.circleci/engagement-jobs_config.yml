@@ -1,0 +1,499 @@
+version: 2.1
+
+orbs:
+  node: circleci/node@4.5.1
+
+references:
+  version_js: &version_js 1
+  ccc_image: &ccc_image circleci/command-convenience:0.1
+
+executors:
+  ccc:
+    parameters:
+      deploy_to_docker_registry:
+        # valid values are "none", "all", "ecr", "dockerhub"
+        type: "string"
+      container_name:
+        type: "string"
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: "<<parameters.container_name>>"
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: "<<parameters.deploy_to_docker_registry>>"
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: "183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/<<parameters.container_name>>"
+          VALUES_FILE: k8s-values.yml
+          CONFIGURE_ECR_REPO: "true"
+          ECR_OWNER_TEAM: "Engagement"
+
+jobs:
+  aqs-updater-no-green-build-deploy:
+    executor:
+      name: ccc
+      container_name: "aqs-updater-no-green-build"
+      deploy_to_docker_registry: ecr
+
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+          version: 19.03.13
+      - run:
+          name: Replace `docker build` in create-image.sh with build-arg passing
+          command:
+            sed 's:docker build:docker build --build-arg NPM_TOKEN=$NPM_TOKEN:'
+            -i /publish/scripts/create-image.sh
+      - run:
+          command: publish
+          working_directory: aqs-updater-no-green-build
+
+  aqs-updater-no-green-build-test-build-container:
+    executor:
+      name: ccc
+      container_name: "aqs-updater-no-green-build"
+      deploy_to_docker_registry: none
+
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+          version: 19.03.13
+      - run:
+          name: Replace `docker build` in create-image.sh with build-arg passing
+          command:
+            sed 's:docker build:docker build --build-arg NPM_TOKEN=$NPM_TOKEN:'
+            -i /publish/scripts/create-image.sh
+      - run:
+          command: publish
+          working_directory: aqs-updater-no-green-build
+
+  first-red-build-email-deploy:
+    executor:
+      name: ccc
+      container_name: "first-red-green-email" # We have promoted the red email and demoted the green email
+      deploy_to_docker_registry: ecr
+
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+          version: 19.03.13
+      - run:
+          name: Replace `docker build` in create-image.sh with build-arg passing
+          command:
+            sed 's:docker build:docker build --build-arg NPM_TOKEN=$NPM_TOKEN:'
+            -i /publish/scripts/create-image.sh
+      - run:
+          command: publish
+          working_directory: first-red-build-email
+
+  first-red-build-email-test-build-container:
+    executor:
+      name: ccc
+      container_name: "first-red-green-email" # We have promoted the red email and demoted the green email
+      deploy_to_docker_registry: none
+
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+          version: 19.03.13
+      - run:
+          name: Replace `docker build` in create-image.sh with build-arg passing
+          command:
+            sed 's:docker build:docker build --build-arg NPM_TOKEN=$NPM_TOKEN:'
+            -i /publish/scripts/create-image.sh
+      - run:
+          command: publish
+          working_directory: first-red-build-email
+
+  aqs-updater-foo-deploy:
+    executor:
+      name: ccc
+      container_name: "aqs-updater-foo"
+      deploy_to_docker_registry: ecr
+
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+          version: 19.03.13
+      - run:
+          name: Replace `docker build` in create-image.sh with build-arg passing
+          command:
+            sed 's:docker build:docker build --build-arg NPM_TOKEN=$NPM_TOKEN:'
+            -i /publish/scripts/create-image.sh
+      - run:
+          command: publish
+          working_directory: aqs-updater-foo
+
+  aqs-updater-foo-test-build-container:
+    executor:
+      name: ccc
+      container_name: "aqs-updater-foo"
+      deploy_to_docker_registry: none
+
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+          version: 19.03.13
+      - run:
+          name: Replace `docker build` in create-image.sh with build-arg passing
+          command:
+            sed 's:docker build:docker build --build-arg NPM_TOKEN=$NPM_TOKEN:'
+            -i /publish/scripts/create-image.sh
+      - run:
+          command: publish
+          working_directory: aqs-updater-foo
+
+  aqs-updater-dds-deploy:
+    executor:
+      name: ccc
+      container_name: "aqs-updater-dds"
+      deploy_to_docker_registry: ecr
+
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+          version: 19.03.13
+      - run:
+          name: Replace `docker build` in create-image.sh with build-arg passing
+          command:
+            sed 's:docker build:docker build --build-arg NPM_TOKEN=$NPM_TOKEN:'
+            -i /publish/scripts/create-image.sh
+      - run:
+          command: publish
+          working_directory: aqs-updater-dds
+
+  aqs-updater-team-org-deploy:
+    executor:
+      name: ccc
+      container_name: "aqs-updater-team-org"
+      deploy_to_docker_registry: ecr
+
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+          version: 19.03.13
+      - run:
+          name: Replace `docker build` in create-image.sh with build-arg passing
+          command:
+            sed 's:docker build:docker build --build-arg NPM_TOKEN=$NPM_TOKEN:'
+            -i /publish/scripts/create-image.sh
+      - run:
+          command: publish
+          working_directory: aqs-updater-team-org
+
+  aqs-updater-team-org-test-build-container:
+    executor:
+      name: ccc
+      container_name: "aqs-updater-team-org"
+      deploy_to_docker_registry: none
+
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+          version: 19.03.13
+      - run:
+          name: Replace `docker build` in create-image.sh with build-arg passing
+          command:
+            sed 's:docker build:docker build --build-arg NPM_TOKEN=$NPM_TOKEN:'
+            -i /publish/scripts/create-image.sh
+      - run:
+          command: publish
+          working_directory: aqs-updater-team-org
+
+  aqs-updater-dds-test-build-container:
+    executor:
+      name: ccc
+      container_name: "aqs-updater-dds"
+      deploy_to_docker_registry: none
+
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+          version: 19.03.13
+      - run:
+          name: Replace `docker build` in create-image.sh with build-arg passing
+          command:
+            sed 's:docker build:docker build --build-arg NPM_TOKEN=$NPM_TOKEN:'
+            -i /publish/scripts/create-image.sh
+      - run:
+          command: publish
+          working_directory: aqs-updater-dds
+
+  aqs-updater-github-ssh-deprecation-notice-deploy:
+    executor:
+      name: ccc
+      container_name: "aqs-updater-github-ssh-deprecation-notice"
+      deploy_to_docker_registry: ecr
+
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+          version: 19.03.13
+      - run:
+          name: Replace `docker build` in create-image.sh with build-arg passing
+          command:
+            sed 's:docker build:docker build --build-arg NPM_TOKEN=$NPM_TOKEN:'
+            -i /publish/scripts/create-image.sh
+      - run:
+          command: publish
+          working_directory: aqs-updater-github-ssh-deprecation-notice
+
+  aqs-updater-github-ssh-deprecation-notice-test-build-container:
+    executor:
+      name: ccc
+      container_name: "aqs-updater-github-ssh-deprecation-notice"
+      deploy_to_docker_registry: none
+
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+          version: 19.03.13
+      - run:
+          name: Replace `docker build` in create-image.sh with build-arg passing
+          command:
+            sed 's:docker build:docker build --build-arg NPM_TOKEN=$NPM_TOKEN:'
+            -i /publish/scripts/create-image.sh
+      - run:
+          command: publish
+          working_directory: aqs-updater-github-ssh-deprecation-notice
+
+  test:
+    parameters:
+      app-dir:
+        description: relative path within the repository to the projects whos tests are to be run
+        type: string
+        default: .
+      pkg-manager:
+        description: package manager to use for installing dependencies
+        type: enum
+        enum: [yarn, yarn-berry]
+        default: yarn
+      node-version:
+        description: node version to use for testing
+        type: string
+
+    executor:
+      name: node/default
+      tag: "<< parameters.node-version >>"
+
+    environment:
+      YARN_NPM_AUTH_TOKEN: $NPM_TOKEN
+
+    steps:
+      - checkout
+      - run:
+          name: "Put NPM_TOKEN where yarn berry can find it"
+          command: "printf \"npmRegistries:\n  'https://registry.yarnpkg.com':\n    npmAuthToken: $NPM_TOKEN\n\" > ~/.yarnrc.yml"
+      - node/install-packages:
+          app-dir: <<parameters.app-dir>>
+          pkg-manager: <<parameters.pkg-manager>>
+      - run:
+          command: "yarn lint"
+          working_directory: <<parameters.app-dir>>
+      - run:
+          command: "yarn test:ci"
+          working_directory: <<parameters.app-dir>>
+          environment:
+            - JEST_JUNIT_OUTPUT_DIR: test-results/jest
+            - JEST_JUNIT_OUTPUT_NAME: results.xml
+      - store_test_results:
+          path: <<parameters.app-dir>>/test-results
+
+  aqs-updater-projects-with-approval-jobs-deploy:
+    executor:
+      name: ccc
+      container_name: "aqs-updater-projects-with-approval-jobs"
+      deploy_to_docker_registry: ecr
+
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+          version: 19.03.13
+      - run:
+          name: Replace `docker build` in create-image.sh with build-arg passing
+          command:
+            sed 's:docker build:docker build --build-arg NPM_TOKEN=$NPM_TOKEN:'
+            -i /publish/scripts/create-image.sh
+      - run:
+          command: publish
+          working_directory: aqs-updater-projects-with-approval-jobs
+
+  aqs-updater-projects-with-approval-jobs-test-build-container:
+    executor:
+      name: ccc
+      container_name: "aqs-updater-projects-with-approval-jobs"
+      deploy_to_docker_registry: none
+
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+          version: 19.03.13
+      - run:
+          name: Replace `docker build` in create-image.sh with build-arg passing
+          command:
+            sed 's:docker build:docker build --build-arg NPM_TOKEN=$NPM_TOKEN:'
+            -i /publish/scripts/create-image.sh
+      - run:
+          command: publish
+          working_directory: aqs-updater-projects-with-approval-jobs
+
+workflows:
+  version: 2
+  test-and-deploy-aqs-updater-foo:
+    jobs:
+      - test:
+          context: [web-ui-npm]
+          app-dir: aqs-updater-foo
+          node-version: "16.13.1"
+          pkg-manager: yarn-berry
+
+      - aqs-updater-foo-deploy:
+          context: [org-global, web-ui-npm]
+          requires:
+            - test
+          filters:
+            branches:
+              only: main
+
+      - aqs-updater-foo-test-build-container:
+          context: [org-global, web-ui-npm]
+          filters:
+            branches:
+              ignore: main
+  test-and-deploy-aqs-updater-dds:
+    jobs:
+      - test:
+          context: [web-ui-npm]
+          app-dir: aqs-updater-dds
+          node-version: "16.13.1"
+          pkg-manager: yarn-berry
+
+      - aqs-updater-dds-deploy:
+          context: [org-global, web-ui-npm]
+          requires:
+            - test
+          filters:
+            branches:
+              only: main
+
+      - aqs-updater-dds-test-build-container:
+          context: [org-global, web-ui-npm]
+          filters:
+            branches:
+              ignore: main
+  build-test-and-deploy:
+    jobs:
+      - first-red-build-email-deploy:
+          context: [org-global, web-ui-npm]
+          filters:
+            branches:
+              only: main
+
+      - first-red-build-email-test-build-container:
+          context: [org-global, web-ui-npm]
+          filters:
+            branches:
+              ignore: main
+
+  test-and-deploy-aqs-updater-team-org:
+    jobs:
+      - test:
+          context: [web-ui-npm]
+          app-dir: aqs-updater-team-org
+          node-version: "16.13.1"
+          pkg-manager: yarn-berry
+
+      - aqs-updater-team-org-deploy:
+          context: [org-global, web-ui-npm]
+          requires:
+            - test
+          filters:
+            branches:
+              only: main
+
+      - aqs-updater-team-org-test-build-container:
+          context: [org-global, web-ui-npm]
+          filters:
+            branches:
+              ignore: main
+
+  test-and-deploy-aqs-updater-github-ssh-deprecation-notice:
+    jobs:
+      - test:
+          context: [web-ui-npm]
+          app-dir: aqs-updater-github-ssh-deprecation-notice
+          node-version: "16.13.1"
+          pkg-manager: yarn-berry
+
+      - aqs-updater-github-ssh-deprecation-notice-deploy:
+          context: [org-global, web-ui-npm]
+          requires:
+            - test
+          filters:
+            branches:
+              only: main
+
+      - aqs-updater-github-ssh-deprecation-notice-test-build-container:
+          context: [org-global, web-ui-npm]
+          filters:
+            branches:
+              ignore: main
+  test-and-deploy-aqs-updater-no-green-build:
+    jobs:
+      - test:
+          context: [web-ui-npm]
+          app-dir: aqs-updater-no-green-build
+          node-version: "16.13.1"
+          pkg-manager: yarn-berry
+
+      - aqs-updater-no-green-build-deploy:
+          context: [org-global, web-ui-npm]
+          requires:
+            - test
+          filters:
+            branches:
+              only: main
+
+      - aqs-updater-no-green-build-test-build-container:
+          context: [org-global, web-ui-npm]
+          filters:
+            branches:
+              ignore: main
+
+  test-and-deploy-aqs-updater-projects-with-approval-jobs:
+    jobs:
+      - test:
+          context: [web-ui-npm]
+          app-dir: aqs-updater-projects-with-approval-jobs
+          node-version: "16.13.1"
+          pkg-manager: yarn-berry
+
+      - aqs-updater-projects-with-approval-jobs-deploy:
+          context: [org-global, web-ui-npm]
+          requires:
+            - test
+          filters:
+            branches:
+              only: main
+
+      - aqs-updater-projects-with-approval-jobs-test-build-container:
+          context: [org-global, web-ui-npm]
+          filters:
+            branches:
+              ignore: main

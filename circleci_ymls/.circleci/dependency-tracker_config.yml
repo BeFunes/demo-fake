@@ -1,0 +1,21 @@
+version: 2.1
+
+setup: true
+
+orbs:
+  path-filtering: circleci/path-filtering@0.0.1
+
+workflows:
+  generate-config:
+    jobs:
+      - path-filtering/filter:
+          name: check-updated-services
+          base-revision: main
+          config-path: .circleci/btd-config.yml
+          mapping: |
+            services/change-tracker/.* update-change-tracker true
+            services/dependency-crawler/.* update-dependency-crawler true
+            services/dependency-tracker/.* update-dependency-tracker true
+            [^/]+ update-all-services true
+            .circleci/.* update-all-services true
+

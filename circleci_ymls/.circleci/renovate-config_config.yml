@@ -1,0 +1,28 @@
+version: 2.1
+
+jobs:
+  verify-renovate-config:
+    parameters:
+      config-file:
+        description: Path to the Renovate config file to test
+        type: string
+    docker:
+      - image: renovate/renovate:latest
+    steps:
+      - checkout
+      - run:
+          name: "Check Renovate config << parameters.config-file >>"
+          environment:
+            RENOVATE_CONFIG_FILE: << parameters.config-file >>
+          command: renovate-config-validator
+
+workflows:
+  version: 2
+  main:
+    jobs:
+      - verify-renovate-config:
+          name: verify-renovate/default
+          config-file: default.json
+      - verify-renovate-config:
+          name: verify-renovate/infra-eng
+          config-file: infra-eng.json

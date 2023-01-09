@@ -1,0 +1,210 @@
+version: 2.1
+
+orbs:
+  shellcheck: circleci/shellcheck@3.1.0
+
+workflows:
+  version: 2
+  main:
+    jobs:
+      - shellcheck/check
+      - shfmt
+      - tf-fmt:
+          context: dockerhub-readonly
+      - tf-validate:
+          name: tf/validate/rds
+          context: dockerhub-readonly
+          directory: rds
+      - tf-validate:
+          name: tf/validate/mongo/action-logs
+          context: dockerhub-readonly
+          directory: mongo/action-logs
+      - tf-validate:
+          name: tf/validate/mongo/domain-model
+          context: dockerhub-readonly
+          directory: mongo/domain-model
+      - tf-validate:
+          name: tf/validate/domain-model-b
+          context: dockerhub-readonly
+          directory: mongo/domain-model-b
+      - lint-rds-management
+      - lint-pgrepack-client
+      - publish-rds-management-dev:
+          context: org-global
+          requires:
+            - lint-rds-management
+          filters:
+            branches:
+              ignore:
+                - main
+      - publish-rds-management:
+          context: org-global
+          requires:
+            - lint-rds-management
+          filters:
+            branches:
+              only:
+                - main
+
+references:
+  project: &project db-infrastructure
+  dir: &dir ~/db-infrastructure
+  rds-management: &rds-management ~/db-infrastructure/dbre-monorepo/rds_management
+  pgrepack-client: &pgrepack-client ~/db-infrastructure/scripts/pgrepack_client
+
+executors:
+  ccc:
+    working_directory: *dir
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    environment:
+      DOCKER_REGISTRY: ecr
+      NAMESPACE: data
+
+  terraform:
+    docker:
+      - image: circleci/terraform:1.1.8-circle1
+        auth:
+          username: $RO_DOCKER_HUB_USERNAME
+          password: $RO_DOCKER_HUB_PASSWORD
+    working_directory: ~/src
+    shell: /bin/bash -eo pipefail -o nounset
+
+  python:
+    docker:
+      - image: python:3.10
+    parameters:
+      project:
+        type: string
+    environment:
+      POETRY_VIRTUALENVS_PATH: /<<parameters.project>>/virtualenvs/envs
+      POETRY_CACHE_DIR: /<<parameters.project>>/virtualenvs/cache
+
+commands:
+
+  setup-python-dependencies:
+    description: Setup the python environment for testing and linting
+    parameters:
+      project:
+        type: string
+    steps:
+      - restore_cache:
+          keys:
+            - poetry-cache-v5-{{ arch }}-{{ .Branch }}-{{ checksum "poetry.lock" }}
+            - poetry-cache-v5-{{ arch }}-{{ .Branch }}
+            - poetry-cache-v5
+      - run: echo "export PATH=$HOME/.poetry/bin:$PATH" >> $BASH_ENV
+      - run: curl -sSL https://raw.githubusercontent.com/python-poetry/poetry/master/get-poetry.py | python -
+      - run: poetry install
+      - save_cache:
+          key: poetry-cache-v5-{{ arch }}-{{ .Branch }}-{{ checksum "poetry.lock" }}
+          paths: /<<parameters.project>>/virtualenvs
+
+  lint:
+    description: Lint the project.
+    parameters:
+      project:
+        type: string
+    steps:
+      - setup-python-dependencies:
+          project: <<parameters.project>>
+      - run: poetry run pylint <<parameters.project>>
+      - run: poetry run mypy <<parameters.project>>
+
+  test:
+    description: Test the project.
+    parameters:
+      project:
+        type: string
+    steps:
+      - setup-python-dependencies:
+          project: <<parameters.project>>
+      - run: poetry run pytest
+
+
+jobs:
+  tf-validate:
+    parameters:
+      directory:
+        description: Directory to run terraform validate in
+        type: string
+    executor: terraform
+    steps:
+      - checkout
+      - run:
+          name: terraform validate
+          command: |
+            terraform -chdir=<< parameters.directory >> init -backend=false
+            terraform -chdir=<< parameters.directory >> validate
+  tf-fmt:
+    executor: terraform
+    steps:
+      - checkout
+      - run:
+          name: terraform fmt
+          command: terraform fmt -check -diff -recursive
+  shfmt:
+    docker:
+      - image: alpine:3.15
+    steps:
+      - checkout
+      - run:
+          name: install shfmt
+          command: apk add shfmt
+      - run:
+          name: check shell formatting
+          command: shfmt -l -d .
+
+  lint-rds-management:
+    executor:
+      name: python
+      project: rds-management
+    working_directory: *rds-management
+    steps:
+      - checkout:
+          path: *dir
+      - lint:
+          project: rds_management
+
+  lint-pgrepack-client:
+    executor:
+      name: python
+      project: pgrepack-client
+    working_directory: *pgrepack-client
+    steps:
+      - checkout:
+          path: *dir
+      - lint:
+          project: pgrepack_client
+
+  publish-rds-management-dev:
+    executor: ccc
+    environment:
+      NAME: rds-management
+      DOCKERFILE_PATH: ./dbre-monorepo/rds_management/Dockerfile
+      VALUES_FILE: ./dbre-monorepo/rds_management/values.yaml
+      CONFIGURE_ECR_REPO: true
+      ECR_OWNER_TEAM: Data
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: publish
+
+  publish-rds-management:
+    executor: ccc
+    environment:
+      NAME: rds-management
+      DOCKERFILE_PATH: ./dbre-monorepo/rds_management/Dockerfile
+      VALUES_FILE: ./dbre-monorepo/rds_management/values.yaml
+      CONFIGURE_ECR_REPO: true
+      ECR_OWNER_TEAM: Data
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: publish
+      - run: deploy
+
+

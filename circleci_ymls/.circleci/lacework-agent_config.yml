@@ -1,0 +1,59 @@
+version: 2.1
+
+parameters:
+  chart-version:
+    description: "The Helm chart version to use"
+    type: string
+    default: "1.0.3"
+
+workflows:
+  version: 2
+  main:
+    jobs:
+      - helm-upgrade:
+          context:
+            - org-global
+            - secops
+          filters:
+            branches:
+              only: main
+
+commands:
+  setup-kube-config:
+    description: "Set Kube config"
+    steps:
+      - run:
+          name: setup kube config and environment variables
+          command: |
+            mkdir -p ~/.kube
+            touch ~/.kube/config
+            chmod 0600 ~/.kube/config
+            echo 'export AWS_ACCESS_KEY_ID="$EKS_AWS_ACCESS_KEY_ID"' >> $BASH_ENV
+            echo 'export AWS_SECRET_ACCESS_KEY="$EKS_AWS_SECRET_ACCESS_KEY"' >> $BASH_ENV
+      - aws-eks/update-kubeconfig-with-authenticator:
+          cluster-name: cci-prod-a
+    
+  add-lacework-chart-repo:
+    description: "add lacework helm repository"
+    steps:
+      - helm/install-helm-client:
+          version: v3.5.0
+      - run: "helm repo add lacework https://lacework.github.io/helm-charts"
+      - run: "helm repo update"
+
+jobs:
+  helm-upgrade:
+    executor: aws-eks/python
+    steps:
+      - checkout
+      - setup-kube-config
+      - add-lacework-chart-repo
+      - run:
+          command: |
+            helm upgrade --install --namespace lacework \
+              --set laceworkConfig.accessToken=${LACEWORK_AGENT_TOKEN} \
+              -f values.yaml \
+              lacework-agent lacework/lacework-agent 
+orbs:
+  aws-eks: circleci/aws-eks@1.0.3
+  helm: circleci/helm@1.0

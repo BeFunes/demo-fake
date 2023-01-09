@@ -1,0 +1,224 @@
+version: "2.1"
+
+orbs:
+  slack: circleci/slack@2.6.0
+
+references:
+  clojure_image: &clojure_image
+    image: circleci/clojure-service:0.7-dev
+    auth:
+      username: $DOCKER_HUB_USER
+      password: $DOCKER_HUB_PASSWORD
+
+executors:
+  clj:
+    docker:
+      - <<: *clojure_image
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          VALUES_FILE: ./values.yml
+  integration:
+    docker:
+      - *clojure_image
+
+commands:
+  restore-deps:
+    description: "Restore maven deps from cache and run lein deps"
+    steps:
+      - restore_cache:
+          keys:
+            - maven-{{ checksum "project.clj" }}
+            - maven
+      - run:
+          name: Fetch dependencies
+          command: lein with-profile dev deps
+  save-deps:
+    description: "Save maven deps to cache"
+    steps:
+      - save_cache:
+          key: maven-{{ checksum "project.clj" }}
+          paths:
+            - ~/.m2
+  check-formatting:
+    steps:
+      - run:
+          name: Check code formatting
+          command: lein check
+      - run:
+          name: cljfmt growth-auth-service
+          command: lein cljfmt check
+  # Wrap the slack/status command to only notify on failures
+  slack-notify-on-failure:
+    steps:
+      - slack/status:
+          fail_only: true
+          only_for_branch: "main"
+
+jobs:
+  # Initialize the environment by pulling maven dependencies into ~/.m2 and caching them for future
+  # steps and future builds.
+  init-service:
+    executor:
+      name: clj
+    working_directory: ~/growth-auth-service
+    steps:
+      - checkout:
+          path: ~/growth-auth-service
+      - restore-deps
+      - save-deps
+      - slack-notify-on-failure
+
+  # Build the uberjar (the standalone JAR file that ends up deployed in production)
+  build-service-uberjar:
+    executor:
+      name: clj
+    working_directory: ~/growth-auth-service
+    steps:
+      - checkout:
+          path: ~/growth-auth-service
+      - restore-deps
+      - run:
+          name: Build uberjar
+          command: |
+            lein uberjar
+            cp -v target/uberjar/growth-auth-service-*-standalone.jar target/growth-auth-service-standalone.jar
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target/growth-auth-service-standalone.jar
+      - slack-notify-on-failure
+  # Runs linters on the Clojure code
+  lint-service:
+    executor:
+      name: clj
+    working_directory: ~/growth-auth-service
+    steps:
+      - checkout:
+          path: ~/growth-auth-service
+      - restore-deps
+      - check-formatting
+      - run: lein clj-kondo
+      - slack-notify-on-failure
+  # Runs all the Clojure tests
+  test-service:
+    executor: integration
+    working_directory: ~/growth-auth-service
+    steps:
+      - checkout:
+          path: ~/growth-auth-service
+      - restore-deps
+      - run: lein test
+      - store_test_results:
+          path: target/test-results
+      - slack-notify-on-failure
+
+  # Runs a Twistlock/Prisma scan on feature branches
+  # See https://github.com/circleci/engineering/blob/master/howto/prisma-scan-for-vulns.md
+  scan-service:
+    executor:
+      name: ccc
+    environment:
+      NAME: growth-auth-service
+      DEPLOY_CLOJURE_JARFILE: target/growth-auth-service-standalone.jar
+    working_directory: ~/growth-auth-service
+    steps:
+      - checkout:
+          path: ~/growth-auth-service
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: scan
+      - store_artifacts:
+          path: ccc-image-scan-results
+          destination: growth-auth-service/ccc-image-scan-results
+      - slack-notify-on-failure
+
+  # Publishes to ECR/Docker Hub and deploys the service on master and canary branches
+  publish-deploy-service:
+    executor:
+      name: ccc
+    environment:
+      NAME: growth-auth-service
+      DEPLOY_CLOJURE_JARFILE: target/growth-auth-service-standalone.jar
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/growth-auth-service
+      DEPLOY_TYPE: helm
+      DOCKER_REGISTRY: all
+      VALUES_FILE: values.yml
+    working_directory: ~/growth-auth-service
+    steps:
+      - checkout:
+          path: ~/growth-auth-service
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - when:
+          condition:
+            not: # exclusive rather than inclusive to protect against branches being renamed
+              equal: [main, << pipeline.git.branch >>]
+          steps:
+            - run:
+                name: Configure canary
+                command: |
+                  # These override default values from CCC and the executor.
+                  echo "export RELEASE_VERSION=canary" >> "${BASH_ENV}"
+                  echo "export ROLLBAR_ENVIRONMENT=canary" >> "${BASH_ENV}"
+                  echo "export VALUES_FILE=canary.yml" >> "${BASH_ENV}"
+                  /deploy/merge-values values.yml canary-overrides.yml > canary.yml
+      - run: publish
+      - run: deploy
+      - slack-notify-on-failure
+  render-helm-chart:
+    executor: ccc
+    steps:
+      - checkout
+      - run:
+          name: create helm package
+          command: |
+            /deploy/scripts/dry-run.sh
+      - slack-notify-on-failure
+workflows:
+  deploy:
+    jobs:
+      - init-service:
+          context: org-global
+      - build-service-uberjar:
+          context: org-global
+          requires:
+            - init-service
+      - lint-service:
+          context: org-global
+          requires:
+            - init-service
+      - test-service:
+          context: org-global
+          requires:
+            - init-service
+      - scan-service:
+          context: org-global
+          requires:
+            - build-service-uberjar
+          filters:
+            branches:
+              # fret not, scans are run on master and canary too, as part of the real publish
+              ignore:
+                - main
+                - canary
+      - render-helm-chart:
+          context: org-global
+      - publish-deploy-service:
+          context: org-global
+          requires:
+            - render-helm-chart
+            - build-service-uberjar
+            - lint-service
+            - test-service
+          filters:
+            branches:
+              only:
+                - main
+                - canary

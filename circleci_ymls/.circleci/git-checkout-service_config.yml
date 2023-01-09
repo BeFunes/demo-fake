@@ -1,0 +1,231 @@
+version: 2.1
+
+workflows:
+  main-workflow:
+    jobs:
+      - lint
+      - test
+      - build
+      - docker-image:
+          context: org-global
+          requires:
+            - lint
+            - test
+            - build
+      - helm-package-dry-run:
+          context: org-global
+          filters:
+            branches:
+              ignore:
+                - main
+      - deploy:
+          context: org-global
+          filters:
+            branches:
+              only:
+                - main
+          requires:
+            - lint
+            - test
+            - build
+            - docker-image
+
+executors:
+  default:
+    docker:
+      - image: &goimage cimg/go:1.17
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    environment:
+      NAME: << pipeline.parameters.release-name >>
+      DOCKERFILE_PATH: Dockerfile
+      CUSTOM_CHART: deploy
+
+parameters:
+  release-name:
+    type: string
+    default: git-checkout
+  release-version:
+    type: string
+    default: "v1"
+
+jobs:
+  lint:
+    docker:
+      - image: *goimage
+    resource_class: large
+    steps:
+      - setup
+      - run:
+          name: generate
+          command: ./do generate
+      - run:
+          name: go tidy
+          command: go mod tidy -v
+      - run:
+          name: verify no changes
+          command: git diff --ignore-matching-lines='Generated on ' --exit-code
+      - run: ./do lint-report
+      - store_results
+
+  build:
+    docker:
+      - image: *goimage
+    resource_class: large
+    steps:
+      - setup
+      - run: ./do generate
+      - run: ./do build
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target
+
+  docker-image:
+    executor: ccc
+    environment:
+      CONFIGURE_ECR_REPO: true
+      ECR_OWNER_TEAM: Pipelines
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - create_and_scan_docker_image
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.tag
+
+  test:
+    docker:
+      - image: *goimage
+      - image: circleci/postgres:13.3-ram
+        environment:
+          POSTGRES_USER: user
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: dbname
+    resource_class: large
+    steps:
+      - setup
+      - run: ./do create-stub-test-files
+      - run:
+          name: run tests
+          command: ./do test ./...
+      - store_results
+
+  deploy:
+    executor: ccc
+    environment:
+      AWS_DEFAULT_REGION: us-east-1
+      RELEASE_VERSION: << pipeline.parameters.release-version >>
+      CONFIGURE_ECR_REPO: true
+      ECR_OWNER_TEAM: Pipelines
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run: deploy
+      - notify_honeycomb
+
+
+  helm-package-dry-run:
+    executor: ccc
+    steps:
+      - checkout
+      - run:
+          name: Override container version & dry run
+          command: |
+            IGNORE_VERSION=1 /deploy/dry-run
+            ls -la .helm.diff
+      - run:
+          name: Install GitHub CLI
+          command: |
+            curl -fsSL 'https://github.com/cli/cli/releases/download/v1.11.0/gh_1.11.0_linux_amd64.tar.gz' | tar -C /usr/local --strip-components=1 -xz
+      - run:
+          name: Comment on pull request
+          command: |
+            if [ ! -s ".helm.diff" ]
+            then
+              echo "No diff found"
+              exit 0
+            fi
+            if [ ! -n "$CI_PULL_REQUEST" ]
+            then
+              echo "No PR found"
+              exit 0
+            fi
+            echo "## Helm diff: <sup>[CI link]( $CIRCLE_BUILD_URL )</sup>" > comment.txt
+            echo '<details><summary>Details (click me)</summary>' >> comment.txt
+            echo '' >> comment.txt
+            echo '```diff' >> comment.txt
+            cat '.helm.diff' >> comment.txt
+            echo '```' >> comment.txt
+            echo '</details>' >> comment.txt
+            echo "Commenting on ${CI_PULL_REQUEST}"
+            gh pr comment "${CI_PULL_REQUEST}" --body-file comment.txt
+
+
+commands:
+  notify_honeycomb:
+    steps:
+      - run:
+          name: Notify Honeycomb
+          command: |
+            cat \<< EOF | tee /tmp/honeycomb-marker
+            {
+              "message": "Deploying go-service-template $(<docker_image.tag)",
+              "type":"deploy"
+            }
+            EOF
+            curl https://api.honeycomb.io/1/markers/execution \
+              -H "X-Honeycomb-Team: $HONEYCOMB_WRITEKEY" \
+              -d @/tmp/honeycomb-marker
+
+  setup:
+    steps:
+      - checkout
+      - run: go mod download
+      - run: ./do install-devtools
+
+  store_results:
+    steps:
+      - run:
+          name: Strip ANSI codes from xunit output
+          when: always
+          command: |
+            # The test output produces ANSI codes, which the XML writer converts into annoying
+            # \0xfffd characters - we'll strip these out to make the XML a bit more readable
+            sed -i 's/�\[[0-9;]*[a-zA-Z]//g' test-reports/*.xml || true
+      - store_artifacts:
+          path: test-reports
+      - store_test_results:
+          path: test-reports
+
+  remote_docker:
+    steps:
+      - setup_remote_docker
+      - run: docker version
+
+  create_and_scan_docker_image:
+    steps:
+      - remote_docker
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: create and scan docker image
+          command: |
+            set -x
+            if [[ "$CIRCLE_BRANCH" = "main" || "$CIRCLE_BRANCH" = "canary" ]]; then
+              # TODO change to all once dockerhub repo is ready
+              export DOCKER_REGISTRY=ecr
+            else
+              # this is how we tell CCC not to actually publish
+              export DOCKER_REGISTRY=none
+            fi
+
+            publish

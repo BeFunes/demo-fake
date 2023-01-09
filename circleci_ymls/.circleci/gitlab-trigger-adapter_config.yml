@@ -1,0 +1,191 @@
+version: 2.1
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+workflows:
+  main:
+    jobs:
+      - lint:
+          matrix:
+            parameters:
+              go_version:
+                - '1.17'
+
+      - test:
+          name: test-<< matrix.go_version >><< matrix.submodule >>
+          matrix:
+            parameters:
+              go_version:
+                - '1.17'
+              submodule:
+                - ""
+
+      - run_acceptance_tests:
+          requires:
+            - lint
+            - test
+          matrix:
+            parameters:
+              go_version:
+                - '1.17'
+
+      - deploy:
+          context: org-global
+          requires:
+            - lint
+            - test
+            - run_acceptance_tests
+          filters:
+            branches:
+              only: main
+
+jobs:
+
+  lint:
+    parameters:
+      go_version:
+        type: string
+    docker:
+      - image: cimg/go:<<parameters.go_version>>
+    steps:
+      - checkout
+      - setup
+      - run:
+          name: Check rootcerts is up to date
+          command: ./do check-rootcerts
+      - run:
+          name: Lint
+          command: ./do lint-report
+      - cleanup
+
+  test:
+    parameters:
+      go_version:
+        type: string
+      submodule:
+        type: string
+    docker:
+      - image: cimg/go:<<parameters.go_version>>
+      - image: circleci/postgres:13.3-ram
+        environment:
+          POSTGRES_USER: user
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: dbname
+    working_directory: ~/project/<<parameters.submodule>>
+    steps:
+      - checkout:
+          path: ~/project
+      - setup
+      - run:
+          name: Run tests
+          command: ./do test
+      - cleanup
+
+  run_acceptance_tests:
+    parameters:
+      go_version:
+        type: string
+    working_directory: ~/project/
+    docker:
+      - image: cimg/go:<<parameters.go_version>>
+      - image: circleci/postgres:13.3-ram
+        environment:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+    steps:
+      - checkout:
+          path: ~/project
+      - setup
+      - install_docker_compose
+      - setup_remote_docker
+      - run_acceptance_tests
+      - stop_docker_compose
+
+  deploy:
+    executor: ccc
+    environment:
+      NAME: gitlab-trigger-adapter
+      DOCKER_REGISTRY: all
+      VALUES_FILE: values.yaml
+      DOCKERFILE_PATH: Dockerfile
+      RELEASE_VERSION: v1
+    working_directory: ~/repo
+    steps:
+      - setup_remote_docker:
+          version: 19.03.8
+      - checkout
+      - set_version
+      - attach_workspace:
+          at: .
+      - run: publish
+      - run: deploy
+
+commands:
+  setup:
+    steps:
+      - run:
+          name: Adding GOPATH bin to PATH
+          command: echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> "$BASH_ENV"
+      - run:
+          name: Install devtools
+          command: ./do install-devtools
+      - run:
+          name: Make test-reports dir
+          command: mkdir -p test-reports
+  set_version:
+    steps:
+      - run:
+          name: Compute and set a single version
+          command: |
+            set -o errexit
+            set -o nounset
+            version="1.0.<<pipeline.number>>-${CIRCLE_SHA1:0:7}"
+            echo "export SERVICE_VERSION=${version}" >> ${CIRCLE_SHELL_ENV}
+            echo "export CONTAINER_VERSION=${version}" >> ${CIRCLE_SHELL_ENV}
+            echo ${version}
+  run_docker_compose:
+    steps:
+      - run:
+          name: Runs the app through Docker Compose
+          command: |
+            docker-compose up -d
+  run_acceptance_tests:
+    steps:
+      - run:
+          name: Runs the acceptance tests
+          command: |
+            set -eo pipefail
+            docker-compose -f docker-compose.test.yml up -d db 
+            sleep 10
+            docker-compose -f docker-compose.test.yml up -d api 
+            docker-compose -f docker-compose.test.yml up --abort-on-container-exit test
+  stop_docker_compose:
+    steps:
+      - run:
+          name: Stops the app running with docker compose
+          command: |
+            docker-compose down
+  cleanup:
+    steps:
+      - store_artifacts:
+          path: test-reports
+      - store_test_results:
+          path: test-reports
+
+  install_docker_compose:
+    steps:
+      - run:
+          name: Install Docker Compose
+          environment:
+            COMPOSE_VERSION: '1.29.2'
+          command: |
+            curl -L "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o ~/docker-compose
+            chmod +x ~/docker-compose
+            sudo mv ~/docker-compose /usr/local/bin/docker-compose

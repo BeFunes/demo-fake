@@ -1,0 +1,225 @@
+version: 2.1
+
+# NB: Must match `project.clj` modules
+modules: &modules
+  - caching
+  - lib/git-safe
+  - lib/shell-safe
+  - update-clj-parent
+  - kpis
+
+orbs:
+  codecov: codecov/codecov@1.2.2
+
+commands:
+  compute_cache_key:
+    steps:
+      - run:
+          name: Compute cache key
+          command: |
+            echo "v1.0.0-" > cache-key
+            for _project in $(find . -maxdepth 3 -type f -name 'project.clj' | sort); do
+              sha256sum "${_project}" >> cache-key
+            done
+
+executors:
+  clojure:
+    docker:
+      - image: circleci/clojure-service:0.8-dev
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+jobs:
+  clj-kondo:
+    docker:
+      - image: cljkondo/clj-kondo:2021.02.13
+    steps:
+      - checkout
+      - run: clj-kondo --config .clj-kondo/config.edn --lint .
+
+  setup:
+    executor: clojure
+    steps:
+      - checkout
+      - compute_cache_key
+      - restore_cache:
+          keys:
+            - v1-jars-{{ checksum "cache-key" }}
+            - v1-jars
+      - run: lein modules install
+      - run: lein modules with-profile dev deps
+      - run:
+          # Ensure that later test steps will use checkout version of modules
+          # rather than cached versions from previous builds.
+          name: Carry SNAPSHOT libs in the workspace and not the cache
+          command: |
+            destination="workspace/.m2-snapshots"
+            mkdir -p "${destination}"
+            packages=$(ls -d ~/.m2/repository/circleci/*/*-SNAPSHOT | xargs -n1 dirname | sort | uniq)
+            for package in $packages; do
+              mv -v "${package}" "${destination}"
+            done
+            cp kpis/lein_profiles.clj workspace/lein_profiles.clj
+      - save_cache:
+          key: v1-jars-{{ checksum "cache-key" }}
+          paths:
+            - ~/.m2
+      - persist_to_workspace:
+          root: workspace
+          paths:
+            - .m2-snapshots
+            - lein_profiles.clj
+
+  test-module:
+    parameters:
+      module:
+        type: string
+    executor: clojure
+    steps:
+      - checkout
+      - compute_cache_key
+      - restore_cache:
+          keys:
+            - v1-jars-{{ checksum "cache-key" }}
+            - v1-jars
+      - attach_workspace:
+          at: workspace
+      - run:
+          name: Restore SNAPSHOT libs from workspace
+          command: |
+            if [ -d workspace/.m2-snapshots ]; then
+              mv -v workspace/.m2-snapshots/* ~/.m2/repository/circleci/
+            fi
+            cp workspace/lein_profiles.clj ~/.lein/profiles.clj
+      - run: lein modules :dirs << parameters.module >> test-ci
+      - run:
+          command: lein modules :dirs << parameters.module >> eastwood '{:config-files ["../eastwood.clj.cfg"]}'
+          when: always
+      - codecov/upload
+      - store_test_results:
+          path: << parameters.module >>/target/test-results
+
+  scan-kpis-image:
+    executor:
+      name: ccc
+    environment:
+      NAME: backplane-kpis
+      DOCKERFILE_PATH: Dockerfile-kpis
+    working_directory: ~/backplane-tools
+    steps:
+      - checkout:
+          path: ~/backplane-tools
+      - setup_remote_docker
+      - attach_workspace:
+          at: workspace
+      - run: scan
+      - store_artifacts:
+          path: ccc-image-scan-results
+          destination: backplane-kpis/ccc-image-scan-results
+
+  publish-kpis-image:
+    executor:
+      name: ccc
+    environment:
+      NAME: backplane-kpis
+      DOCKERFILE_PATH: Dockerfile-kpis
+      DOCKER_REGISTRY: ecr
+    working_directory: ~/backplane-tools
+    steps:
+      - checkout:
+          path: ~/backplane-tools
+      - setup_remote_docker
+      - attach_workspace:
+          at: workspace
+      - run: publish
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.tag
+
+  schedule-kpis-job-dry-run:
+    executor:
+      name: ccc
+    environment:
+      NAME: backplane-kpis
+      CUSTOM_CHART: chart
+      NAMESPACE: jail
+    working_directory: ~/backplane-tools/kpis
+    steps:
+      - checkout:
+          path: ~/backplane-tools
+      - setup_remote_docker
+      - run: /deploy/dry-run
+
+  schedule-kpis-job:
+    executor:
+      name: ccc
+    environment:
+      NAME: backplane-kpis
+      CUSTOM_CHART: chart
+      NAMESPACE: jail
+    working_directory: ~/backplane-tools/kpis
+    steps:
+      - checkout:
+          path: ~/backplane-tools
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run: deploy
+
+
+workflows:
+  build-test:
+    jobs:
+      - clj-kondo:
+          context: org-global
+      - setup:
+          context: org-global
+      - test-module:
+          context: org-global
+          requires:
+            - setup
+          matrix:
+            parameters:
+              module: *modules
+      - scan-kpis-image:
+          context: org-global
+          requires:
+            - setup
+          filters:
+            branches:
+              ignore:
+                - main
+      - schedule-kpis-job-dry-run:
+          context: org-global
+          requires:
+            - setup
+          filters:
+            branches:
+              ignore:
+                - main
+      - publish-kpis-image:
+          context: org-global
+          requires:
+            - setup
+            - test-module
+          filters:
+            branches:
+              only:
+                - main
+      - schedule-kpis-job:
+          context: org-global
+          requires:
+            - publish-kpis-image
+          filters:
+            branches:
+              only:
+                - main

@@ -1,0 +1,788 @@
+version: 2.1
+orbs:
+  aws-cli: circleci/aws-cli@1.4.0
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+  slack: circleci/slack@4.4.4
+
+workflows:
+  ci:
+    when:
+      not:
+        equal: [ scheduled_pipeline, << pipeline.trigger_source >> ]
+    jobs:
+      - generate_docker_version
+
+      - test:
+          name: << matrix.service >>-tests
+          context: org-global
+          matrix:
+              parameters:
+                service: 
+                  - vm-circuit-breaker
+                  - vm-scaler
+                  - vm-service
+                  - vm-stats
+
+      - lint:
+          name: << matrix.service >>-lint
+          context: org-global
+          matrix:
+              parameters:
+                service: 
+                  - vm-circuit-breaker
+                  - vm-scaler
+                  - vm-service
+                  - vm-stats
+
+      - build-service:
+          name: << matrix.service >>-build
+          context: org-global
+          matrix:
+              parameters:
+                service: 
+                  - vm-circuit-breaker
+                  - vm-scaler
+                  - vm-service
+                  - vm-stats
+
+      - codecov:
+          name: << matrix.service >>-codecov
+          context: org-global
+          matrix:
+              parameters:
+                service: 
+                  - vm-circuit-breaker
+                  - vm-scaler
+                  - vm-service
+                  - vm-stats
+
+      - integration-test:
+          name: vm-circuit-breaker-integration-tests
+          service: vm-circuit-breaker
+          context: org-global
+
+      - e2e-test:
+          name: << matrix.service >>-e2e-tests
+          context: org-global
+          matrix:
+            parameters:
+              service:
+                - vm-circuit-breaker
+                - vm-scaler
+                - vm-service
+                - vm-stats
+
+      - twistlock-check-and-publish:
+          name: vm-service-publish
+          service: vm-service
+          working_directory: vm-service
+          dockerfile_path: Dockerfile
+          context: org-global
+          requires:
+            - vm-service-tests
+            - vm-service-build
+            - vm-service-lint
+            - generate_docker_version
+            - structure-is-current
+
+      - twistlock-check-and-publish:
+          name: vm-stats-publish
+          service: vm-stats
+          working_directory: vm-stats
+          clojure_main_class: vm-stats.core
+          context: org-global
+          requires:
+            - vm-stats-tests
+            - vm-stats-e2e-tests
+            - vm-stats-build
+            - vm-stats-lint
+            - generate_docker_version
+            - structure-is-current
+
+      - twistlock-check-and-publish:
+          name: vm-scaler-publish
+          service: vm-scaler
+          working_directory: vm-scaler
+          clojure_main_class: vm-scaler.main
+          context: org-global
+          requires:
+            - vm-scaler-tests
+            - vm-scaler-e2e-tests
+            - vm-scaler-build
+            - vm-scaler-lint
+            - generate_docker_version
+            - structure-is-current
+
+      - twistlock-check-and-publish:
+          name: vm-circuit-breaker-publish
+          service: vm-circuit-breaker
+          working_directory: vm-circuit-breaker
+          clojure_main_class: vm-circuit-breaker.main
+          context: org-global
+          requires:
+            - vm-circuit-breaker-tests
+            - vm-circuit-breaker-integration-tests
+            - vm-circuit-breaker-build
+            - vm-circuit-breaker-lint
+            - generate_docker_version
+            - structure-is-current
+
+      - twistlock-check-and-publish-migrator:
+          name: vm-service-db-migrator-publish
+          context: org-global
+          requires:
+            - generate_docker_version
+            - validate-migrations
+
+      - twistlock-check-and-publish:
+          name: vm-gc-publish
+          service: vm-gc
+          working_directory: gc
+          dockerfile_path: Dockerfile
+          context: org-global
+          requires:
+            - generate_docker_version
+
+      - structure-is-current:
+          context: org-global
+      - go_lint
+      - helm_package:
+          context: org-global
+      - validate-migrations
+      - check-links
+      - deploy:
+          context: org-global
+          requires:
+            - helm_package
+            - vm-service-publish
+            - vm-circuit-breaker-publish
+            - vm-stats-publish
+            - vm-scaler-publish
+            - vm-service-db-migrator-publish
+            - vm-gc-publish
+
+          filters:
+            branches:
+              only:
+                - master
+                - canary
+      - scotty-orb/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          promotion_component_list: "circleci/vm-service circleci/vm-service-db-migrator circleci/vm-gc circleci/vm-scaler"
+          requires:
+            - vm-service-publish
+            - vm-service-db-migrator-publish
+            - vm-gc-publish
+            - vm-scaler-publish
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-\d\..+/
+
+      - get-machine-provisioner-config:
+          context: org-global
+          filters:
+            branches:
+              ignore: [/^server-\d\..+/]
+
+      - check-machine-provisioner-config:
+          context: org-global
+          requires:
+            - get-machine-provisioner-config
+          filters:
+            branches:
+              ignore: [/^server-\d\..+/]
+
+  compute_cleanup:
+    when:
+      and:
+        - equal: [ scheduled_pipeline, << pipeline.trigger_source >> ]
+        - equal: [ "gc", << pipeline.schedule.name >> ]
+    jobs:
+      - cleanup_gce
+      - cleanup_aws
+
+references:
+  go-image: &go-image
+    image: cimg/go:1.17
+  ccc-image: &ccc-image
+    image: circleci/command-convenience:0.1
+    auth:
+      username: $DOCKER_HUB_USER
+      password: $DOCKER_HUB_PASSWORD
+  clojure-image: &clojure-image
+    image: circleci/clojure-service:0.6-dev
+    auth:
+      username: $DOCKER_HUB_USER
+      password: $DOCKER_HUB_PASSWORD
+  postgres-image: &postgres-image
+    image: circleci/postgres:12.4-ram
+    environment:
+      POSTGRES_USER: root
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_DB: root
+  rabbitmq-image: &rabbitmq-image
+    image: rabbitmq:3.8-management-alpine
+    name: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_VHOST: vm-service
+
+commands:
+  run-migrations:
+    steps:
+      - run:
+          name: Test DB migrations
+          working_directory: ~/vm-service
+          command: |
+            migrate() {
+              flyway -url=jdbc:postgresql://postgres:5432/root -schemas=vms -user=root -password= -table=schema_version -locations=filesystem:./sql migrate
+            }
+            # Setup 'postgres -> localhost' compatibility alias
+            echo '127.0.0.1 postgres' | sudo tee -a /etc/hosts
+            for n in $(seq 1 10)
+            do
+              if migrate; then exit 0; fi
+              echo 'migration failed, sleep and wait'
+              sleep $n
+            done
+            echo 'migration failed after many retries'
+            exit 1
+
+          environment:
+            DATABASE_HOST: postgres
+            DATABASE_NAME: root
+            DATABASE_USER: root
+
+  codecov-upload:
+    parameters:
+      codecov_flag:
+        type: string
+    steps:
+      - run:
+          name: Upload code coverage report to codecov.io
+          when: always
+          command: >
+            curl -s https://codecov.io/bash |
+            bash -s --
+            -f target/coverage/codecov.json
+            -F '<< parameters.codecov_flag >>'
+
+  checkout_and_restore:
+    steps:
+      - checkout:
+          path: ~/vm-service
+
+      - restore_cache:
+          keys:
+            - v4-{{ .Environment.CIRCLE_JOB }}-jars-{{ checksum "project.clj" }}
+
+  save_service_cache:
+    steps:
+      - save_cache:
+          key: v4-{{ .Environment.CIRCLE_JOB }}-jars-{{ checksum "project.clj" }}
+          paths:
+            - ~/.m2
+
+  notify_failing_master:
+    steps:
+      - slack/notify:
+          channel: fleets-alerts
+          branch_pattern: master
+          event: fail
+          template: basic_fail_1
+
+jobs:
+  validate-migrations:
+    docker:
+      - image: alpine:3.8
+    steps:
+      - run: apk add --no-cache git bash diffutils
+      - checkout
+      - run: ./scripts/validate-migrations sql
+  check-links:
+    docker:
+      - image: raviqqe/liche:0.1.1
+    steps:
+      - checkout
+      - run: /liche -r -d. -x '^https?:\/\/' .
+
+  get-machine-provisioner-config:
+    docker:
+      - *ccc-image
+    steps:
+      - checkout
+      - run: env AWS_ACCESS_KEY_ID="${EKS_AWS_ACCESS_KEY_ID}" AWS_SECRET_ACCESS_KEY="${EKS_AWS_SECRET_ACCESS_KEY}" kubectl get -o jsonpath="{$.data.*}" configmap machine-provisioner-v1-configmap > machine-provisioner-config.yaml
+      - run:
+          name: "Template vm-service config"
+          command: |
+            cd charts/vm-service
+            sed -i 's/[<]<chart_name>>/Test/' Chart.yaml
+            sed -i 's/[<]<chart_version>>/1.2.3/' Chart.yaml
+            helm template . -s 'templates/vm-service-config.yaml' > ../../vm-service-config.yaml
+            cd -
+      - persist_to_workspace:
+          root: .
+          paths:
+            - machine-provisioner-config.yaml
+            - vm-service-config.yaml
+
+  check-machine-provisioner-config:
+    docker:
+      - *go-image
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run: yq eval '.data."config.edn"' vm-service-config.yaml > vm-service-config.edn
+      - run: go run cmd/compare-mp-and-vms-config-images/main.go --vm-service-config vm-service-config.edn --machine-provisioner-config machine-provisioner-config.yaml
+      - run: go run cmd/vet-gcp-images/main.go --vm-service-config vm-service-config.edn --project circleci-picard-mahmood
+
+  structure-is-current:
+    working_directory: ~/vm-service
+    docker:
+      - *clojure-image
+      - *postgres-image
+    steps:
+      - checkout
+      - run:
+          name: Download PostgreSQL client
+          command: |
+            . /etc/os-release
+            echo "deb http://apt.postgresql.org/pub/repos/apt $VERSION_CODENAME-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+            curl -s https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client-12
+      - run:
+          name: Ensure migration files are not kebab-cased
+          command: |
+            # If `test` exit code is not zero, kebab-cased migration
+            # scripts may have been added. Please use snake casing for
+            # migration scripts.
+            test $(find sql -name '*-*.sql' -depth 1 | wc -l) -eq 0
+      - run-migrations
+      - run:
+          name: Dump migrated schema
+          command: ./scripts/dump-schema
+          environment:
+            DATABASE: root
+            PG_DUMP_COMMAND: pg_dump --host=localhost
+      - run:
+          name: Check that structure.sql accounts for migrations
+          command: |
+            # If the `diff` exit code is not zero, the structure.sql file is
+            # out-of date. Read https://github.com/circleci/vm-service/blob/master/docs/migrations.md
+            # for instructions on creating migrations.
+            git diff --exit-code
+      - store_artifacts:
+          path: structure.sql
+
+  lint:
+    parameters:
+      service:
+        description: "The service to test"
+        type: string
+    docker:
+      - *clojure-image
+    resource_class: small
+    working_directory: ~/vm-service/<< parameters.service >>
+    steps:
+      - checkout_and_restore
+      - run:
+          name: "Lint"
+          command: lein cljfmt check
+      - save_service_cache
+      - notify_failing_master
+
+  test:
+    parameters:
+      service:
+        description: "The service to test"
+        type: string
+    docker:
+      - *clojure-image
+      - *postgres-image
+      - *rabbitmq-image
+    resource_class: large
+    working_directory: ~/vm-service/<< parameters.service >>
+    steps:
+      - checkout_and_restore
+      - run-migrations
+      - run:
+          name: "Run tests"
+          command: lein test-local --plugin profiling --plugin capture-output --reporter documentation --plugin junit-xml --junit-xml-file target/test-results/results.xml
+          environment:
+            GOOGLE_APPLICATION_CREDENTIALS: ./config/config-dev-gce-credentials.json
+            RABBITMQ__PASSWORD: "guest"
+            RABBITMQ__USERNAME: "guest"
+      - store_artifacts:
+          path: target/test-results
+      - store_test_results:
+          path: target/test-results
+      - save_service_cache
+      - notify_failing_master
+
+  codecov:
+    parameters:
+      service:
+        description: "The service to run coverage reports on"
+        type: string
+    docker:
+      - *clojure-image
+      - *postgres-image
+      - *rabbitmq-image
+    resource_class: large
+    working_directory: ~/vm-service/<< parameters.service >>
+    steps:
+      - checkout_and_restore
+      - run-migrations
+      - run:
+          name: Test service
+          command: lein test --plugin junit-xml --junit-xml-file target/test-results/results.xml --plugin cloverage --codecov --cov-ns-exclude-regex 'circleci.vm-service.spec-helpers'
+          environment:
+            GOOGLE_APPLICATION_CREDENTIALS: ./config/config-dev-gce-credentials.json
+      - store_artifacts:
+          path: target/test-results
+      - store_test_results:
+          path: target/test-results
+      - store_artifacts:
+          path: target/coverage
+      - codecov-upload:
+          codecov_flag: << parameters.service >>
+      - save_service_cache
+
+  build-service:
+    description: Checks out, runs tests and builds standalone jar for a single microservice
+    parameters:
+      service:
+        description: The service to build
+        type: string
+    docker:
+      - *clojure-image
+    working_directory: ~/vm-service
+    steps:
+      - checkout_and_restore
+
+      - run: mkdir -p target
+
+      - run: cd << parameters.service >>; lein uberjar
+      - run: cp << parameters.service >>/target/uberjar/<< parameters.service >>-*-standalone.jar << parameters.service>>/target/<< parameters.service >>-standalone.jar
+      - run:
+          name: Cleaning confidential data from uberjar
+          command: |
+            zip -d << parameters.service >>/target/<< parameters.service >>-standalone.jar \
+              'project.clj' \
+              'META-INF/*/project.clj' \
+              'META-INF/leiningen/amazonica/amazonica/README.md'
+
+      - persist_to_workspace:
+          root: .
+          paths:
+            - << parameters.service>>/target/<< parameters.service>>-standalone.jar
+
+      - save_service_cache
+      - notify_failing_master
+
+  integration-test:
+    parameters:
+      service:
+        description: "The service to integration test"
+        type: string
+
+    docker:
+      - *clojure-image
+      - *postgres-image
+    working_directory: ~/vm-service/<< parameters.service >>
+
+    steps:
+      - checkout_and_restore
+      - run-migrations
+
+      - run:
+          name: Run integration tests
+          command: lein test-integration --plugin profiling --plugin capture-output --reporter documentation --plugin junit-xml --junit-xml-file target/test-results/results.xml
+
+      - store_test_results:
+          path: target/test-results
+
+      - save_service_cache
+      - notify_failing_master
+
+  e2e-test:
+    parameters:
+      service:
+        description: "The service to e2e test"
+        type: string
+
+    docker:
+      - *clojure-image
+      - *postgres-image
+      - *rabbitmq-image
+    working_directory: ~/vm-service/<< parameters.service >>
+
+    steps:
+      - checkout_and_restore
+
+      - when:
+          condition:
+            equal: [ vm-service, << parameters.service >> ]
+          steps:
+            - setup_remote_docker:
+                version: 19.03.14
+            - run: apt-get update
+            - run: apt-get install --yes iproute2
+            # ip route
+            # default via 192.168.96.1 dev eth0
+            # 192.168.96.0/20 dev eth0 proto kernel scope link src 192.168.96.3
+
+      - run:
+          name: Install Go
+          command: curl -fsSL https://golang.org/dl/go1.17.10.linux-amd64.tar.gz | tar -C /usr/local --strip-components 1 -xz
+
+      - run:
+          name: Adding GOPATH bin to PATH
+          command: echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> "$BASH_ENV"
+
+      - run:
+          name: Download dependencies
+          command: go mod download
+
+      - run:
+          name: Install Go devtools
+          command: ../do install-devtools
+
+      - run:
+          name: Run e2e tests
+          command: ../do test
+
+      - store_artifacts:
+          path: /tmp/service-log-errors.log
+
+      - store_artifacts:
+          path: test-reports
+
+      - store_test_results:
+          path: test-reports
+
+      - save_service_cache
+      - notify_failing_master
+
+  deploy:
+    docker:
+      - *ccc-image
+    working_directory: ~/vm-service
+    steps:
+      - run:
+          name: Skip if not cloud
+          command: |
+            # Only deploy from cloud to avoid duplicate deploys
+            [[ "$CIRCLE_BUILD_URL" =~ ^https://circleci.com ]] || \
+              circleci-agent step halt
+
+      - checkout
+      - attach_workspace:
+          at: .
+
+      #### Build and deploy the Helm Package
+      - run:
+          name: Use vm-service tag as overall release version
+          command: |
+            cp vm-service/docker_image.tag .
+            cat docker_image.tag
+      - run:
+          name: deploy helm package
+          command: |
+            if [[ "$CIRCLE_BRANCH" = "canary" ]]; then
+              sed -i'.bak' 's/canary: false/canary: true/' charts/vm-service/values.yaml
+              export RELEASE_VERSION=canary
+              export ROLLBAR_ENVIRONMENT=canary
+            fi
+
+            deploy
+          environment:
+            NAME: vm-service
+            DEPLOY_TYPE: helm
+            DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/vm-service
+            CUSTOM_CHART: charts/vm-service
+      - notify_failing_master
+
+  go_lint:
+    docker:
+      - image: cimg/go:1.17
+    steps:
+      - checkout
+      - run: ./do install-devtools
+      - run: mkdir -p test-reports
+      - run: ./do lint --out-format=junit-xml | tee test-reports/lint.xml
+      - store_artifacts:
+          path: test-reports
+      - store_test_results:
+          path: test-reports
+      - notify_failing_master
+
+  helm_package:
+    docker:
+      - *ccc-image
+    working_directory: ~/vm-service
+    steps:
+      - checkout
+      - run:
+          name: Install Go
+          command: apk add --no-cache go=1.17.10-r0
+      - run:
+          name: Adding GOPATH bin to PATH
+          command: echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> "$BASH_ENV"
+      - run: ./do install-devtools
+      - run: mkdir -p test-reports
+      - run:
+          name: Run chart tests
+          command: ./do test ./charts/...
+      - run:
+          name: create helm package
+          environment:
+            NAME: vm-service
+            DEPLOY_CONTAINER_NAME: example.com/circleci/vm-service
+            CUSTOM_CHART: charts/vm-service
+          command: |
+            /deploy/scripts/dry-run.sh | tee helm-package.txt
+      - store_artifacts:
+          path: helm-package.txt
+      - store_artifacts:
+          path: test-reports
+      - store_test_results:
+          path: test-reports
+      - notify_failing_master
+
+  generate_docker_version:
+    docker:
+      - image: cimg/base:stable
+    working_directory: ~/vm-service
+    steps:
+      - checkout
+      - run: echo "0.1.${CIRCLE_BUILD_NUM}-$(set -e ; git rev-parse --short HEAD)" | tee docker_version.txt
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_version.txt
+      - notify_failing_master
+
+  twistlock-check-and-publish-migrator:
+    docker:
+      - *ccc-image
+    environment:
+      TWISTLOCK_ENFORCE: "false"
+    working_directory: ~/vm-service
+    steps:
+      - setup_remote_docker:
+          version: 20.10.2
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Build vm-service-db-migrator image
+          command: |
+            set -x
+              if [[ "$CIRCLE_BRANCH" = "master" || "$CIRCLE_BRANCH" = "canary" || "$CIRCLE_BRANCH" =~ ^server-[0-9]\..+ ]]; then
+                export DOCKER_REGISTRY=all
+              else
+                # this is how we tell CCC not to actually publish
+                export DOCKER_REGISTRY=none
+              fi
+
+            export CONTAINER_VERSION="$(cat ~/vm-service/docker_version.txt)"
+            publish
+          environment:
+            NAME: vm-service-db-migrator
+            MIGRATIONS_SQL_PATH: sql
+
+  twistlock-check-and-publish:
+    parameters:
+      service:
+        type: string
+      working_directory:
+        type: string
+      clojure_main_class:
+        type: string
+        default: ""
+      dockerfile_path:
+        type: string
+        default: ""
+    docker:
+      - *ccc-image
+    environment:
+      TWISTLOCK_ENFORCE: "false"
+    working_directory: ~/vm-service
+    steps:
+      - setup_remote_docker:
+          version: 20.10.2
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Build << parameters.service >> image
+          command: |
+            set -x
+              if [[ "$CIRCLE_BRANCH" = "master" || "$CIRCLE_BRANCH" = "canary" || "$CIRCLE_BRANCH" =~ ^server-[0-9]\..+ ]]; then
+                export DOCKER_REGISTRY=all
+              else
+                # this is how we tell CCC not to actually publish
+                export DOCKER_REGISTRY=none
+              fi
+
+            export CONTAINER_VERSION="$(cat ~/vm-service/docker_version.txt)"
+            publish
+          working_directory: << parameters.working_directory >>
+          environment:
+            NAME: << parameters.service >>
+            DOCKERFILE_PATH: << parameters.dockerfile_path >>
+            # Only one of these should be used
+            CLOJURE_MAIN_CLASS: << parameters.clojure_main_class >>
+            DEPLOY_CLOJURE_JARFILE: <<^ parameters.dockerfile_path >> target/<< parameters.service >>-standalone.jar <</ parameters.dockerfile_path >>
+      - store_artifacts:
+          path: << parameters.working_directory >>/ccc-image-scan-results
+
+      - persist_to_workspace:
+          root: .
+          paths:
+            - << parameters.working_directory >>/docker_image.tag
+      - notify_failing_master
+
+  cleanup_gce:
+    docker:
+      - image: google/cloud-sdk
+        environment:
+          GOOGLE_APPLICATION_CREDENTIALS: vm-service/config/config-dev-gce-credentials.json
+          GOOGLE_PROJECT_ID: notnoopci-prototype
+          GOOGLE_APPLICATION_CREDENTIALS_STORAGE: vm-service/config/config-dev-dlcpubs-credentials.json
+          GOOGLE_PROJECT_ID_STORAGE: execution-dev
+    working_directory: ~/vm-service
+    steps:
+      - checkout
+      - run:
+          name: configure gcloud (compute)
+          command: |
+            gcloud auth activate-service-account --key-file=$GOOGLE_APPLICATION_CREDENTIALS;
+            gcloud config set project $GOOGLE_PROJECT_ID
+      - run:
+          name: cleanup gce
+          command: scripts/compute-cleanup-gcp.sh
+      - run:
+          name: configure gcloud (storage)
+          command: |
+            gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS_STORAGE"
+            gcloud config set project $GOOGLE_PROJECT_ID_STORAGE
+      - run:
+          name: cleanup execution-dev buckets
+          command: scripts/storage-cleanup.sh
+      - notify_failing_master
+
+  cleanup_aws:
+    executor: aws-cli/default
+    steps:
+      - checkout
+      - aws-cli/setup
+      - run:
+          name: cleanup aws
+          command: scripts/compute-cleanup-aws.sh
+      - notify_failing_master

@@ -1,0 +1,116 @@
+version: 2.1
+
+parameters:
+  run-friday:
+    type: boolean
+    default: false
+  run-daily:
+    type: boolean
+    default: false
+
+orbs:
+  slack: circleci/slack@4.4.4
+
+executors:
+  ccc:
+    docker:
+    - image: circleci/command-convenience:0.1
+      auth:
+        username: $DOCKER_HUB_USER
+        password: $DOCKER_HUB_PASSWORD
+
+jobs:
+  scan-service:
+    executor: ccc
+    environment:
+      NAME: macos-cyberlynkr
+      VALUES_FILE: values.yml
+      TWISTCLI_DEBUG: true
+      DOCKERFILE_PATH: Dockerfile
+    working_directory: /root/macos-cyberlynkr
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /root/macos-cyberlynkr
+      - setup_remote_docker
+      - run: scan
+      - store_artifacts:
+          path: /tmp/twistlock_scan.json
+      - store_artifacts:
+          path: /tmp/_lw-scanner_scan_result.json
+  
+  dry-run-service:
+    executor: ccc
+    environment:
+      NAME: macos-cyberlynkr
+      VALUES_FILE: values.yml
+      TWISTCLI_DEBUG: true
+    working_directory: /root/macos-cyberlynkr
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /root/macos-cyberlynkr
+      - run: /deploy/dry-run | tee output.txt
+      - store_artifacts:
+          path: output.txt
+  
+  publish-deploy-notify:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: macos-cyberlynkr
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: ecr
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/macos-cyberlynkr
+          VALUES_FILE: values.yml
+    working_directory: /root/macos-cyberlynkr
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: publish
+      - run: deploy
+      # Send a failed deploy notification
+      - slack/notify:
+          branch_pattern: main
+          channel: macos-alerts
+          event: fail
+          mentions: '@ask-mac'
+          template: basic_fail_1
+      # Send a successful deploy notification
+      - slack/notify:
+          branch_pattern: main
+          channel: macos-alerts
+          event: pass
+          template: basic_success_1
+
+workflows:
+  dry-run:
+    jobs:
+      - dry-run-service:
+          context: org-global
+          filters:
+            branches:
+              ignore: main
+
+  notify-cyberlynk:
+    when: << pipeline.parameters.run-friday >>
+    jobs:
+      - publish-deploy-notify:
+          context: org-global
+          filters:
+            branches:
+              only:
+                - main
+  scan-image:
+    when: << pipeline.parameters.run-daily >>
+    jobs:
+      - scan-service:
+          context: org-global
+          filters:
+            branches:
+              only:
+                - main

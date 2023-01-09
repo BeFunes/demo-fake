@@ -1,0 +1,163 @@
+version: 2.1
+
+# To get this to work look for all the TODOs and update as needed
+
+# uncomment if you use the promote-to-server job
+# orbs:
+#   scotty-orb: cci-releng/scotty-orb@0
+
+executors:
+  go:
+    docker:
+      - image: circleci/go-service:0.1-dev
+        auth:
+          username: $RO_DOCKER_HUB_USERNAME
+          password: $RO_DOCKER_HUB_PASSWORD
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    environment:
+      GO_BINARY_PATH: ./bin/app
+      DOCKER_REGISTRY: ecr
+      CONFIGURE_ECR_REPO: yes
+      NAME: my-service # TODO
+      ECR_OWNER_TEAM: MyTeam # TODO
+
+jobs:
+  build:
+    executor: go
+    environment:
+      GO_BUILD_TARGET: ./cmd/server/main.go
+    steps:
+      - checkout
+      - run: task go-service:private-go-mod-init
+      - run: task go-service:build
+      - persist_to_workspace:
+          root: .
+          paths:
+            - bin/app
+
+  lint:
+    executor: go
+    steps:
+      - checkout
+      - run: task go-service:private-go-mod-init
+      - run: task lint
+      - run: task lint-mod
+
+  test:
+    executor: go
+    steps:
+      - checkout
+      - run: task go-service:private-go-mod-init
+      - run: task ci:test RESULTS_DIR=/tmp/test-results
+      - store_test_results:
+          path: /tmp/test-results
+
+  scan:
+    executor:
+      name: ccc
+    environment:
+      TWISTCLI_DEBUG: true
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: scan
+      - store_artifacts:
+          path: ccc-image-scan-results
+          destination: service/ccc-image-scan-results
+
+  publish-deploy:
+    executor: ccc
+    environment:
+      VALUES_FILE: values.yml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: publish
+      - run: deploy
+
+  publish-deploy-canary:
+    executor: ccc
+    environment:
+      VALUES_FILE: canary.yml
+      RELEASE_VERSION: canary
+      DEPLOY_ENVIRONMENT: canary
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: publish
+      - run: /deploy/merge-values values.yml canary-overrides.yml > canary.yml
+      - run: deploy
+
+workflows:
+  main-workflow:
+    jobs:
+      - build:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - lint:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+          requires:
+            - build
+      - test:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+          requires:
+            - build
+      - scan:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - build
+          filters:
+            branches:
+              ignore:
+                - main
+                - canary
+# TODO: Uncomment this section to enable deploying to production
+#       - publish-deploy:
+#           context:
+#             - org-global
+#             - github-readonly
+#           requires:
+#             - build
+#             - lint
+#             - test
+#           filters:
+#             branches:
+#               only: main
+# Uncomment this section to enable promoting to server after deploying to production
+#       - scotty-orb/promote-to-server:
+#           name: promote-to-server
+#           context: org-global
+#           promotion_component_list: 'my-component'
+#           requires:
+#             - publish-deploy
+# TODO: Uncomment this section to enable deploying a canary
+#       - publish-deploy-canary:
+#           context:
+#             - org-global
+#             - github-readonly
+#           requires:
+#             - build
+#             - lint
+#             - test
+#           filters:
+#             branches:
+#               only:
+#                 - canary

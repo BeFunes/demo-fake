@@ -1,0 +1,331 @@
+version: 2.1
+
+orbs:
+  shellcheck: circleci/shellcheck@1.1.0
+  codecov: codecov/codecov@1.0.5
+  isolated-changes: cci-dev/isolated-changes@0.0.2
+
+workflows:
+  btd-server:
+    jobs:
+      - shellcheck/check:
+          path: 'server'
+      - structure-is-current:
+          context: org-global
+      - changes_isolated
+      - test_server:
+          context: org-global
+      - test_server_scripts:
+          context: org-global
+      - lint_server:
+          context: org-global
+      - uberjar_server:
+          context: org-global
+      - twistlock-check:
+          context: org-global
+          requires:
+            - uberjar_server
+      - helm-deploy-db-migrator:
+          context: org-global
+          requires: &test_requirements
+            - shellcheck/check
+            - structure-is-current
+            - uberjar_server
+            - test_server
+            - test_server_scripts
+          filters:
+            branches:
+              only: main
+      - helm-deploy-esxi-api:
+          context: org-global
+          requires:
+            - helm-deploy-db-migrator
+          filters:
+            branches:
+              only: main
+      - helm-canary-deploy-esxi-api:
+          context: org-global
+          requires: *test_requirements
+          filters:
+            branches:
+              only: canary
+
+executors:
+  machine:
+    machine:
+      image: ubuntu-2004:202111-02
+
+  clojure:
+    parameters:
+      size:
+        type: string
+        default: medium
+    resource_class: << parameters.size >>
+    docker:
+      - image: "circleci/clojure-service:0.8-dev"
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+      - image: postgres:12.5
+        environment:
+          POSTGRES_USER: root
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: esxi_api_test
+      - image: rabbitmq:3.8.9-management-alpine
+
+  deploy:
+    parameters:
+      dockerfile-path:
+        type: string
+      container-name:
+        type: string
+      values-file:
+        type: string
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: << parameters.container-name >>
+          DOCKERFILE_PATH: << parameters.dockerfile-path >>
+          DOCKER_REGISTRY: ecr
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/<< parameters.container-name >>
+          VALUES_FILE: << parameters.values-file >>
+
+commands:
+  run_migrations:
+    description: "Run Postgres migrations in place"
+    steps:
+      - run:
+          name: Run Migrations
+          command: sql/docker-entrypoint.sh
+          working_directory: /root/esxi-api
+          environment:
+            DATABASE_URL: jdbc:postgresql://localhost:5432/esxi_api_test
+            DATABASE_USER: root
+            DATABASE_PASSWORD: password
+            DATABASE_MIGRATIONS: sql/
+
+  cached_deps:
+    description: "Fetch Clojure dependencies, caching when possible"
+    steps:
+      - restore_cache:
+          keys:
+            - v1-jars-{{ checksum "project.clj" }}
+            - v1-jars-
+      - run:
+          name: Dependencies
+          command: lein do deps, javac
+      - save_cache:
+          key: v1-jars-{{ checksum "project.clj" }}
+          paths:
+            - /root/.m2
+
+jobs:
+  structure-is-current:
+    working_directory: /root/esxi-api
+    executor: clojure
+    steps:
+      - checkout
+      - run:
+          name: Download PostgreSQL client
+          command: |
+            echo "deb http://apt.postgresql.org/pub/repos/apt $(grep VERSION_CODENAME= /etc/os-release | cut -d= -f2)-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+            curl -s https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add -
+            apt-get update
+            apt-get install postgresql-client-12
+      - run:
+          name: Ensure migration files are not kebab-cased
+          command: |
+            # If `test` exit code is not zero, kebab-cased migration
+            # scripts may have been added. Please use snake casing for
+            # migration scripts.
+            test $(find sql -name '*-*.sql' -depth 1 | wc -l) -eq 0
+      - run_migrations
+      - run:
+          name: Dump migrated schema
+          command: ./scripts/dump-schema
+          environment:
+            PG_DUMP_COMMAND: /usr/bin/pg_dump --host=localhost
+            DATABASE: esxi_api_test
+            PGUSER: root
+      - run:
+          name: Check that structure.sql accounts for migrations
+          command: |
+            # If the `diff` exit code is not zero, the structure.sql file is
+            # out-of date. Read https://github.com/circleci/vm-service/blob/main/docs/migrations.md
+            # for instructions on creating migrations.
+            git diff --exit-code
+
+  changes_isolated:
+    working_directory: /home/circleci/esxi-api
+    executor: machine
+    steps:
+      - checkout
+      - isolated-changes/assert_not_both:
+          directory_1: sql
+          directory_2: server
+          base_branch: main
+
+  lint_server:
+    executor: clojure
+    working_directory: /root/esxi-api/server
+    steps:
+      - checkout:
+          path: /root/esxi-api
+      - cached_deps
+      - run:
+          name: Format code
+          command:
+            lein cljfmt check
+      - run:
+          name: Lint code
+          command:
+            lein eastwood || ( cat target/eastwood_warnings.txt && false )
+      - store_artifacts:
+          path: target/eastwood_warnings.txt
+
+  test_server:
+    executor:
+      name: clojure
+      size: large
+    working_directory: /root/esxi-api/server
+    steps:
+      - checkout:
+          path: /root/esxi-api
+      - cached_deps
+      - save_cache:
+          key: v1-jars-{{ checksum "project.clj" }}
+          paths:
+            - /root/.m2
+      - run_migrations
+      - run:
+          name: Code Coverage
+          command: lein run -m kaocha.runner
+          environment:
+            STATSD__HOST: localhost
+            DATABASE_URL: postgres://root:password@localhost:5432/esxi_api_test
+            RABBITMQ__URI: amqp://localhost:5672
+      - store_test_results:
+          path: target/junit.xml
+      - store_artifacts:
+          path: target/coverage
+      - codecov/upload:
+          file: target/coverage/codecov.json
+
+  uberjar_server:
+    executor: clojure
+    working_directory: /root/esxi-api/server
+    steps:
+      - checkout:
+          path: /root/esxi-api
+      - cached_deps
+      - run: lein uberjar
+      - run:
+          name: Fixing uberjar path
+          command: mv target/uberjar/esxi-lifecycle-*standalone.jar target/esxi-lifecycle-standalone.jar
+      - persist_to_workspace:
+          root: target
+          paths:
+            - "*.jar"
+
+  test_server_scripts:
+    executor: machine
+    working_directory: ~/esxi-api/server
+    steps:
+      - checkout:
+          path: ~/esxi-api
+      - run:
+          name: Test esxi-create-vm.sh
+          command: |
+            set -o errexit
+            for _vmx_sha in $(ls script_test/test_esxi-create-vm/vmx-bundle); do
+              echo "Testing standard.vmx version ${_vmx_sha} (medium)"
+              echo
+              ./script_test/test_esxi-create-vm/run-test.sh \
+                  "${_vmx_sha}" \
+                  "script_test/test_esxi-create-vm/expected/${_vmx_sha}/medium.vmx"
+              echo
+              echo
+
+              echo "Testing standard.vmx version ${_vmx_sha} (large)"
+              echo
+              ./script_test/test_esxi-create-vm/run-test.sh \
+                  "${_vmx_sha}" \
+                  "script_test/test_esxi-create-vm/expected/${_vmx_sha}/large.vmx"
+              echo
+              echo
+            done
+
+  helm-deploy-db-migrator:
+    executor:
+      name: deploy
+      container-name: esxi-api-db-migrator
+      values-file: /root/esxi-api/charts/db-migrator.yaml
+      dockerfile-path: /root/esxi-api/sql/Dockerfile
+    working_directory: /root/esxi-api
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          command: publish
+          working_directory: /root/esxi-api/sql
+      - run:
+          command: deploy
+          working_directory: /root/esxi-api/sql
+
+  helm-deploy-esxi-api:
+    executor:
+      name: deploy
+      container-name: esxi-api
+      values-file: charts/server.yaml
+      dockerfile-path: Dockerfile.release
+    working_directory: /root/esxi-api
+    steps:
+      - checkout
+      - attach_workspace:
+          at: server/target
+      - setup_remote_docker
+      - run: publish
+      - run: deploy
+
+  twistlock-check:
+    executor:
+      name: deploy
+      container-name: esxi-api
+      values-file: charts/server.yaml
+      dockerfile-path: Dockerfile.release
+    working_directory: /root/esxi-api
+    steps:
+      - checkout
+      - attach_workspace:
+          at: server/target
+      - setup_remote_docker
+      - run: publish
+
+  helm-canary-deploy-esxi-api:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: esxi-api
+          DOCKERFILE_PATH: Dockerfile.release
+          DOCKER_REGISTRY: ecr
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/esxi-api
+          RELEASE_VERSION: canary
+          ROLLBAR_ENVIRONMENT: canary
+          VALUES_FILE: charts/merged-values.yaml
+    working_directory: /root/esxi-api
+    steps:
+      - checkout
+      - attach_workspace:
+          at: server/target
+      - setup_remote_docker
+      - run: publish
+      - run: /deploy/merge-values charts/server.yaml charts/canary.yaml > ${VALUES_FILE}
+      - run: deploy

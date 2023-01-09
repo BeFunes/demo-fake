@@ -1,0 +1,174 @@
+version: 2.1
+
+orbs:
+  aws-cli: circleci/aws-cli@3.1.1
+
+executors:
+  integration:
+    machine:
+      image: ubuntu-2004:202101-01
+      docker_layer_caching: true
+      resource_class: large
+
+  ccc:
+    docker:
+    - image: circleci/command-convenience:0.1
+      auth:
+        username: $DOCKER_HUB_USER
+        password: $DOCKER_HUB_PASSWORD
+
+commands:
+  compile_dev_values:
+    description: Compile values file out of production values and dev overrides
+    steps:
+      - run: /deploy/merge-values values.yml values.dev.yml > dev-compiled.yml
+
+  initialize:
+    description: Initial CI setup before CCC runs
+    parameters:
+      values_file:
+        type: string
+        default: "values.yml"
+    steps:
+      - setup_remote_docker
+      # Override some chart values with template that CCC expects
+      - run: cp chart/Chart.yaml /tmp/Chart.yaml
+      - run: /deploy/merge-values /tmp/Chart.yaml chart-CI-overrides.yml > chart/Chart.yaml
+      # Apply values now because CCC does not allow using custom values file with custom chart
+      - run: cp chart/values.yaml /tmp/values.yaml
+      - run: /deploy/merge-values /tmp/values.yaml << parameters.values_file >> > chart/values.yaml
+
+jobs:
+  molecule-test:
+    executor: integration
+    parameters:
+      scenario:
+        type: string
+        default: "default"
+    steps:
+      - checkout
+      - aws-cli/setup:
+          aws-access-key-id: ECR_AWS_ACCESS_KEY_ID
+          aws-secret-access-key: ECR_AWS_SECRET_ACCESS_KEY
+          profile-name: privaterepo
+      - run:
+          name: Log into ECR
+          command: |
+            aws --profile privaterepo ecr get-login-password \
+              --region us-east-1 | \
+            docker login \
+              --username AWS \
+              --password-stdin \
+              "https://183081753049.dkr.ecr.us-east-1.amazonaws.com"
+      - run:
+          name: Run molecule test
+          command: |
+            docker run -ti --rm \
+              -v $PWD:/$PWD \
+              -w /$PWD \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+            183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/ansible:5.2 molecule test -s "<< parameters.scenario >>"
+
+  dry-run-dev:
+    executor: ccc
+    environment: &ccc-environment
+      NAME: rabbit
+      RELEASE_VERSION: dev
+      # This should reflect the RabbitMQ version in Dockerfile:
+      MAJOR_VERSION: 3.10
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: ecr
+      IMAGE_NAME: circleci/rabbitmq
+      CUSTOM_CHART: chart
+      NAMESPACE: sre
+      CONFIGURE_ECR_REPO: true
+      ECR_OWNER_TEAM: InfraEng
+    steps:
+      - checkout
+      - compile_dev_values
+      - initialize:
+          values_file: dev-compiled.yml
+      - run: scan
+      - run: /deploy/dry-run
+
+  deploy-dev:
+    executor: ccc
+    environment:
+      <<: *ccc-environment
+    steps:
+      - checkout
+      - compile_dev_values
+      - initialize:
+          values_file: dev-compiled.yml
+      - run: publish
+      - run: deploy
+
+  dry-run:
+    executor: ccc
+    environment:
+      <<: *ccc-environment
+      RELEASE_VERSION: prod
+    steps:
+      - checkout
+      - initialize
+      - run: scan
+      - run: /deploy/dry-run
+
+  deploy:
+    executor: ccc
+    environment:
+      <<: *ccc-environment
+      RELEASE_VERSION: prod
+    steps:
+      - checkout
+      - initialize
+      - run: publish
+      - run: deploy
+
+workflows:
+  version: 2
+  install-rabbitmq:
+    jobs:
+      - molecule-test:
+          context: org-global
+          matrix:
+            parameters:
+              scenario:
+                - default
+                - exclusive-update
+                - rolling-update
+                - readiness-check
+      - deploy:
+          context: org-global
+          requires:
+            - molecule-test
+          filters:
+            branches:
+              only: master
+
+      - deploy-dev:
+          context: org-global
+          requires:
+            - molecule-test
+          filters:
+            branches:
+              only: deploy-dev
+
+      - dry-run:
+          context: org-global
+          requires:
+            - molecule-test
+          filters:
+            branches:
+              ignore:
+                - master
+
+      - dry-run-dev:
+          context: org-global
+          requires:
+            - molecule-test
+          filters:
+            branches:
+              ignore:
+                - deploy-dev
+                - master

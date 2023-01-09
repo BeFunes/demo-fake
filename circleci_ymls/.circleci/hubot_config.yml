@@ -1,0 +1,72 @@
+version: 2.1
+
+jobs:
+  deploy:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: hubot
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/hubot
+          VALUES_FILE: k8s-values.yaml
+    working_directory: ~/hubot
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /tmp/workspace
+      - run: cp /tmp/workspace/docker_image.tag .
+      - setup_remote_docker
+      - run: deploy
+
+  publish:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: hubot
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: all
+          TWISTLOCK_ENFORCE: false
+    working_directory: ~/hubot
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: publish
+      - persist_to_workspace:
+          root: .
+          paths: docker_image.tag
+
+  build:
+    docker:
+      - image: circleci/node:14
+    working_directory: ~/hubot
+    steps:
+      - checkout
+      - run: node --version
+      - run: export PATH="~/circleci/hubot/node_modules/.bin:$PATH"
+      - run: npm install
+      - run: npm test
+      - store_test_results:
+          path: test-results
+
+workflows:
+  version: 2
+  publish-deploy:
+    jobs:
+      - deploy:
+          context: org-global
+          filters:
+            branches:
+              only: master
+          requires:
+            - publish
+      - publish:
+          context: org-global
+          requires:
+            - build
+      - build

@@ -1,0 +1,464 @@
+version: 2.1
+
+orbs:
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+
+refs:
+  clojure-service-image: &clojure-service-image
+    image: circleci/clojure-service:0.8-dev
+    auth:
+      username: $DOCKER_HUB_USER
+      password: $DOCKER_HUB_PASSWORD
+  working_directory: &working_directory
+    working_directory: ~/builds-service
+
+executors:
+  clojure-service:
+    docker:
+      - <<: *clojure-service-image
+  ccc:
+    working_directory: /root/circle
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+jobs:
+  clj-kondo:
+    executor: clojure-service
+    steps:
+      - checkout
+      - lein_deps
+      - restore_cache:
+          keys:
+            - v1-clj-kondo-{{ checksum "project.clj" }}
+      - run:
+          name: Prime clj-kondo cache (if deps changed)
+          command: |
+            # Trying to prime cache on the entire classpath results in
+            # OOM. Moreover, it's very slow; so we only want to do it
+            # if dependencies have changed.
+            if test ! -d .clj-kondo/.cache ; then
+                lein classpath | sed 's/:/ /g' | xargs -n10 lein clj-kondo --no-warnings --lint || true
+            fi
+      - save_cache:
+          paths:
+            - .clj-kondo/.cache
+          key: v1-clj-kondo-{{ checksum "project.clj" }}
+      - run:
+          name: Report on new clj-kondo violations
+          command: lein clj-kondo --lint src
+
+  test-client:
+    executor: clojure-service
+    <<: *working_directory
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - client-{{ checksum "client/project.clj" }}
+            - client-
+      - run:
+          name: Testing client
+          working_directory: client
+          command: lein test
+      - store_test_results:
+          path: client/target/test-results
+      - save_cache:
+          key: client-{{ checksum "client/project.clj" }}
+          paths:
+            - ~/.m2
+
+  test:
+    parameters:
+      pg-version:
+        type: string
+        default: "12"
+    resource_class: large
+    docker:
+      - *clojure-service-image
+      - image: circleci/postgres:<<parameters.pg-version>>-ram
+        name: postgres
+        environment:
+          POSTGRES_USER: circle
+          POSTGRES_DB: circle_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+      - image: redis:4.0.2-alpine
+        name: redis
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+      - image: rabbitmq:3.6-management-alpine
+        name: rabbitmq
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    <<: *working_directory
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - service-{{ checksum "./project.clj" }}
+            - service-
+      - run:
+          name: Install additional software
+          command: |
+            curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+            echo "deb http://apt.postgresql.org/pub/repos/apt/ buster-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-client-12
+      - lein_deps
+      - run:
+          name: Run builds-service PostgreSQL Migrations
+          command: |
+            createdb --username circle --owner=circle --host postgres builds_service
+            run-migrations
+          environment:
+            DATABASE_MIGRATIONS: migrator/sql
+            DATABASE_USER: circle
+            DATABASE_URL: "jdbc:postgresql://postgres:5432/builds_service"
+      - when:
+          condition:
+            equal: [ "12", << parameters.pg-version >>]
+          steps:
+            - run:
+                name: Dump migrated schema
+                command: |
+                  PG_DUMP_COMMAND="pg_dump --host=postgres" PGUSER=circle ./scripts/dump-schema > /tmp/structure-after-migration.sql
+
+                  diff -u structure-<<parameters.pg-version>>.sql /tmp/structure-after-migration.sql
+      - run:
+          name: Run Tests
+          command: lein test --reporter documentation --plugin profiling --plugin junit-xml --junit-xml-file target/test-results/results.xml
+      - store_test_results:
+          path: target/test-results
+      - save_cache:
+          key: service-{{ checksum "./project.clj" }}
+          paths:
+            - ~/.m2
+
+  uberjar:
+    resource_class: large
+    executor: clojure-service
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - lein_deps
+      - set_version
+      - run:
+          name: lein uberjar
+          command: |
+            lein uberjar
+            mkdir -p /workspace
+            cp target/builds-service-${BUILDS_SERVICE_VERSION}-standalone.jar /workspace/builds-service-cloud.jar
+      - persist_to_workspace:
+          root: /workspace
+          paths:
+            - builds-service-cloud.jar
+
+  publish-migrator:
+    executor: ccc
+    environment:
+      NAME: builds-service-migrator
+      DOCKER_REGISTRY: all
+      MIGRATIONS_SQL_PATH: sql
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - set_version
+      - setup_remote_docker:
+          version: 20.10.14
+      - run:
+          name: Build and publish the builds-service migrator image
+          command: publish
+          working_directory: migrator
+      - run: mv migrator/docker_image.tag migrator_docker_image.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - migrator_docker_image.tag
+
+  deploy-migrator:
+    executor: ccc
+    environment:
+      NAME: builds-service-migrator
+      MIGRATIONS_SQL_PATH: sql
+      VALUES_FILE: k8s-values.yaml
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - set_version
+      - setup_remote_docker:
+          version: 20.10.14
+      - attach_workspace: { at: ~/repo/migrator }
+      - run:
+          name: Rename docker_image.tag
+          command: mv migrator_docker_image.tag docker_image.tag
+          working_directory: migrator
+      - run:
+          name: Deploy builds-service migrator
+          command: deploy
+          working_directory: migrator
+
+  scan-service:
+    executor: ccc
+    environment:
+      NAME: builds-service
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: none
+    working_directory: ~/repo
+    steps:
+      - setup_remote_docker:
+          version: 20.10.14
+      - checkout
+      - set_version
+      - build_scan_publish
+
+  build-scan-publish-service:
+    executor: ccc
+    environment:
+      NAME: builds-service
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: all
+    working_directory: ~/repo
+    steps:
+      - setup_remote_docker:
+          version: 20.10.14
+      - checkout
+      - set_version
+      - build_scan_publish
+      - run: mv deploy/docker_image.tag docker_image_tmp.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image_tmp.tag
+
+  deploy-service:
+    executor: ccc
+    environment:
+      NAME: builds-service
+      VALUES_FILE: service.yaml
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - set_version
+      - attach_workspace:
+          at: /workspace
+      - run: mv /workspace/docker_image_tmp.tag /workspace/docker_image.tag
+      - run: cp /workspace/docker_image.tag deploy
+      - run:
+          name: Deploy
+          command: deploy
+          working_directory: deploy
+      - rollbar_deploy:
+          access_token: BUILDS_SERVICE_ROLLBAR_TOKEN
+      - notify_honeycomb:
+          version: $(< ./deploy/docker_image.tag)
+
+  deploy-canary:
+    executor: ccc
+    environment:
+      NAME: builds-service
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: all
+      VALUES_FILE: merged-canary.yaml
+      RELEASE_VERSION: canary1
+    working_directory: ~/repo
+    steps:
+      - setup_remote_docker:
+          version: 20.10.14
+      - checkout
+      - set_version
+      - run:
+          name: Merge Canary Values
+          command: /deploy/merge-values service.yaml canary-override.yaml > merged-canary.yaml
+          working_directory: deploy
+      - build_scan_publish
+      - run:
+          name: Deploy
+          command: deploy
+          working_directory: deploy
+      - rollbar_deploy:
+          access_token: BUILDS_SERVICE_ROLLBAR_TOKEN
+          environment: canary
+
+  deploy-client:
+    executor: clojure-service
+    steps:
+      - checkout
+      - lein_deps
+      - set_version
+      - run:
+          name: Deploy builds-service client
+          command: |
+            lein deploy circle-s3
+          working_directory: client
+commands:
+  set_version:
+    description: >
+      Set BUILDS_SERVICE_VERSION and CONTAINER_VERSION
+      If we don't set the CONTAINER_VERSION then ccc will use format ${MAJOR_VERSION}.${CIRCLE_BUILD_NUM}-$(git rev-parse --short HEAD) to create the docker tag
+      but we would like to include pipeline number to keep the client and server version numbers consistent.
+    steps:
+      - run:
+          name: Compute and set a single version
+          command: |
+            set -o errexit
+            set -o nounset
+            version="1.0.<<pipeline.number>>-${CIRCLE_SHA1:0:7}"
+            echo "export BUILDS_SERVICE_VERSION=${version}" >> ${CIRCLE_SHELL_ENV}
+            echo "export CONTAINER_VERSION=${version}" >> ${CIRCLE_SHELL_ENV}
+  lein_deps:
+    steps:
+      - restore_cache:
+          keys:
+            - v1-dependencies-{{ checksum "project.clj" }}
+            - v1-dependencies-
+      - run: lein deps
+      - save_cache:
+          paths:
+            - ~/.m2
+          key: v1-dependencies-{{ checksum "project.clj" }}
+
+  build_scan_publish:
+    steps:
+      - attach_workspace:
+          at: /workspace
+      - run:
+          name: Copy Jar
+          command: cp /workspace/builds-service-cloud.jar .
+          working_directory: deploy
+      - run:
+          name: Build, Scan & Publish
+          command: publish
+          working_directory: deploy
+
+  rollbar_deploy:
+    parameters:
+      access_token:
+        type: env_var_name
+      environment:
+        type: string
+        default: production
+    steps:
+      - run:
+          name: Notify Rollbar
+          command: |
+            curl https://api.rollbar.com/api/1/deploy/ \
+              --form access_token="$<< parameters.access_token >>" \
+              --form environment="<< parameters.environment >>" \
+              --form revision=$CIRCLE_SHA1 \
+              --form local_username=$CIRCLE_USERNAME \
+              --form comment="$(git show --no-patch --format=%s)"
+
+  notify_honeycomb:
+    parameters:
+      version:
+        type: string
+    steps:
+      - run:
+          name: Notify Honeycomb
+          command: |
+            cat \<< EOF | tee /tmp/honeycomb-marker
+            {
+              "message": "Deploying circleci/circle << parameters.version >>",
+              "type":"deploy"
+            }
+            EOF
+            curl https://api.honeycomb.io/1/markers/distributed-traces \
+              -H "X-Honeycomb-Team: $HONEYCOMB_WRITEKEY" \
+              -d @/tmp/honeycomb-marker
+
+workflows:
+  build-test-deploy:
+    jobs:
+      - clj-kondo:
+          context: org-global
+
+      - test:
+          context: org-global
+
+      - test-client:
+          context: org-global
+
+      - uberjar:
+          context: org-global
+
+      - scan-service:
+          context: org-global
+          requires:
+            - uberjar
+          filters:
+            branches:
+              ignore:
+                - main
+                - canary
+
+      - publish-migrator:
+          context: org-global
+          requires:
+            - test
+            - uberjar
+          filters:
+            branches:
+              only:
+                - main
+                - /^server-\d\..+/
+
+      - deploy-migrator:
+          context: org-global
+          requires:
+            - publish-migrator
+          filters:
+            branches:
+              only: main
+
+      - build-scan-publish-service:
+          context: org-global
+          requires:
+            - uberjar
+          filters:
+            branches:
+              only:
+                - main
+                - /^server-\d\..+/
+
+      - deploy-service:
+          context: org-global
+          requires:
+            - deploy-migrator
+            - build-scan-publish-service
+          filters:
+            branches:
+              only: main
+
+      - scotty-orb/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          promotion_component_list: "circleci/builds-service circleci/builds-service-migrator"
+          requires:
+            - publish-migrator
+            - build-scan-publish-service
+
+      - deploy-canary:
+          context: org-global
+          requires:
+            - test
+            - uberjar
+          filters:
+            branches:
+              only: canary
+
+      - deploy-client:
+          context: org-global
+          requires:
+            - test
+            - test-client
+            - uberjar
+          filters:
+            branches:
+              only: main

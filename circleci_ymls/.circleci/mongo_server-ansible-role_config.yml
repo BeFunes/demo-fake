@@ -1,0 +1,53 @@
+---
+version: 2.1
+
+orbs:
+  aws-ecr: circleci/aws-ecr@8.1.2
+
+executors:
+  integration:
+    machine:
+      image: ubuntu-2004:202101-01
+      docker_layer_caching: true
+      resource_class: large
+
+jobs:
+  molecule-test:
+    executor: integration
+    environment:
+      AWS_ECR_REGISTRY_ID: "183081753049"
+    parameters:
+      scenario:
+        type: string
+        default: "default"
+    steps:
+      - checkout
+      - aws-ecr/ecr-login:
+          aws-access-key-id: ECR_AWS_ACCESS_KEY_ID
+          aws-secret-access-key: ECR_AWS_SECRET_ACCESS_KEY
+          region: us-east-1
+      - run:
+          name: Run molecule test
+          environment:
+            ECR_IMAGE: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/ansible:5.7
+          command: |
+            docker run -ti --rm \
+              -v $PWD:$PWD \
+              -v $PWD:/root/.ansible/roles/circleci.mongo_server \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -w $PWD \
+            $ECR_IMAGE molecule test \
+              --destroy never \
+              -s << parameters.scenario >>
+workflows:
+  version: 2
+  test-coverage:
+    jobs:
+      - molecule-test:
+          context: org-global
+          matrix:
+            parameters:
+              scenario:
+                - default
+                - lint
+                - mongo-next

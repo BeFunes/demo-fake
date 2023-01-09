@@ -1,0 +1,76 @@
+version: 2.1
+
+orbs:
+  codecov: codecov/codecov@1.2.2
+
+executors:
+  clojure-lein:
+    docker:
+      - image: circleci/clojure:lein-2.8.1
+
+commands:
+  restore-clojure-cache:
+    steps:
+      - restore_cache:
+          key: v1-m2-cache
+      - run: lein deps
+      - save_cache:
+          key: v1-m2-cache-{{ checksum "project.clj" }}
+          paths:
+            - ~/.m2
+
+jobs:
+  build:
+    executor: clojure-lein
+    steps:
+      - checkout
+      - restore-clojure-cache
+      - run:
+          name: Install and Configure dependencies
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y ruby
+      - run:
+          name: Fail on untested namespaces
+          command: script/fail-on-untested-namespaces.sh
+      - run:
+          name: Test
+          command: lein test
+      - run:
+          name: Coverage
+          command: |
+            lein change :plugins conj "[lein-cloverage \"1.1.1\"]"
+            lein change :pedantic? set :warn
+            lein cloverage --codecov
+          when: always
+      - store_artifacts:
+          path: target/coverage
+          destination: coverage
+      - codecov/upload:
+          file: target/coverage/codecov.json
+  deploy:
+    executor: clojure-lein
+    steps:
+      - checkout
+      - restore-clojure-cache
+      - run:
+          name: Build and Deploy jar
+          command: |
+            set -o errexit
+            lein version-spec
+            lein deploy circle-s3
+
+
+workflows:
+  version: 2
+  workflow:
+    jobs:
+      - build:
+          context: org-global
+      - deploy:
+          requires:
+            - build
+          context: org-global
+          filters:
+            branches:
+              only: main

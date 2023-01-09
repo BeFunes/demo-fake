@@ -1,0 +1,147 @@
+version: 2.1
+
+executors:
+  run-in-docker:
+    docker:
+      - image: clojure:lein-2.8.1
+      - image: rabbitmq:3.8-management
+    working_directory: ~/components
+    environment:
+      RABBITMQ_VM_MEMORY_HIGH_WATERMARK: 800MB
+      CHILD_PROJECTS: "http-server rabbitmq"
+
+jobs:
+  cache:
+    executor: run-in-docker
+    steps:
+      - checkout
+      - restore_cache:
+          key: v1-jars-
+      - run:
+          name: Pull dependencies
+          command: |
+            set -exu
+            for _project in ${CHILD_PROJECTS}; do
+              pushd ${_project}
+              lein with-profile dev deps
+              popd
+            done
+      - run:
+          name: Compute cache key
+          command: |
+            set -exu
+            sha256sum project.clj > project.checksums
+            for _project in ${CHILD_PROJECTS}; do
+              sha256sum ${_project}/project.clj >> project.checksums
+            done
+      - save_cache:
+          key: v1-jars-{{ checksum "project.checksums" }}
+          paths:
+            - ~/.m2
+
+  clj-kondo:
+    executor: run-in-docker
+    steps:
+      - checkout
+      - run:
+          name: Install clj-kondo
+          command: |
+            curl -sLo clj-kondo.zip https://github.com/borkdude/clj-kondo/releases/download/v$CLJ_KONDO_VERSION/clj-kondo-$CLJ_KONDO_VERSION-linux-amd64.zip
+            echo "fba4661a24c921fe80109791b02adc60b3d6f36f  clj-kondo.zip" | sha1sum -c
+            unzip clj-kondo.zip
+            rm clj-kondo.zip
+          environment:
+            CLJ_KONDO_VERSION: 2020.10.10
+      - run:
+          name: Lint using clj-kondo
+          command: |
+            ./clj-kondo --config .clj-kondo/config.edn --lint .
+
+  eastwood:
+    executor: run-in-docker
+    steps:
+      - checkout
+      - restore_cache:
+          key: v1-jars-
+      - run:
+          name: Lint using eastwood
+          command: |
+            set -exu
+            for _project in ${CHILD_PROJECTS}; do
+              pushd ${_project}
+              lein eastwood
+              popd
+            done
+
+  build:
+    executor: run-in-docker
+    steps:
+      - checkout
+      - restore_cache:
+          key: v1-jars-
+      - run:
+          name: Unit tests
+          command: |
+            set -exu
+            for _project in ${CHILD_PROJECTS}; do
+              pushd ${_project}
+              lein test :unit
+              popd
+            done
+      - run:
+          name: Integration tests
+          command: |
+            set -exu
+            for _project in ${CHILD_PROJECTS}; do
+              pushd ${_project}
+              lein test :integration
+              popd
+            done
+
+  deploy:
+    executor: run-in-docker
+    steps:
+      - add_ssh_keys:
+          fingerprints:
+            - "05:18:bb:96:47:49:91:bc:e3:85:92:0c:73:fe:92:a0"
+      - checkout
+      - restore_cache:
+          key: v1-jars-
+      - run:
+          name: Push jars and tag the release
+          command: |
+            git config user.email "backplane@circleci.com"
+            git config user.name "Backplane Bot"
+            set -exu
+            for _project in ${CHILD_PROJECTS}; do
+              pushd ${_project}
+              mkdir .git  # Note: leiningen needs .git to detect which vcs to use
+              lein release
+              popd
+            done
+
+workflows:
+  build-and-deploy:
+    jobs:
+      - cache:
+          context: org-global
+      - clj-kondo:
+          context: org-global
+      - build:
+          context: org-global
+          requires:
+            - cache
+            - clj-kondo
+      - eastwood:
+          context: org-global
+          requires:
+            - cache
+            - clj-kondo
+      - deploy:
+          context: org-global
+          requires:
+            - build
+            - eastwood
+          filters:
+            branches:
+              only: main

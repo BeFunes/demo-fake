@@ -1,0 +1,40 @@
+version: 2.1
+
+jobs:
+  build:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - run:
+          name: "Build app"
+          command: "./build.sh"
+  deploy:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - run:
+          name: "Deploy app"
+          command: "./deploy.sh"
+  rollback:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - run:
+          name: "Rollback"
+          command: "./rollback.sh"
+
+workflows:
+  build and deploy:
+    jobs:
+      - build
+      - deploy:
+          requires: 
+          - build
+
+  rollback:
+    when: on_fail
+    jobs:
+      - rollback 

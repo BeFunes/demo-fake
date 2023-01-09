@@ -1,0 +1,127 @@
+version: 2.1
+  
+executors:
+  go:
+    docker:
+      - image: cimg/go:1.17 
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    environment:
+      DOCKER_REGISTRY: ecr
+      EXTRA_DOCKER_BUILD_ARGS: "--secret id=github_user,env=GITHUB_USER --secret id=github_token,env=GITHUB_TOKEN"
+
+workflows:
+  build-test-deploy:
+    jobs:
+      - output-test-coverage:
+          context:
+            - org-global
+            - github-readonly
+      - build-service:
+          context: 
+            - org-global
+            - github-readonly
+      - lint-service:
+          context: 
+            - github-readonly
+          requires:
+            - build-service
+      - test-service:
+          context:
+            - github-readonly
+          requires:
+            - build-service
+      - dry-run-service:
+          context:
+            - github-readonly
+            - org-global
+          requires:
+            - build-service
+      - deploy-service:
+          context: 
+            - org-global  
+            - github-readonly
+          requires:
+            - build-service
+            - dry-run-service
+          filters:
+            branches:
+              only: main   
+commands:
+  # This is not ideal, it's just executing a shell from the web.
+  # Need to add task bins to our project, or find a better way.
+  get-task-build-system:
+    steps:
+      - run: sh -c "$(curl --location https://taskfile.dev/install.sh)" -- -d
+
+jobs:
+  build-service:
+    executor: go
+    steps:
+      - checkout
+      - get-task-build-system
+      - run: cd crypto_service;../bin/task ci:private-go-mod-init
+      - run: cd crypto_service;../bin/task build
+  output-test-coverage:
+    executor: go
+    steps:
+      - checkout
+      - get-task-build-system
+      - run: cd crypto_service;../bin/task ci:private-go-mod-init
+      - run: cd crypto_service; go mod tidy -compat=1.17
+      #- run: cd crypto_service;../bin/task go-mod-tidy 
+      - run: cd crypto_service;../bin/task coverage-console
+  test-service:
+    executor: go
+    steps:
+      - checkout
+      - get-task-build-system
+      - run: cd crypto_service; ../bin/task ci:private-go-mod-init
+      - run: cd crypto_service; go install -mod=mod github.com/onsi/ginkgo/v2/ginkgo
+      - run: cd crypto_service; go get github.com/onsi/gomega/...
+      - run: cd crypto_service; ginkgo ./...
+  
+  lint-service:
+    executor: go
+    steps:
+      - checkout
+      - get-task-build-system
+      - run: cd crypto_service;../bin/task ci:private-go-mod-init
+      - run: cd crypto_service;../bin/task lint
+  
+  dry-run-service:
+    executor: ccc
+    environment:
+      NAME: threat-service
+      DOCKERFILE_PATH: ./crypto_service/Dockerfile
+      VALUES_FILE: ./crypto_service/deploy/values.yml
+      DOCKER_BUILDKIT: 1
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: 20.10.11
+      - run: /deploy/dry-run
+
+  deploy-service:
+    executor: ccc
+    environment:
+      NAME: threat-service
+      DOCKERFILE_PATH: ./crypto_service/Dockerfile
+      DOCKER_REGISTRY: ecr
+      VALUES_FILE: ./crypto_service/deploy/values.yml
+      NAMESPACE: default
+      DOCKER_BUILDKIT: 1
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: 20.10.11
+      - run: publish
+      - run: deploy
+

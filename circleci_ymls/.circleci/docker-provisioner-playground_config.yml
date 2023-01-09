@@ -1,0 +1,21 @@
+version: 2.1
+
+workflows:
+  main:
+    jobs:
+      - test:
+          matrix:
+            parameters:
+              resource_class: [medium]
+
+jobs:
+  test:
+    parameters:
+      resource_class:
+        type: string
+    docker:
+      - image: alpine
+    resource_class: << parameters.resource_class >>
+    steps:
+      - run: echo "im a docker provisioned job"
+      - run: uname -a

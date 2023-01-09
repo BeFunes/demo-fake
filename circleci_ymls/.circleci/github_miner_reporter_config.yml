@@ -1,0 +1,38 @@
+version: 2.1
+
+executors:
+  ccc:
+    docker:
+    - image: circleci/command-convenience:0.1
+      auth:
+        username: $DOCKER_HUB_USER
+        password: $DOCKER_HUB_PASSWORD
+    environment:
+      DOCKER_REGISTRY: ecr
+      NAMESPACE: data
+
+jobs:
+  publish_image:
+    executor: ccc
+    environment:
+      NAME: github-crypto-reporter
+      DOCKERFILE_PATH: ./Dockerfile
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/github-crypto-reporter
+      CONTAINER_VERSION: latest
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /root/my-project
+      - setup_remote_docker
+      - run: scan
+      - run: publish
+
+workflows:
+  version: 2
+  publish-deploy:
+    jobs:
+      - publish_image:
+          context: org-global
+          filters:
+            branches:
+              only: main

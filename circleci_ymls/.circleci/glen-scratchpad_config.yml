@@ -1,0 +1,13 @@
+version: 2.1
+workflows:
+  btd:
+    jobs:
+      - build
+jobs:
+  build:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - run:
+          name: Show storage prefix
+          command: cat /.circleci-runner-config.json  | jq .Dispatched.TaskInfo.Storage

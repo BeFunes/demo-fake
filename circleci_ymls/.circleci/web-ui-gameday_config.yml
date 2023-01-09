@@ -1,0 +1,89 @@
+version: 2.1
+
+orbs:
+  web-ui-orb: sandbox/web-ui-orb@5.1.0
+
+references:
+  version_js: &version_js 4
+  version_cypress: &version_cypress 1
+  image_name: &image_name 'web-ui-gameday'
+workflows:
+  version: 2
+
+  build-test-and-deploy:
+    jobs:
+      - web-ui-orb/dependencies:
+          name: dependencies
+          context: web-ui-npm
+          cache_version_js_dependencies: *version_js
+          cache_version_cypress_dependencies: *version_cypress
+      - web-ui-orb/storybook-build:
+          name: storybook-build
+          cache_version_js_dependencies: *version_js
+          build_storybook_command:
+            NODE_ENV=test ASSET_PREFIX='' yarn build-storybook
+          requires:
+            - dependencies
+      - web-ui-orb/test:
+          name: test
+          cache_version_js_dependencies: *version_js
+          codecov: false
+          requires:
+            - dependencies
+      - web-ui-orb/chromatic-snapshot:
+          name: chromatic-snapshot
+          cache_version_js_dependencies: *version_js
+          requires:
+            - storybook-build
+      - web-ui-orb/build-static:
+          name: build-static-assets
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+      - web-ui-orb/build-and-publish-container:
+          name: scan-production-docker-image
+          image_name: *image_name
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [web-ui-npm, web-ui-datadog, org-global]
+          scan_only: true
+          filters:
+            branches:
+              ignore: main
+          requires:
+            - build-static-assets
+      - web-ui-orb/deploy-static:
+          name: deploy-static-assets
+          bucket_name: circleci-web-ui-gameday-assets/7e7761e9-2fea-4e06-9495-a4591dbab6fd
+          cdn_url: https://assets-gameday.circleci.com/7e7761e9-2fea-4e06-9495-a4591dbab6fd
+          context: [web-ui-gameday-assets, web-ui-npm, web-ui-datadog]
+          build_dir: ./.next
+          filters:
+            branches:
+              only: main
+          requires:
+            - build-static-assets
+            - test
+      - web-ui-orb/build-and-publish-container:
+          name: scan-and-publish-production-docker-image
+          image_name: *image_name
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          docker_registry: ecr
+          context: [web-ui-npm, web-ui-datadog, org-global]
+          filters:
+            branches:
+              only: main
+          requires:
+            - deploy-static-assets
+      - web-ui-orb/deploy-container:
+          name: deploy
+          image_name: *image_name
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [web-ui-npm, org-global]
+          filters:
+            branches:
+              only: main
+          requires:
+            - scan-and-publish-production-docker-image

@@ -1,0 +1,248 @@
+version: 2.1
+
+orbs:
+  docker: circleci/docker@2.0.5
+  terraform: circleci/terraform@3.0.0
+
+commands:
+  remote_docker:
+    steps:
+      - setup_remote_docker:
+          version: 20.10.12
+
+executors:
+  go:
+    docker:
+      - image: circleci/go-service:0.1-dev
+        auth:
+          username: $RO_DOCKER_HUB_USERNAME
+          password: $RO_DOCKER_HUB_PASSWORD
+
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    environment:
+      EXTRA_DOCKER_BUILD_ARGS: "--secret id=github_user,env=GITHUB_USER --secret id=github_token,env=GITHUB_TOKEN"
+      DOCKER_BUILDKIT: 1
+
+workflows:
+  build-test-deploy:
+    jobs:
+      # backplane standard
+      - build-service:
+          context:
+            - org-global
+            - github-readonly
+            - dockerhub-readonly
+      - lint-service:
+          context:
+            - org-global
+            - github-readonly
+            - dockerhub-readonly
+          requires:
+            - build-service
+      - test-service:
+          context:
+            - org-global
+            - github-readonly
+            - dockerhub-readonly
+          requires:
+            - build-service
+      - integration-test-service:
+          context:
+            - org-global
+            - github-readonly
+            - dockerhub-readonly
+          requires:
+            - build-service
+            - lint-service
+            - test-service
+      - dry-run-service:
+          context: org-global
+          requires:
+            - build-service
+            - lint-service
+            - test-service
+          filters:
+            branches:
+              # diffs are included automatically by actual deploys
+              ignore:
+                - main
+                - canary
+      - can-deploy-canary:
+          type: approval
+          requires:
+            - build-service
+            - lint-service
+            - test-service
+            - integration-test-service
+          filters:
+            branches:
+              only:
+                - canary
+      - publish-deploy-service-canary:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - can-deploy-canary
+          filters:
+            branches:
+              only:
+                - canary
+      - can-delete-canary:
+          type: approval
+          requires:
+            - publish-deploy-service-canary
+          filters:
+            branches:
+              only:
+                - canary
+      - delete-canary:
+          context: org-global
+          requires:
+            - can-delete-canary
+          filters:
+            branches:
+              only:
+                - canary
+      - scan-service:
+          requires:
+            - build-service
+          context:
+            - org-global
+            - github-readonly
+          filters:
+            branches:
+              # fret not, scans are run on main as part of the real publish
+              ignore:
+                - main
+                - canary
+      - deploy:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - build-service
+            - lint-service
+            - test-service
+            - integration-test-service
+          filters:
+            branches:
+              only: main
+
+jobs:
+  build-service:
+    executor: go
+    steps:
+      - checkout
+      - run: task ci:private-go-mod-init
+      - run: task build
+
+  lint-service:
+    executor: go
+    steps:
+      - checkout
+      - run: task ci:private-go-mod-init
+      - run: task lint
+
+  test-service:
+    executor: go
+    environment:
+      - STATSD_HOST: localhost
+    steps:
+      - checkout
+      - run: task ci:private-go-mod-init
+      - run: task ci:test
+      - store_test_results:
+          path: ./junit
+      - store_artifacts:
+          path: ./junit  
+
+  integration-test-service:
+    executor: go
+    steps:
+      - remote_docker
+      - checkout
+      - run: task ci:private-go-mod-init
+      - run: task vendor
+      - run: task ci:install-docker-compose
+      - docker/install-docker-compose
+      - run: task integration-test
+
+  deploy:
+    executor: ccc
+    environment:
+      NAME: test-results-api
+      DOCKER_REGISTRY: all
+      CONFIGURE_ECR_REPO: yes
+      VALUES_FILE: service/values.yaml
+      DOCKERFILE_PATH: Dockerfile
+      RELEASE_VERSION: v1
+      ECR_OWNER_TEAM: TestAndDebug
+      GOPRIVATE: github.com/circleci
+    working_directory: ~/repo
+    steps:
+      - remote_docker
+      - checkout
+      - attach_workspace:
+          at: .
+      - run: publish
+      - run: deploy
+
+  publish-deploy-service-canary:
+    executor: ccc
+    environment:
+      NAME: test-results-api
+      DOCKER_REGISTRY: ecr
+      CONFIGURE_ECR_REPO: yes
+      VALUES_FILE: service/canary.yaml
+      DOCKERFILE_PATH: Dockerfile
+      RELEASE_VERSION: canary
+      ECR_OWNER_TEAM: TestAndDebug
+      GOPRIVATE: github.com/circleci
+      GO_ENTRY_POINT: cmd/main.go
+      DEPLOY_ENVIRONMENT: canary
+    steps:
+      - remote_docker
+      - checkout
+      - attach_workspace:
+          at: .
+      - run: publish
+      - run: /deploy/merge-values service/values.yaml service/canary-overrides.yaml > service/canary.yaml
+      - run: deploy
+
+  scan-service:
+    executor:
+      name: ccc
+    environment:
+      NAME: test-results-api
+      DOCKERFILE_PATH: Dockerfile
+      TWISTCLI_DEBUG: true
+    steps:
+      - remote_docker
+      - checkout
+      - run: scan
+      - store_artifacts:
+          path: ccc-image-scan-results
+          destination: test-results-api/ccc-image-scan-results
+
+  dry-run-service:
+    executor: ccc
+    environment:
+      NAME: test-results-api
+      DOCKERFILE_PATH: Dockerfile
+      VALUES_FILE: service/values.yaml
+    steps:
+      - remote_docker
+      - checkout
+      - run: /deploy/dry-run
+
+  delete-canary:
+    executor: ccc
+    steps:
+      - checkout
+      - run: .circleci/delete-canary.sh test-results-api-canary

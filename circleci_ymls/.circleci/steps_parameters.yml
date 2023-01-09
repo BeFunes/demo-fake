@@ -1,0 +1,35 @@
+version: 2.1
+
+commands:
+    run-tests:
+        parameters:
+            after-deps:
+                type: steps
+                default:
+                    - run: echo "this should work" # valid step
+            after-deps2:
+                type: steps
+                default:
+                    - echo "this should not work" # should fail because it's invalid step
+            customParam:
+                type: string
+                default:
+                    - fze # valid command because param type is string
+        steps:
+            - run: make deps
+            - steps: << parameters.customParam >> # must fail because customParam is not of type steps
+            - steps: << parameters.after-deps >> # must succeed because after-deps exist and it's type is steps
+            - steps: << parameters.after-deps2 >> # must succeed because after-deps exist and it's type is steps
+            - steps: << parameters.doesntExist >> # must fail because doesntExist doesn't Exist
+            - run: make test
+
+jobs:
+    build:
+        machine: true
+        steps:
+            - run-tests:
+                  after-deps:
+                      - run: echo "The dependencies are installed"
+                      - run: echo "And now I'm going to run the tests" # must work because it's valid step
+                      - veikzfikegie # must fail because it's invalid step
+                      - zeiufzui # must fail because it's invalid step

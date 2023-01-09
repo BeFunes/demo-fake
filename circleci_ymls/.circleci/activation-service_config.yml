@@ -1,0 +1,22 @@
+version: 2.1
+
+orbs:
+    go: circleci/go@1.7.0
+
+jobs:
+    test:
+        docker:
+            # replace with your preferred image
+            - image: cimg/base:stable
+        steps:
+            - checkout
+            - go/install:
+                version: '1.17'
+            - go/test:
+                race: true
+                covermode: atomic
+
+workflows:
+    build-and-run:
+        jobs:
+            - test

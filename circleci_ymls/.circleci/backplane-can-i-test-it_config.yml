@@ -1,0 +1,57 @@
+version: 2.1
+
+parameters:
+  repo_name:
+    type: string
+    default: smoke-test-service
+  project_dir:  # subdir in the repo
+    type: string
+    default: client-service
+  jvm-version:  # TODO
+    type: string
+    default: '8'
+
+jobs:
+  grade:
+    machine:
+      image: ubuntu-2004:202107-02
+    environment:
+      # The SSH URL will be rewritten by a rule in gitconfig, which is going to also include the token.
+      REPO_URL: "ssh://git@github.com/circleci/<< pipeline.parameters.repo_name >>.git"
+      PROJECT_DIR: "repos/<< pipeline.parameters.repo_name >>/<< pipeline.parameters.project_dir >>"
+    steps:
+      - checkout
+      - run: 'echo "REPO_URL: $REPO_URL, PROJECT_DIR: $PROJECT_DIR"'
+      - run: whoami
+      - run: 'git config --global url."https://ssh:$GITHUB_TOKEN@github.com/".insteadOf "ssh://git@github.com/"'
+      - run: ls
+      - run: sudo wget https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein -O /usr/bin/lein
+      - run: sudo pip3 install docker-compose
+
+      - run: ./clone.py
+
+      # TODO: try-lein-modules. Without, these projects will fail
+      # - orb-service
+      # - vm-service
+      # - backplane
+
+      - run: 'sudo docker login --username "$DOCKER_HUB_USER" --password-stdin \<<<"$DOCKER_HUB_PASSWORD"'
+      - run: sudo ./try-docker-compose.py
+      - run: python -m json.tool < docker-compose-score.json  # see results
+      - store_artifacts:
+          path: docker-compose-score.json
+
+      - run: sleep 15  # Give services time to start up.
+
+      - run: ./try-lein.py
+      - run: python -m json.tool < lein-test-score.json  # see results
+      - store_artifacts:
+          path: lein-test-score.json
+
+workflows:
+  version: 2
+  repo_grading:
+    when: << pipeline.parameters.repo_name >>
+    jobs:
+      - grade:
+          context: org-global

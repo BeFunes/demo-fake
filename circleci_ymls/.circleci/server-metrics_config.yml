@@ -1,0 +1,48 @@
+version: 2.0
+
+jobs:
+  build_telegraf:
+    docker:
+      - image: circleci/command-convenience:0.1.201-8df25af
+        environment:
+          NAME: server-telegraf
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: none
+    working_directory: ~/project
+    steps:
+      - setup_docker_engine
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          command: publish
+          working_directory: ~/project/telegraf
+  publish_telegraf:
+    docker:
+      - image: circleci/command-convenience:0.1.201-8df25af
+        environment:
+          NAME: server-telegraf
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: dockerhub
+    working_directory: ~/project
+    steps:
+      - setup_docker_engine
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          command: publish
+          working_directory: ~/project/telegraf
+workflows:
+  version: 2
+  build-and-deploy:
+    jobs:
+      - build_telegraf:
+          context: org-global
+      - publish_telegraf:
+          context: org-global
+          requires:
+            - build_telegraf
+          filters:
+            branches:
+              only: master

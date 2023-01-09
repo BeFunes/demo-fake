@@ -1,0 +1,95 @@
+version: 2.1
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: refinery-internal
+          MAJOR_VERSION: "1.11.0"
+          RELEASE_SUFFIX: ""
+          DOCKERFILE_PATH: Dockerfile.ccc
+          DOCKER_REGISTRY: ecr
+          # IMAGE_NAME: circleci/refinery-internal
+          CONFIGURE_ECR_REPO: true
+          ECR_OWNER_TEAM: SRE
+          TWISTLOCK_ENFORCE: false
+
+
+commands:
+  go-build:
+    parameters:
+      os:
+        description: Target operating system
+        type: enum
+        enum: ["linux", "darwin"]
+        default: "linux"
+      arch:
+        description: Target architecture
+        type: enum
+        enum: ["amd64", "arm64"]
+        default: "amd64"
+    steps:
+      - run: |
+          GOOS=<< parameters.os >> \
+          GOARCH=<< parameters.arch >> \
+          go build -ldflags "-X main.BuildID=${CIRCLE_TAG:-${CIRCLE_SHA1:0:7}}" \
+          -o $GOPATH/bin/refinery-<< parameters.os >>-<< parameters.arch >> \
+          ./cmd/refinery
+
+jobs:
+  test:
+    docker:
+      - image: cimg/go:1.17
+      - image: redis:6
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-dockerize-{{ checksum "Makefile" }}
+            - v1-dockerize-
+      - run: make dockerize
+      - save_cache:
+          key: v1-dockerize-{{ checksum "Makefile" }}
+          paths:
+            - dockerize.tar.gz
+      - restore_cache:
+          keys:
+            - v3-go-mod-{{ checksum "go.sum" }}
+      - run: make test
+      - save_cache:
+          key: v3-go-mod-{{ checksum "go.sum" }}
+          paths:
+            - /home/circleci/go/pkg/mod
+
+  ccc_build:
+    executor: ccc
+  
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: apk update
+      - run: apk add make go
+      - run: go install github.com/google/ko@latest
+      - run: PATH="/root/go/bin:${PATH}" ./build-docker.sh
+      - run:
+          name: publish refinery-internal
+          command: publish
+workflows:
+  build:
+    jobs:
+      - test:
+          filters:
+            tags:
+              only: /.*/
+      - ccc_build:
+          context:
+            - org-global
+          filters:
+            branches:
+              only: main
+          requires:
+          - test

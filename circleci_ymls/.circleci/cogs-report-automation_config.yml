@@ -1,0 +1,66 @@
+version: 2.1
+
+parameters:
+  run-schedule:
+    type: boolean
+    default: false
+
+jobs:
+  ce_upload:
+    docker:
+      - image: circleci/python:3.6.8
+    steps:
+      - checkout
+      - run: mkdir -p ~/.config/gspread_pandas/creds
+      - run: echo $GOOGLE_APPLICATION_CREDENTIALS > ~/.config/gspread_pandas/google_secret.json
+      - run: echo $GOOGLE_APPLICATION_CREDENTIALS > ~/.config/gspread_pandas/creds/default
+      - run: mkdir -p ~/.aws
+      - run: echo -e $AWS > ~/.aws/credentials
+      - run: pipenv sync
+      - run: |
+          if [ $CIRCLE_BRANCH = 'master' ]; then pipenv run python get_CE_data.py; else pipenv run python get_CE_data.py --dry_run; fi
+    resource_class: small
+  athena_aws_dlc_upload:
+    docker:
+      - image: circleci/python:3.6.8
+    steps:
+      - checkout
+      - run: mkdir -p ~/.config/gspread_pandas/creds
+      - run: echo $GOOGLE_APPLICATION_CREDENTIALS > ~/.config/gspread_pandas/google_secret.json
+      - run: echo $GOOGLE_APPLICATION_CREDENTIALS > ~/.config/gspread_pandas/creds/default
+      - run: mkdir -p ~/.aws
+      - run: echo -e $AWS > ~/.aws/credentials
+      - run: pipenv sync
+      - run: |
+          if [ $CIRCLE_BRANCH = 'master' ]; then pipenv run python athena_dlc.py; else pipenv run python athena_dlc.py --dry_run; fi
+    resource_class: small
+  bigquery_gcp_upload:
+    docker:
+      - image: circleci/python:3.6.8
+    steps:
+      - checkout
+      - run: mkdir -p ~/.config/gspread_pandas/creds
+      - run: echo $GOOGLE_APPLICATION_CREDENTIALS > ~/.config/gspread_pandas/google_secret.json
+      - run: echo $GOOGLE_APPLICATION_CREDENTIALS > ~/.config/gspread_pandas/creds/default
+      - run: echo $GOOGLE_APPLICATION_CREDENTIALS > ./GOOGLE_APPLICATION_CREDENTIALS.json
+      - run: pipenv sync
+      - run: |
+          if [ $CIRCLE_BRANCH = 'master' ]; then pipenv run python bigquery.py; else pipenv run python bigquery.py --dry_run; fi
+    resource_class: small
+
+workflows:
+  commit:
+    when:
+      not: << pipeline.parameters.run-schedule >>
+    jobs:
+      - ce_upload
+      - athena_aws_dlc_upload
+      - bigquery_gcp_upload
+
+  twice_daily_upload:
+    when: << pipeline.parameters.run-schedule >>
+    jobs:
+      - ce_upload
+      - athena_aws_dlc_upload
+      - bigquery_gcp_upload
+

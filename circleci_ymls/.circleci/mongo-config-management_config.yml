@@ -1,0 +1,187 @@
+---
+version: 2.1
+
+orbs:
+ aws-cli: circleci/aws-cli@2.1.0
+ slack: circleci/slack@4.9.3
+
+executors:
+  ansible:
+    docker:
+      - image: &ansible-image 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/ansible:5.7
+        aws_auth:
+          aws_access_key_id: $ECR_AWS_ACCESS_KEY_ID
+          aws_secret_access_key: $ECR_AWS_SECRET_ACCESS_KEY
+  machine:
+    machine:
+      image: ubuntu-2004:202101-01
+      docker_layer_caching: true
+  runner-sre:
+    machine: true
+    resource_class: cci-platform/runner-sre-ansible-ssh-prod-access
+    environment:
+      PIPENV_VENV_IN_PROJECT: true
+
+commands:
+  setup-venv:
+    description: "Setup .venv cache and sync from Pipfile.lock"
+    steps:
+      - run:
+          name: Link venv cache
+          command: |
+            # BUG: https://circleci.atlassian.net/browse/RT-166
+            mkdir -p /tmp/circleci/cache/venv-$CIRCLE_PROJECT_REPONAME
+            ln -s /tmp/circleci/cache/venv-$CIRCLE_PROJECT_REPONAME .venv
+      - run:
+          name: Sync dependencies from Pipfile.lock
+          command: |
+            pipenv clean
+            pipenv sync
+
+  molecule-test:
+    description: "Run molecule test"
+    parameters:
+      role:
+        type: string
+      docker-image:
+        type: string
+        default: *ansible-image
+    steps:
+      - aws-cli/setup:
+          aws-access-key-id: ECR_AWS_ACCESS_KEY_ID
+          aws-secret-access-key: ECR_AWS_SECRET_ACCESS_KEY
+          profile-name: privaterepo
+      - run:
+          name: Log into ECR
+          command: |
+            aws --profile privaterepo ecr get-login-password \
+              --region us-east-1 | \
+            docker login \
+              --username AWS \
+              --password-stdin \
+              "https://183081753049.dkr.ecr.us-east-1.amazonaws.com"
+      - run:
+          name: Test << parameters.role >> role
+          command: |
+            docker run -ti --rm \
+              -e ANSIBLE_VAULT_PASSWORD="${ANSIBLE_VAULT_PASSWORD:-fake}" \
+              -v $PWD:/workdir \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -w /workdir/<< parameters.role >> \
+            << parameters.docker-image >> molecule test --all
+
+jobs:
+  lint-playbook:
+    executor: ansible
+    steps:
+      - checkout
+      - run:
+          name: Ansible lint configuration
+          command: "ansible-lint --exclude /root/.cache/ansible-lint -v playbook.yml"
+
+  lint-roles:
+    executor: ansible
+    steps:
+      - checkout
+      - run:
+          name: Ansible lint all roles
+          command: "ansible-lint -v roles/"
+
+  molecule_honeycomb_test:
+    executor: machine
+    steps:
+      - checkout
+      - molecule-test:
+          role: roles/honeycomb
+
+  molecule_mongodb_test:
+    executor: machine
+    steps:
+      - checkout
+      - molecule-test:
+          role: roles/mongodb
+
+  molecule_upstream_test:
+    executor: machine
+    steps:
+      - checkout
+      - molecule-test:
+          role: upstream_roles
+
+  ansible_run:
+    executor: runner-sre
+    environment:
+      ANSIBLE_INVENTORY_UNPARSED_FAILED: "True"
+    steps:
+      - checkout
+      - setup-venv
+      - run:
+          name: Get Galaxy roles
+          shell: &pipenv /usr/bin/pipenv run /bin/bash -eo pipefail
+          command: ansible-galaxy install -r requirements.yml --force-with-deps
+      - run:
+          name: Prepare the Runner private SSH key
+          shell: *pipenv
+          command: ./prepare-runner-ssh-key.bash
+      - run:
+          name: Show the instances Ansible has discovered
+          shell: *pipenv
+          command: ansible-inventory -i inventory --graph
+      - run:
+          name: Run Ansible against discovered hosts
+          shell: *pipenv
+          command: ansible-playbook -i inventory playbook.yml
+          environment:
+            ANSIBLE_FORCE_COLOR: "true"
+      - slack/notify:
+          channel: C03972EABCY # channel id for #dbre-alerts
+          event: fail
+          template: basic_fail_1
+
+workflows:
+  ansible_run:
+    jobs:
+      - lint-playbook:
+          context:
+            - org-global
+            - mongo-config-management
+      - lint-roles:
+          context:
+            - org-global
+            - mongo-config-management
+      - molecule_honeycomb_test:
+          context: org-global
+          requires:
+            - lint-playbook
+      - molecule_mongodb_test:
+          context: org-global
+          requires:
+            - lint-playbook
+      - molecule_upstream_test:
+          context:
+            - org-global
+            - mongo-config-management
+          requires:
+            - lint-playbook
+      - ansible_run:
+          name: Run Ansible
+          context: mongo-config-management
+          requires:
+            - molecule_honeycomb_test
+            - molecule_upstream_test
+          filters:
+            branches:
+              only:
+                - main
+  ansible_scheduled:
+    jobs:
+      - ansible_run:
+          name: Run Ansible periodically
+          context: mongo-config-management
+    triggers:
+      - schedule:
+          cron: "42 0,3,6,9,12,15,18,21 * * *"
+          filters:
+            branches:
+              only:
+                - main

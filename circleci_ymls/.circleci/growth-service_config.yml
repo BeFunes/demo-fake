@@ -1,0 +1,270 @@
+version: "2.1"
+
+orbs:
+  codecov: codecov/codecov@1.2.2
+  slack: circleci/slack@2.6.0
+
+references:
+  test_db_image: &test_db_image
+    image: postgres:12
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: growthservice
+      POSTGRES_HOST_AUTH_METHOD: trust
+  clojure_image: &clojure_image
+    image: circleci/clojure-service:0.7-dev
+    auth:
+      username: $DOCKER_HUB_USER
+      password: $DOCKER_HUB_PASSWORD
+
+executors:
+  clj:
+    docker:
+      - <<: *clojure_image
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+  integration:
+    docker:
+      - *clojure_image
+      - *test_db_image
+    environment:
+      - POSTGRESQL__GROWTHSERVICE__URI: jdbc:postgresql://localhost:5432/growthservice?user=postgres
+      - FLYWAY_DB_URL: jdbc:postgresql://localhost:5432/growthservice?user=postgres
+
+commands:
+  restore-deps:
+    description: "Restore maven deps from cache and run lein deps"
+    steps:
+      - restore_cache:
+          keys:
+            - maven-{{ checksum "project.clj" }}
+            - maven
+      - run:
+          name: Fetch dependencies
+          command: lein with-profile dev deps
+  save-deps:
+    description: "Save maven deps to cache"
+    steps:
+      - save_cache:
+          key: maven-{{ checksum "project.clj" }}
+          paths:
+            - ~/.m2
+  # Wrap the slack/status command to only notify on failures
+  slack-notify-on-failure:
+    steps:
+      - slack/status:
+          fail_only: true
+          only_for_branch: "main"
+
+
+jobs:
+  # Initialize the environment by pulling maven dependencies into ~/.m2 and caching them for future
+  # steps and future builds.
+  init-service:
+    executor:
+      name: clj
+    working_directory: ~/growth-service
+    steps:
+      - checkout:
+          path: ~/growth-service
+      - restore-deps
+      - save-deps
+      - slack-notify-on-failure
+
+  # Build the uberjar (the standalone JAR file that ends up deployed in production)
+  build-service-uberjar:
+    executor:
+      name: clj
+    working_directory: ~/growth-service
+    steps:
+      - checkout:
+          path: ~/growth-service
+      - restore-deps
+      - run:
+          name: Build uberjar
+          command: |
+            lein uberjar
+            cp -v target/uberjar/growth-service-*-standalone.jar target/growth-service-standalone.jar
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target/growth-service-standalone.jar
+      - slack-notify-on-failure
+  # Runs linters on the Clojure code
+  lint-service:
+    executor:
+      name: clj
+    working_directory: ~/growth-service
+    steps:
+      - checkout:
+          path: ~/growth-service
+      - restore-deps
+      - run: lein clj-kondo
+      - slack-notify-on-failure
+      #- run: lein eastwood
+  # Runs all the Clojure tests
+  test-service:
+    executor: integration
+    working_directory: ~/growth-service
+    steps:
+      - checkout:
+          path: ~/growth-service
+      - restore-deps
+      - run:
+          name: Run db migrations
+          command: lein flyway migrate
+      # See the project.clj file for the differences between test and test-ci:
+      # Usually this means `test` plus coverage and junit output plugins
+      - run: lein test-ci
+      - store_test_results:
+          path: target/test-results
+      - codecov/upload
+      - slack-notify-on-failure
+
+  # Runs a Twistlock/Prisma scan on feature branches
+  # See https://github.com/circleci/engineering/blob/master/howto/prisma-scan-for-vulns.md
+  scan-service:
+    executor:
+      name: ccc
+    environment:
+      NAME: growth-service
+      DEPLOY_CLOJURE_JARFILE: target/growth-service-standalone.jar
+    working_directory: ~/growth-service
+    steps:
+      - checkout:
+          path: ~/growth-service
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: scan
+      - store_artifacts:
+          path: ccc-image-scan-results
+          destination: growth-service/ccc-image-scan-results
+      - slack-notify-on-failure
+
+  # Publishes to ECR/Docker Hub and deploys the service on master and canary branches
+  publish-deploy-service:
+    executor:
+      name: ccc
+    environment:
+      NAME: growth-service
+      DEPLOY_CLOJURE_JARFILE: target/growth-service-standalone.jar
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/growth-service
+      DEPLOY_TYPE: helm
+      DOCKER_REGISTRY: all
+      VALUES_FILE: k8s-values.yml
+    working_directory: ~/growth-service
+    steps:
+      - checkout:
+          path: ~/growth-service
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - when:
+          condition:
+            not: # exclusive rather than inclusive to protect against branches being renamed
+              equal: [master, << pipeline.git.branch >>]
+          steps:
+            - run:
+                name: Configure canary
+                command: |
+                  # These override default values from CCC and the executor.
+                  echo "export RELEASE_VERSION=canary" >> "${BASH_ENV}"
+                  echo "export ROLLBAR_ENVIRONMENT=canary" >> "${BASH_ENV}"
+                  echo "export VALUES_FILE=canary.yml" >> "${BASH_ENV}"
+                  /deploy/merge-values k8s-values.yml canary-overrides.yml > canary.yml
+      - run: publish
+      - run: deploy
+      - slack-notify-on-failure
+
+  deploy-migrator:
+    executor: ccc
+    environment:
+      NAME: growth-service-migrator
+      DOCKER_REGISTRY: all
+      DEPLOY_TYPE: helm
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/growth-service-migrator
+      MIGRATIONS_SQL_PATH: migrations
+      VALUES_FILE: migrations/k8s-values.yml
+      ROLLBAR_ACCESS_TOKEN: "" # Prevent CCC from notifying Rollbar when migrator is deployed.
+    working_directory: ~/growth-service
+    steps:
+      - checkout:
+          path: ~/growth-service
+      - setup_remote_docker
+      - run: publish
+      - run: deploy
+      - slack-notify-on-failure
+
+  deploy-client:
+    executor: clj
+    steps:
+      - checkout
+      - restore-deps
+      - run:
+          name: Deploy growth-service client
+          command: |
+            lein deploy circle-s3
+          working_directory: client
+      - slack-notify-on-failure
+
+workflows:
+  deploy:
+    jobs:
+      - init-service:
+          context: org-global
+      - build-service-uberjar:
+          context: org-global
+          requires:
+            - init-service
+      - lint-service:
+          context: org-global
+          requires:
+            - init-service
+      - test-service:
+          context: org-global
+          requires:
+            - init-service
+      - scan-service:
+          context: org-global
+          requires:
+            - build-service-uberjar
+          filters:
+            branches:
+              # fret not, scans are run on master and canary too, as part of the real publish
+              ignore:
+                - master
+                - canary
+      - deploy-migrator:
+          context: org-global
+          requires:
+            - test-service
+            - lint-service
+            - test-service
+          filters:
+            branches:
+              only: master
+      - publish-deploy-service:
+          context: org-global
+          requires:
+            - build-service-uberjar
+            - lint-service
+            - test-service
+          filters:
+            branches:
+              only:
+                - master
+                - canary
+      - deploy-client:
+          context: org-global
+          requires:
+            - publish-deploy-service
+          filters:
+            branches:
+              only:
+                - master
+                - canary

@@ -1,0 +1,41 @@
+version: 2.1
+
+packages: &packages
+  - babashka
+  # - clj-find-usage # cf https://circleci.atlassian.net/browse/BACKPLANE-1369
+
+jobs:
+  build-package:
+    parameters:
+      package:
+        type: string
+    macos:
+      xcode: 11.3.0 # NB: arbitrary
+    steps:
+      - checkout
+      - add_ssh_keys:
+          fingerprints:
+            - "6e:99:ef:68:60:d7:1d:10:b9:33:b1:e9:c5:74:83:de"
+      - run:
+          name: Install Nix
+          command: |
+            sh <(curl -L "https://nixos.org/nix/install") --darwin-use-unencrypted-nix-store-volume --no-daemon --no-modify-profile --no-channel-add
+            source "$HOME/.nix-profile/etc/profile.d/nix.sh"
+            nix-channel --add 'https://nixos.org/channels/nixos-21.05' nixpkgs
+            nix-channel --update
+      - run:
+          name: Build package '<< parameters.package >>'
+          command: |
+            source "$HOME/.nix-profile/etc/profile.d/nix.sh"
+            NIX_PATH="$NIX_PATH:nixpkgs-overlays=$(pwd)" \
+            nix-env -i -A nixpkgs.<< parameters.package >>
+
+
+workflows:
+  version: 2
+  build-packages:
+    jobs:
+      - build-package:
+          matrix:
+            parameters:
+              package: *packages

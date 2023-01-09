@@ -1,0 +1,183 @@
+version: 2.1
+orbs:
+  web-ui-orb: sandbox/web-ui-orb@5.0.1
+references:
+  version_js: &version_js 7
+  version_cypress: &version_cypress 1
+  hostname: &hostname circleci.com
+parameters:
+    run-schedule:
+      type: boolean
+      default: false
+workflows:
+  version: 2
+  build-test-and-deploy:
+    when:
+      not: <<pipeline.parameters.run-schedule>>
+    jobs:
+      - web-ui-orb/dependencies:
+          name: dependencies
+          context: web-ui-npm
+          cache_version_js_dependencies: *version_js
+          cache_version_cypress_dependencies: *version_cypress
+      - web-ui-orb/storybook-build:
+          name: storybook-build
+          cache_version_js_dependencies: *version_js
+          prebuild_run_command: yarn build:i18n
+          build_storybook_command: "NODE_ENV=test yarn build-storybook"
+          requires:
+            - dependencies
+      - web-ui-orb/test:
+          name: test
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+      - web-ui-orb/chromatic-snapshot:
+          name: chromatic-snapshot
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+            - storybook-build
+      - web-ui-orb/test-production-docker-image:
+          name: test-production-docker-image
+          image_name: web-ui-authentication
+          cache_version_js_dependencies: *version_js
+          hostname: *hostname
+          requires:
+            - dependencies
+          context:
+            - web-ui-npm
+            - org-global
+      - web-ui-orb/build-and-deploy-static:
+          cache_version_js_dependencies: *version_js
+          name: build-and-deploy-static
+          bucket_name: circleci-web-ui-authentication-assets
+          cdn_url: http://assets-authentication.circleci.com
+          context: 
+            - web-ui-authentication-assets
+            - web-ui-npm
+            - web-ui-datadog
+            - org-global
+          filters:
+            branches:
+              only:
+                - master
+                - canary
+          requires:
+            - dependencies
+      - web-ui-orb/build-static:
+          name: build-static
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+          filters:
+            branches:
+              ignore:
+                - master
+                - canary
+      - web-ui-orb/build-and-publish-container:
+          name: vulnerability-scan-docker-image
+          image_name: web-ui-authentication
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          scan_only: true
+          context: 
+            - org-global
+            - web-ui-npm
+          filters:
+            branches:
+              ignore: 
+                - master
+                - canary
+          requires:            
+            - build-static
+      - web-ui-orb/build-and-publish-container:
+          name: publish
+          image_name: web-ui-authentication
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: 
+            - org-global
+            - web-ui-npm
+          filters:
+            branches:
+              only: master
+          requires:
+            - test
+            - build-and-deploy-static
+            - test-production-docker-image   
+      - web-ui-orb/deploy-container:
+          name: deploy
+          image_name: web-ui-authentication
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: 
+            - org-global
+            - web-ui-npm
+          filters:
+            branches:
+              only: master
+          requires:
+            - publish   
+      - web-ui-orb/build-and-publish-container:
+          name: publish-canary
+          image_name: web-ui-authentication
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: 
+            - org-global
+            - web-ui-npm
+          filters:
+            branches:
+              only: canary
+          requires:
+            - test
+            - build-and-deploy-static
+            - test-production-docker-image
+      - web-ui-orb/deploy-container:
+          name: deploy-canary
+          image_name: web-ui-authentication
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: 
+            - org-global
+            - web-ui-npm
+          release_version: canary
+          values_file: k8s-canary-values.yml
+          filters:
+            branches:
+              only: canary
+          requires:
+            - publish-canary
+
+  scheduled-vulnerability-scan:
+    when: <<pipeline.parameters.run-schedule>>
+    jobs:
+      - web-ui-orb/dependencies:
+          name: dependencies
+          context: web-ui-npm
+          cache_version_js_dependencies: *version_js
+          cache_version_cypress_dependencies: *version_cypress
+      - web-ui-orb/build-static:
+          name: build-static
+          cache_version_js_dependencies: *version_js
+          context: web-ui-authentication-assets
+          filters:
+            branches:
+              only: master
+          requires:
+            - dependencies
+      - web-ui-orb/build-and-publish-container:
+          name: scheduled-vulnerability-scan-docker-image
+          image_name: web-ui-authentication
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          scan_only: true
+          context: 
+            - org-global
+            - web-ui-npm
+          filters:
+            branches:
+              only: master
+          requires:
+            - build-static

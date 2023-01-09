@@ -1,0 +1,97 @@
+version: 2.1
+orbs:
+  slack: circleci/slack@4.1.1
+jobs:
+  build:
+    working_directory: /go/src/github.com/tylerconlee/slab
+    docker:
+      - image: circleci/golang:1.10.3
+      
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+              - glide-cache-{{ .Branch }}-{{ checksum "glide.lock" }}
+      - run:
+          name: Install dependencies if not cached
+          command: |
+              if [ -d ./vendor ]; then
+                  echo "vendor directory found"
+              else
+                  echo "vendor directory not found"
+                  curl https://glide.sh/get | sh
+                  glide install
+              fi
+      - save_cache:
+          key: glide-cache-{{ .Branch }}-{{ checksum "glide.lock" }}
+          paths:
+              - vendor
+  test:
+    working_directory: /go/src/github.com/tylerconlee/slab
+    docker:
+      - image: circleci/golang:1.10.3
+      - image: circleci/redis:4
+    steps:
+      - checkout
+      - restore_cache:
+          key: glide-cache-{{ .Branch }}-{{ checksum "glide.lock" }}
+      - run: go test -v $(go list ./... | grep -v /vendor/) 
+  dev-deploy:
+    working_directory: /go/src/github.com/tylerconlee/slab
+    docker:
+      - image: circleci/golang:1.10.3
+    steps:
+      - checkout
+      - restore_cache:
+          key: glide-cache-{{ .Branch }}-{{ checksum "glide.lock" }}
+      - run: make
+      - run: make dev
+      - slack/notify:
+          event: fail
+          mentions: '@ceops'
+          template: basic_fail_1
+      - slack/notify:
+          event: pass
+          template: success_tagged_deploy_1
+  deploy:
+    working_directory: /go/src/github.com/tylerconlee/slab
+    docker:
+      - image: circleci/golang:1.10.3
+    steps:
+      - checkout
+      - add_ssh_keys:
+          fingerprints:
+            - "c6:f3:f5:fd:8e:c0:cc:96:dc:8e:7f:c2:08:a4:f0:6d"
+      - restore_cache:
+          key: glide-cache-{{ .Branch }}-{{ checksum "glide.lock" }}
+      - run: make
+      - run: make deploy
+      - slack/notify:
+          event: fail
+          mentions: '@ceops'
+          template: basic_fail_1
+      - slack/notify:
+          event: pass
+          template: success_tagged_deploy_1
+
+workflows:
+  version: 2
+  build_and_test:
+    jobs:
+      - build
+      - test:
+          requires:
+            - build
+      - dev-deploy:
+          requires:
+            - test
+          filters:
+            branches:
+              only: develop
+      - deploy:
+          requires:
+            - test
+          filters:
+            branches:
+              only: master
+      

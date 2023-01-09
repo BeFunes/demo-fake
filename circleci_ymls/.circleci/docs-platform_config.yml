@@ -1,0 +1,388 @@
+version: 2.1
+orbs:
+  web-ui-orb: sandbox/web-ui-orb@3.11.0
+  node: circleci/node@5.0.1
+  ruby: circleci/ruby@1.1.4 # for __content
+
+defaults: &defaults
+  docker:
+    - image: cimg/node:16.14.2
+
+references:
+  image_name: &image_name "docs-platform"
+  optimizely_sdk_key: &optimizely_sdk_key GfYszBpMkefBSwiiEkH3b3
+
+executors:
+  docker-executor: # for use with CCC. need a different image than the others to prevent errors
+    docker:
+      - image: cimg/node:16.14.2
+    resource_class: medium+
+
+commands:
+  inject-npm-token:
+    steps:
+      - run:
+          name: Inject NPM Token into build script
+          command:
+            sed 's:docker build:docker build --build-arg NPM_TOKEN=$NPM_TOKEN:'
+            -i /publish/scripts/create-image.sh
+  verify-npm-token:
+    steps:
+      - run:
+          name: Check for NPM_TOKEN
+          command: |
+            if [ -z "$NPM_TOKEN" ]; then
+              echo "Error: The environment variable NPM_TOKEN is empty. Please ensure the environment variable NPM_TOKEN has been added (you likely need the web-ui-npm context)"
+              exit 1
+            fi
+  restore-yarn-cache:
+    description: "Restore node_modules cache"
+    steps:
+      - restore_cache:
+          keys:
+            - docs-platform-v3-{{arch}}-{{checksum "yarn.lock"}}
+  restore-next-cache:
+    description: "Restore NextJS build cache"
+    steps:
+      - restore_cache:
+          keys:
+            - next-{{arch}}-{{checksum "yarn.lock"}}
+
+jobs:
+  audit:
+    <<: *defaults
+    steps:
+      - attach_workspace:
+          at: ~/project
+      - checkout
+      - run:
+          name: "yarn audit"
+          command: yarn audit
+      - persist_to_workspace:
+          root: ~/project
+          paths:
+            - .
+
+  dependencies:
+    <<: *defaults
+    steps:
+      - attach_workspace:
+          at: ~/project
+      - verify-npm-token
+      - checkout
+      - restore-yarn-cache
+      - run:
+          name: "Login to npm"
+          command: echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
+      - run:
+          name: Install yarn deps
+          command: yarn install --frozen-lockfile
+      - save_cache:
+          paths:
+            - node_modules
+          key: docs-platform-v3-{{arch}}-{{checksum "yarn.lock"}}
+      - persist_to_workspace:
+          root: ~/project
+          paths:
+            - .
+
+  checkout-content:
+    executor:
+      name: ruby/default
+      tag: "2.7.4-browsers"
+    steps:
+      - attach_workspace:
+          at: ~/project
+      - run:
+          name: Init __content submodule
+          command: |
+            git submodule update --init --recursive
+      - restore_cache:
+          keys:
+            # when lock file changes, use increasingly general patterns to restore cache
+            - v1-gem-cache-{{ arch }}-{{ .Branch }}-{{ checksum "__content/Gemfile.lock" }}
+            - v1-gem-cache-{{ arch }}-{{ .Branch }}-
+            - v1-gem-cache-{{ arch }}-
+      - run:
+          name: Build __content
+          command:
+            | # https://support.circleci.com/hc/en-us/articles/360051656632-Swap-node-version-on-CircleCI-convenience-image
+            set +e
+            wget -qO- https://raw.githubusercontent.com/nvm-sh/nvm/v0.35.1/install.sh | bash
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+            [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
+            nvm install 16.14.2
+            nvm alias default 16.14.2
+            sudo apt-get update && sudo apt-get install -y cmake
+            yarn update-content
+      - save_cache:
+          paths:
+            - ~/.bundle
+          key: v1-gem-cache-{{ arch }}-{{ .Branch }}-{{ checksum "__content/Gemfile.lock" }}
+      - persist_to_workspace:
+          root: ~/project
+          paths:
+            - .
+
+  lint-typecheck:
+    <<: *defaults
+    steps:
+      - attach_workspace:
+          at: ~/project
+      - run: yarn lint
+      - run: yarn typecheck
+      - run: yarn start-storybook --smoke-test
+
+  jest-cypress-tests:
+    <<: *defaults
+    steps:
+      - attach_workspace:
+          at: ~/project
+      - run:
+          name: "Run jest"
+          command: yarn test:ci
+      - run:
+          name: "Install cypress dependencies"
+          command: |
+            sudo apt-get update && sudo apt-get install libgtk2.0-0 libgtk-3-0 libgbm-dev libnotify-dev libgconf-2-4 libnss3 libxss1 libasound2 libxtst6 xauth xvfb
+            npx cypress install
+      - run:
+          name: "Run cypress"
+          command: yarn test:e2e:ci
+
+  build:
+    <<: *defaults
+    steps:
+      - attach_workspace:
+          at: ~/project
+      # - restore-yarn-cache
+      - restore-next-cache
+      - run:
+          name: Build nextjs app
+          command: BUILD_ID="$CIRCLE_SHA1" yarn build
+      - save_cache:
+          paths:
+            - src/.next
+            - .next
+          key: next-{{arch}}-{{checksum "yarn.lock"}}
+      - persist_to_workspace:
+          paths:
+            - src/.next
+            - .next
+          root: .
+
+  deploy-static:
+    <<: *defaults
+    parameters:
+      bucket_name:
+        description: The name of the s3 bucket where static assets are stored.
+        type: string
+      build_dir:
+        default: "./.next"
+        description: The path to the NextJS build directory
+        type: string
+      cdn_url:
+        description: The url of the CDN where we host assets for this app.
+        type: string
+      cdn_url_build_dir:
+        default: "_next"
+        description: The path to the NextJS build directory on the CDN
+        type: string
+      cache_control_ttl:
+        default: 31536000
+        description: |
+          The number of seconds the browser should cache JS, CSS, and image assets. Default is 365 days.
+          Deploys will create new hash file names which will break the cache.
+        type: integer
+    steps:
+      - attach_workspace: # assumes NextJs build exists here
+          at: ~/project
+      # - restore-yarn-cache
+      - restore-next-cache
+      - run:
+          name: Install AWS CLI for S3 Uploads
+          command: |
+            sudo apt update
+            sudo apt-get install awscli
+      - run:
+          name: Upload build static files to S3
+          command: |
+            AWS_S3_BUCKET=<< parameters.bucket_name >>
+            BUILD_DIRECTORY=<< parameters.build_dir >>
+            BUILD_ID="$(cat $BUILD_DIRECTORY/BUILD_ID)"
+            CACHE_TTL=<< parameters.cache_control_ttl >>
+
+            if [[ -d "$BUILD_DIRECTORY/static" ]] ; then
+              aws s3 cp "$BUILD_DIRECTORY/static" "s3://$AWS_S3_BUCKET/_next/static" \
+                --recursive --exclude="*.js.map" --cache-control max-age=$CACHE_TTL
+            fi
+            if [[ -d "$BUILD_DIRECTORY/server/static/$BUILD_ID/pages" ]] ; then
+              aws s3 cp "$BUILD_DIRECTORY/server/static/$BUILD_ID/pages" "s3://$AWS_S3_BUCKET/_next/server/static/$BUILD_ID/pages" \
+                --recursive --exclude="*.js.map" --cache-control max-age=$CACHE_TTL
+            fi
+      - run:
+          name: Upload sourcemaps to Rollbar
+          command: |
+            BUILD_DIRECTORY=<< parameters.build_dir >>
+            BUILD_ID="$(cat $BUILD_DIRECTORY/BUILD_ID)"
+
+            find $BUILD_DIRECTORY/server $BUILD_DIRECTORY/static -name '*.js' -type f -print0 |
+            while IFS= read -r -d '' line; do
+              if [[ $line =~ ^[.] ]]; # if the glob starts with a period, remove it
+              then
+                name=${line/./}
+              else
+                name=${line}
+              fi
+              url="<< parameters.cdn_url>>${name/./_}"
+              map="$line.map"
+
+            if [[ -f "$map" ]];
+            then
+              echo "Uploading source map: ${map}"
+              curl https://api.rollbar.com/api/1/sourcemap \
+                -F access_token="$EXCEPTION_LOGGER_SERVER_TOKEN" \
+                -F version="$BUILD_ID" \
+                -F minified_url="$url"\
+                -F "source_map=@$map"
+            fi
+            done
+      - run:
+          name: Upload sourcemaps to Datadog RUM
+          command: |
+            BUILD_DIRECTORY=<< parameters.build_dir >>
+            BUILD_ID="$(cat $BUILD_DIRECTORY/BUILD_ID)"
+
+            if [ -z "$DATADOG_API_KEY" ]; then
+            echo "Warning: The environment variable DATADOG_API_KEY is empty. If you want to send source maps to Datadog RUM, please ensure the web-ui-datadog context has been added to your config."
+            else
+              url="<< parameters.cdn_url>>/<< parameters.cdn_url_build_dir>>/"
+              echo "Uploading source maps to DDR"
+                yarn datadog-ci sourcemaps upload ./.next \
+                  --service=circleci \
+                  --release-version="$BUILD_ID" \
+                  --minified-path-prefix="$url"
+            fi
+
+  build-and-scan-twistlock:
+    # builds the docker image and runs twistlock scan without publishing
+    executor: docker-executor
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: *image_name
+          DOCKERFILE_PATH: Dockerfile
+          CONFIGURE_ECR_REPO: true
+          ECR_OWNER_TEAM: DocsDisco
+    steps:
+      - attach_workspace:
+          at: ~/project
+      - verify-npm-token
+      - restore-next-cache
+      - setup_remote_docker:
+          docker_layer_caching: true
+          version: 20.10.11
+      - inject-npm-token
+      - run: pwd && scan # https://github.com/circleci/command-convenience-containers/blob/main/publish/bin/scan
+      - store_artifacts:
+          path: /tmp/_lw-scanner_scan_result.json
+          destination: lacework_scan_result.json
+
+  build-scan-and-publish:
+    # builds the docker image, scans with twistlock, and publishes
+    executor: docker-executor
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: *image_name
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: ecr
+          CONFIGURE_ECR_REPO: true
+          ECR_OWNER_TEAM: DocsDisco
+    steps:
+      - attach_workspace:
+          at: ~/project
+      - verify-npm-token
+      - restore-next-cache
+      - attach_workspace:
+          at: . # for nextjs build
+      - setup_remote_docker:
+          docker_layer_caching: true
+          version: 20.10.11
+      - inject-npm-token
+      - run: publish # https://github.com/circleci/command-convenience-containers/blob/main/publish/bin/publish
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.tag
+
+workflows:
+  build-test-and-deploy:
+    jobs:
+      - audit
+      - dependencies:
+          requires:
+            - audit
+          context:
+            - web-ui-npm
+      - checkout-content:
+          requires:
+            - dependencies
+      - lint-typecheck:
+          requires:
+            - checkout-content
+      - jest-cypress-tests:
+          requires:
+            - checkout-content
+      - build:
+          requires:
+            - checkout-content
+      - deploy-static:
+          bucket_name: "circleci-docs-platform-assets/docs"
+          build_dir: ./.next
+          cdn_url: "https://assets-docs.circleci.com/docs"
+          context: [docs-platform-assets, web-ui-npm, web-ui-datadog]
+          filters:
+            branches:
+              only:
+                - main
+          requires:
+            - lint-typecheck
+            - jest-cypress-tests
+            - build
+            #- chromatic
+      - build-and-scan-twistlock:
+          context: [web-ui-npm, org-global]
+          requires:
+            - build
+          filters:
+            branches:
+              ignore:
+                - main
+      - build-scan-and-publish:
+          context: [web-ui-npm, org-global]
+          requires:
+            - deploy-static
+          filters:
+            branches:
+              only:
+                - main
+      - web-ui-orb/deploy-container:
+          name: deploy-production
+          image_name: *image_name
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [web-ui-npm, org-global]
+          filters:
+            branches:
+              only:
+                - main
+          requires:
+            - build-scan-and-publish

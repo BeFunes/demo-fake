@@ -1,0 +1,37 @@
+version: 2.1
+
+commands:
+  gomod:
+    steps:
+      - restore_cache:
+          keys: ["gomod-{{ arch }}-"]
+      - run:
+          name: Download go module dependencies
+          command: go mod download
+      - save_cache:
+          key: gomod-{{ arch }}-{{ checksum "go.sum" }}
+          paths:
+            - /go/pkg/mod  # Linux
+            - ~/go/pkg/mod # macOS
+
+jobs:
+  build:
+    docker:
+      - image: circleci/golang:1.13.4
+        environment:
+          GOPRIVATE=github.com/circleci
+    resource_class: small
+    steps:
+      - checkout
+      - gomod
+      - run: go test
+      - store_test_results:
+          path: results
+      - store_artifacts:
+          path: results
+
+workflows:
+  version: 2
+  build:
+    jobs:
+      - build

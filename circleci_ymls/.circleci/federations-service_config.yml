@@ -1,0 +1,298 @@
+version: 2.0
+
+references:
+  clojure-service-image: &clojure-service-image
+    image: circleci/clojure-service:0.7-dev
+    auth:
+      username: $DOCKER_HUB_USER
+      password: $DOCKER_HUB_PASSWORD
+
+  command-convenience-image: &command-convenience-image
+    image: circleci/command-convenience:0.1
+    auth:
+      username: $DOCKER_HUB_USER
+      password: $DOCKER_HUB_PASSWORD
+
+  postgresql-image: &postgresql-image
+    image: postgres:9.5.16
+
+  command-convenience-environment: &command-convenience-environment
+    CONTAINER_ORG: circleci
+    DOCKER_REGISTRY: all
+    DEPLOY_TYPE: helm
+    RELEASE_VERSION: v1
+
+  restore-maven-local-repository: &restore-maven-local-repository
+    restore_cache:
+      keys:
+        - v1-mvn-{{ checksum "client/project.clj" }}-{{ checksum "server/project.clj" }}
+        - v1-mvn-
+
+  save-maven-local-repository: &save-maven-local-repository
+    save_cache:
+      key: v1-mvn-{{ checksum "client/project.clj" }}-{{ checksum "server/project.clj" }}
+      paths:
+        - /root/.m2
+
+  working-directory: &working-directory
+    working_directory: /root/federations-service
+
+  migrate: &migrate
+    run:
+      name: Migrate database
+      command: |
+        sleep 2
+        flyway -url=jdbc:postgresql://localhost:5432/postgres \
+          -user=postgres \
+          -locations=filesystem:migrator/sql \
+          migrate
+
+  configuration: &configuration
+    GRPC_PORT: 8010
+    GRPC_PLAINTEXT_PORT: 8011
+    HEALTH_CHECK_PORT: 8090
+    NREPL_PORT: 3145
+    POSTGRES_JDBC_URL: postgres://postgres:@localhost:5432/postgres
+    PROJECT__ARTIFACT: federations-service
+    PROJECT__GROUP: circleci
+    ROLLBAR__ENVIRONMENT: development
+    ROLLBAR__TOKEN: meaningless
+    STATSD__HOST: localhost
+    STATSD__PORT: 8125
+
+jobs:
+  build-cache:
+    docker:
+      - *clojure-service-image
+    <<: *working-directory
+    steps:
+      - checkout
+      - *restore-maven-local-repository
+      - run:
+          name: Download server dependencies
+          command: lein with-profile test deps
+          working_directory: /root/federations-service/server
+      - run:
+          name: Download client dependencies
+          command: lein with-profile test deps
+          working_directory: /root/federations-service/client
+      - *save-maven-local-repository
+
+  test-client:
+    docker:
+      - *clojure-service-image
+      - *postgresql-image
+    <<: *working-directory
+    steps:
+      - checkout
+      - *restore-maven-local-repository
+      - *migrate
+      - run:
+          name: Run client tests
+          working_directory: /root/federations-service/client
+          command: lein test
+      - store_test_results:
+          path: client/target/test-results
+
+  test-server:
+    docker:
+      - *clojure-service-image
+      - *postgresql-image
+    <<: *working-directory
+    steps:
+      - checkout
+      - *restore-maven-local-repository
+      - *migrate
+      - run:
+          name: Run server tests
+          working_directory: /root/federations-service/server
+          command: lein test
+          environment:
+            <<: *configuration
+      - store_test_results:
+          path: server/target/test-results
+      - store_artifacts:
+          path: target/test-results
+          destination: raw-test-results
+
+  build-uberjar:
+    docker:
+      - *clojure-service-image
+      - *postgresql-image
+    <<: *working-directory
+    steps:
+      - checkout
+      - *restore-maven-local-repository
+      - run:
+          name: uberjar
+          working_directory: /root/federations-service/server
+          command: lein uberjar
+      - run:
+          command: |
+            mv target/federations-service-*-standalone.jar \
+              target/federations-service-standalone.jar
+          working_directory: /root/federations-service/server
+      - persist_to_workspace:
+          root: .
+          paths:
+            - server/target/federations-service-standalone.jar
+
+  test-publish-migrator:
+    docker:
+      - <<: *command-convenience-image
+        environment:
+          <<: *command-convenience-environment
+          NAME: federations-service-migrator
+          DOCKERFILE_PATH: migrator/Dockerfile
+    <<: *working-directory
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Publish docker image
+          command: publish
+          environment:
+            DOCKER_REGISTRY: none
+
+  publish-migrator:
+    docker:
+      - <<: *command-convenience-image
+        environment:
+          <<: *command-convenience-environment
+          NAME: federations-service-migrator
+          DOCKERFILE_PATH: migrator/Dockerfile
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/federations-service-migrator
+          VALUES_FILE: migrator/values.yaml
+    <<: *working-directory
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Publish docker image
+          command: publish
+      - run: mv docker_image.tag docker_image.migrator.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.migrator.tag
+
+  test-publish-service:
+    docker:
+      - <<: *command-convenience-image
+        environment:
+          <<: *command-convenience-environment
+          NAME: federations-service
+          DOCKERFILE_PATH: server.Dockerfile
+    <<: *working-directory
+    steps:
+      - checkout
+      - *restore-maven-local-repository
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run:
+          name: Publish docker image
+          command: publish
+          environment:
+            DOCKER_REGISTRY: none
+
+  publish-service:
+    docker:
+      - <<: *command-convenience-image
+        environment:
+          <<: *command-convenience-environment
+          NAME: federations-service
+          DOCKERFILE_PATH: server.Dockerfile
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/federations-service
+          VALUES_FILE: server/values.yaml
+    <<: *working-directory
+    steps:
+      - checkout
+      - *restore-maven-local-repository
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run:
+          name: Publish docker image
+          command: publish
+      - run: mv docker_image.tag docker_image.service.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.service.tag
+
+  deploy-client:
+    docker:
+      - *clojure-service-image
+      - *postgresql-image
+    <<: *working-directory
+    steps:
+      - checkout
+      - *restore-maven-local-repository
+      - run:
+          name: Deploy federations-service-client
+          command: lein deploy circle-s3
+          working_directory: /root/federations-service/client
+
+workflows:
+  version: 2
+  build-and-deploy:
+    jobs:
+      - build-cache:
+          context: org-global
+      - test-client:
+          context: org-global
+          requires:
+            - build-cache
+      - test-server:
+          context: org-global
+          requires:
+            - build-cache
+      - build-uberjar:
+          context: org-global
+          requires:
+            - build-cache
+      - test-publish-migrator:
+          context: org-global
+          requires:
+            - build-cache
+          filters:
+            branches:
+              ignore:
+                - main
+                - /^server-2\..+/
+      - publish-migrator:
+          context: org-global
+          requires:
+            - test-client
+            - test-server
+          filters:
+            branches:
+              only:
+                - main
+                - /^server-2\..+/
+      - test-publish-service:
+          context: org-global
+          requires:
+            - build-uberjar
+          filters:
+            branches:
+              ignore:
+                - main
+                - /^server-2\..+/
+      - publish-service:
+          context: org-global
+          requires:
+            - build-uberjar
+          filters:
+            branches:
+              only:
+                - main
+                - /^server-2\..+/
+      - deploy-client:
+          context: org-global
+          filters:
+            branches:
+              only:
+                - main
+                - /^server-2\..+/

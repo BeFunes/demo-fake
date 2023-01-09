@@ -1,0 +1,13 @@
+version: 2.1
+
+workflows:
+  testing:
+    jobs:
+      - stuff
+
+jobs:
+  stuff:
+    docker:
+      - image: circleci/python:3
+    steps:
+      - run: sleep 30

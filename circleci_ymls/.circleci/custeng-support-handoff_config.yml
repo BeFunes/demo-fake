@@ -1,0 +1,72 @@
+version: 2.1 
+
+orbs:
+  python: circleci/python@1.5.0
+
+jobs:
+  test:
+    executor:
+      name: python/default
+      tag: '3.8'
+    steps:
+      - checkout
+      - python/install-packages:
+          args: '--dev'
+          pkg-manager: pipenv
+      - run:
+          command: |
+            # exit non-zero if linting fails
+            pipenv run black . --check
+          name: Lint
+      - run:
+          command: |
+            pipenv run pytest .
+          name: Test
+
+  handoff:
+    parameters:
+      app_env:
+        type: enum
+        enum:
+          - staging
+          - production
+        default: staging
+    environment:
+      APP_ENV: <<parameters.app_env>>
+    executor: python/default
+    steps:
+      - checkout
+      - python/install-packages:
+          pkg-manager: pipenv
+      - run:
+          command: |
+            pipenv run python main.py
+          name: Handoff!!
+
+workflows:
+  version: 2
+  # NOTE: this will run on commit-related triggers (e.g., pull requests)
+  test_and_run:
+    when:
+      not:
+        equal: [ scheduled_pipeline, << pipeline.trigger_source >> ]
+    jobs:
+      - test
+      - handoff:
+          app_env: staging
+          name: "Handoff to #slacktest"
+          requires:
+            - test
+
+  scheduled:
+    when:
+      and:
+        - equal: [ scheduled_pipeline, << pipeline.trigger_source >> ]
+    jobs:
+      - handoff:
+          app_env: production
+          filters:
+            branches:
+              only:
+                - master
+

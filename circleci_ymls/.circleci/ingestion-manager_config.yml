@@ -1,0 +1,343 @@
+version: 2.1
+
+orbs:
+  terraform: circleci/terraform@3.0.0
+
+refs:
+  clojure-service-image: &clojure-service-image
+    image: circleci/clojure-service:0.8-dev
+    auth:
+      username: $DOCKER_HUB_USER
+      password: $DOCKER_HUB_PASSWORD
+
+executors:
+  clojure-service:
+    docker:
+      - <<: *clojure-service-image
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+commands:
+  set_version:
+    steps:
+      - run:
+          name: Compute and set a single version
+          command: |
+            set -o errexit
+            set -o nounset
+            version="1.0.<<pipeline.number>>-${CIRCLE_SHA1:0:7}"
+            echo "export SERVICE_VERSION=${version}" >> ${CIRCLE_SHELL_ENV}
+            echo "export CONTAINER_VERSION=${version}" >> ${CIRCLE_SHELL_ENV}
+            echo ${version}
+  build_scan_publish:
+    parameters:
+      jar-name:
+        type: string
+        default: ingestion-manager.jar
+    steps:
+      - attach_workspace:
+          at: /workspace
+      - run:
+          name: Copy Jar
+          command: cp /workspace/<< parameters.jar-name >> .
+          working_directory: deploy
+      - run:
+          name: Build, Scan & Publish
+          command: publish
+          working_directory: deploy
+  lein_deps:
+    steps:
+      - restore_cache:
+          keys:
+            - v1-dependencies-{{ checksum "project.clj" }}
+            - v1-dependencies-
+      - run: lein deps
+      - save_cache:
+          paths:
+            - ~/.m2
+          key: v1-dependencies-{{ checksum "project.clj" }}
+  run_postgres_migration:
+    steps:
+      - run:
+          name: Run PostgreSQL Migrations
+          command: |
+            createdb --username circle --owner=circle --host postgres ingestion_manager
+            run-migrations
+          environment:
+            DATABASE_MIGRATIONS: resources/migrations
+            DATABASE_USER: circle
+            DATABASE_URL: "jdbc:postgresql://postgres:5432/ingestion_manager"
+  rollbar_deploy:
+    parameters:
+      access_token:
+        type: env_var_name
+      environment:
+        type: string
+        default: production
+    steps:
+      - run:
+          name: Notify Rollbar
+          command: |
+            curl https://api.rollbar.com/api/1/deploy/ \
+              --form access_token="$<< parameters.access_token >>" \
+              --form environment="<< parameters.environment >>" \
+              --form revision=$CIRCLE_SHA1 \
+              --form local_username=$CIRCLE_USERNAME \
+              --form comment="$(git show --no-patch --format=%s)"
+
+jobs:
+  clj-kondo:
+    resource_class: large
+    executor: clojure-service
+    steps:
+      - checkout
+      - lein_deps
+      - run:
+          name: Report on new clj-kondo violations
+          command: lein clj-kondo --lint src test
+
+  cljfmt:
+    executor: clojure-service
+    steps:
+      - checkout
+      - lein_deps
+      - run: lein cljfmt check
+
+  test:
+    resource_class: large
+    docker:
+      - *clojure-service-image
+      - image: rabbitmq:3.8-alpine
+      - image: circleci/postgres:12-ram
+        name: postgres
+        environment:
+          POSTGRES_USER: circle
+          POSTGRES_DB: circle_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    steps:
+      - checkout
+      - run:
+          name: Install additional software
+          command: |
+            curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+            echo "deb http://apt.postgresql.org/pub/repos/apt/ buster-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-client-12
+      - lein_deps
+      - run_postgres_migration
+      - run:
+          name: Dump migrated schema
+          command: |
+            PG_DUMP_COMMAND="pg_dump --host=postgres" PGUSER=circle ./resources/scripts/dump-schema > /tmp/structure-after-migration.sql
+            diff --ignore-blank-lines -u resources/structure.sql /tmp/structure-after-migration.sql
+      - run:
+          name: Run Tests
+          command: lein test --reporter documentation --plugin profiling --plugin junit-xml --junit-xml-file target/test-results/results.xml
+      - store_test_results:
+          path: target/test-results
+
+  uberjar:
+    resource_class: large
+    executor: clojure-service
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - lein_deps
+      - set_version
+      - run:
+          name: lein uberjar
+          command: |
+            lein uberjar
+            mkdir -p /workspace
+            cp target/ingestion-manager-${SERVICE_VERSION}-standalone.jar /workspace/ingestion-manager.jar
+      - persist_to_workspace:
+          root: /workspace
+          paths:
+            - ingestion-manager.jar
+
+  build-scan-publish-service:
+    executor: ccc
+    environment:
+      NAME: ingestion-manager
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: all
+    working_directory: ~/repo
+    steps:
+      - setup_remote_docker:
+          version: 19.03.8
+      - checkout
+      - set_version
+      - build_scan_publish
+      - persist_to_workspace:
+          root: deploy
+          paths:
+            - docker_image.tag
+
+  deploy-migrator:
+    executor: ccc
+    environment:
+      NAME: ingestion-manager-migrator
+      DOCKER_REGISTRY: all
+      MIGRATIONS_SQL_PATH: resources/migrations
+      VALUES_FILE: deploy/migrator.yaml
+      ROLLBAR_ACCESS_TOKEN: "" # Prevent CCC from notifying Rollbar when migrator is deployed.
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - set_version
+      - setup_remote_docker:
+          version: 19.03.8
+      - run:
+          name: Build and publish the migrator image
+          command: publish
+      - run:
+          name: Deploy migrator
+          command: deploy
+
+  deploy-canary:
+    executor: ccc
+    environment:
+      NAME: ingestion-manager
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: all
+      VALUES_FILE: merged-canary.yaml
+      RELEASE_VERSION: canary1
+    working_directory: ~/repo
+    steps:
+      - setup_remote_docker:
+          version: 19.03.8
+      - checkout
+      - set_version
+      - run:
+          name: Merge Canary Values
+          command: /deploy/merge-values service.yaml canary-override.yaml > merged-canary.yaml
+          working_directory: deploy
+      - build_scan_publish
+      - run:
+          name: Deploy
+          command: deploy
+          working_directory: deploy
+      - rollbar_deploy:
+          access_token: INGESTION_MANAGER_ROLLBAR_TOKEN
+          environment: canary
+
+  deploy-service:
+    executor: ccc
+    environment:
+      NAME: ingestion-manager
+      DOCKER_REGISTRY: all
+      VALUES_FILE: service.yaml
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - set_version
+      - attach_workspace:
+          at: /workspace
+      - run: cp /workspace/docker_image.tag deploy
+      - run:
+          name: Deploy
+          command: deploy
+          working_directory: deploy
+      - rollbar_deploy:
+          access_token: INGESTION_MANAGER_ROLLBAR_TOKEN
+
+  terraform-lint:
+    executor:
+      name: terraform/default
+      tag: '1.0.11'
+    steps:
+      - checkout
+      - terraform/fmt:
+          path: ./alerts
+      - terraform/validate:
+          path: ./alerts
+
+  terraform-plan:
+    executor:
+      name: terraform/default
+      tag: '1.0.11'
+    steps:
+      - checkout
+      - terraform/plan:
+          path: ./alerts
+  terraform-apply:
+    executor:
+      name: terraform/default
+      tag: '1.0.11'
+    steps:
+      - checkout
+      - terraform/apply:
+          path: ./alerts
+
+workflows:
+  build-test-deploy:
+    jobs:
+      - clj-kondo:
+          context: org-global
+      - cljfmt:
+          context: org-global
+      - test:
+          context: org-global
+      - uberjar:
+          context: org-global
+      - build-scan-publish-service:
+          context: org-global
+          requires:
+            - uberjar
+            - test
+          filters:
+            branches:
+              only:
+                - main
+      - deploy-canary:
+          context: org-global
+          requires:
+            - uberjar
+            - test
+          filters:
+            branches:
+              only: canary
+      - deploy-migrator:
+          context: org-global
+          requires:
+            - test
+            - uberjar
+          filters:
+            branches:
+              only: main
+      - deploy-service:
+          context: org-global
+          requires:
+            - build-scan-publish-service
+            - deploy-migrator
+          filters:
+            branches:
+              only:
+                - main
+      - terraform-lint:
+          context:
+            - pipelines-terraform
+            - ingestion-manager-adapters-alerts
+      - terraform-plan:
+          context:
+            - pipelines-terraform
+            - ingestion-manager-adapters-alerts
+          requires:
+            - terraform-lint
+          filters:
+            branches:
+              ignore: main
+      - terraform-apply:
+          context:
+            - pipelines-terraform
+            - ingestion-manager-adapters-alerts
+          filters:
+            branches:
+              only: main

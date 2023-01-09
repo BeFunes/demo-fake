@@ -1,0 +1,78 @@
+---
+version: "2.1"
+
+executors:
+  generic:
+    docker:
+      - image: circleci/python:3.9
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    working_directory: ~/project
+
+commands:
+  install_deps:
+    steps:
+      - run: pip3 install -r requirements.txt
+
+jobs:
+  linter:
+    executor: generic
+    steps:
+      - checkout:
+          path: ~/project
+      - install_deps
+      - run:
+          command: make lint
+  pytest:
+    executor: generic
+    steps:
+      - checkout:
+          path: ~/project
+      - install_deps
+      - run:
+          name: running test
+          command: make test
+
+  build-and-deploy:
+    executor: ccc
+    environment:
+      NAME: secops-cci-admins-importer
+      CUSTOM_CHART: deploy/
+      DOCKER_REGISTRY: ecr
+      DOCKERFILE_PATH: Dockerfile
+    steps:
+      - setup_remote_docker
+      - checkout:
+          path: ~/project
+      - run: publish
+      - run: deploy
+  
+  render-helm-chart:
+      executor: ccc
+      environment:
+        NAME: secops-cci-admins-importer
+        CUSTOM_CHART: deploy/
+      steps:
+        - checkout
+        -  run: /deploy/dry-run       
+workflows:
+  version: 2
+  workflow:
+    jobs:
+      - linter
+      - pytest
+      - render-helm-chart:
+          context: org-global
+      - build-and-deploy:
+          context: org-global
+          requires:
+            - linter
+            - pytest
+          filters:
+            branches:
+              only:
+                - main

@@ -1,0 +1,793 @@
+version: 2.1
+
+orbs:
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+  shellcheck: circleci/shellcheck@2.0.0
+  rollbar: rollbar/deploy@1.0.1
+  docker-cache: cci-x/docker-registry-image-cache@0.2.3
+
+# The lein image needed for most things.
+lein_image: &lein_image
+  image: circleci/clojure-service:java11-0.8-dev
+  auth:
+    username: $DOCKER_HUB_USER
+    password: $DOCKER_HUB_PASSWORD
+
+# The lein image needed for the client. We leave it still using Java8
+# for now, otherwise we can't bump the WFC client in some services --
+# notably circleci/circle.
+client_lein_image: &client_lein_image
+  image: circleci/clojure-service:0.8-dev
+  auth:
+    username: $DOCKER_HUB_USER
+    password: $DOCKER_HUB_PASSWORD
+
+# The db image needed for running tests.
+db_image: &db_image
+  image: cimg/postgres:12.9
+  environment:
+    POSTGRES_USER: postgres
+    POSTGRES_DB: circle_test
+    POSTGRES_HOST_AUTH_METHOD: trust
+
+mongo_image: &mongo_image
+  image: mongo:4.2
+  name: mongodb
+  environment:
+    MONGO_INITDB_ROOT_USERNAME: testmongouser
+    MONGO_INITDB_ROOT_PASSWORD: opensesame
+    MONGO_INITDB_DATABASE: admin
+
+redis_image: &redis_image
+  image: cimg/redis:6.2
+
+# CCC Image needed for deploying and publish.
+ccc_image: &ccc_image
+  image: circleci/command-convenience:0.1
+  auth:
+    username: $DOCKER_HUB_USER
+    password: $DOCKER_HUB_PASSWORD
+
+rmq_image: &rmq_image
+  image: rabbitmq:3.8-alpine
+
+# The environment variables for connecting to the database.
+db_env: &db_env
+  POSTGRESQL__DB__URI: jdbc:postgresql://localhost:5432/circle_test?user=postgres
+  POSTGRESQL__DB_BACKGROUND_JOBS__URI: jdbc:postgresql://localhost:5432/circle_test?user=postgres
+  POSTGRESQL__READ_ONLY__URI: jdbc:postgresql://localhost:5432/circle_test?user=postgres
+  POSTGRESQL__SLOW_QUERY__MILLIS: 1000
+
+rmq_env: &rmq_env
+  MESSAGING_AMQP_URI: amqp://guest:guest@localhost:5672
+
+# The environment variables for setting up the service
+service_env: &service_env
+  DOMAIN_SERVICE__URI: "http://domain-service:3000"
+  PERMISSIONS_SERVICE__URI: "http://permissions-service:3000"
+  PROJECT__GROUP: 'workflows-conductor'
+  PROJECT__ARTIFACT: 'workflows-conductor'
+  BACKPLANE_TRACE_STRICT_ATTRIBUTE_MODE: 'true'
+
+cache_env: &cache_env
+  REDIS__CACHE__URI: "redis://redis:6379/11"
+  REDIS__CACHE__READER_URI: "redis://redis:6379/11"
+
+commands:
+  ensure_branch_up_to_date:
+    description: >-
+      Ensure branch is up to date, so we don't accidentally deploy a
+      canary that reverts important changes on the default branch.
+    parameters:
+      default_branch:
+        type: string
+        description: "The branch to ensure we're up to date with"
+        default: "main"
+    steps:
+      - run:
+          name: Ensure branch up to date
+          command: |
+            git fetch origin <<parameters.default_branch>>
+            commits=$(git log --oneline --decorate origin/<<parameters.default_branch>> --not HEAD)
+            if [[ -n "$commits" ]] ; then
+                echo "The following commits from <<parameters.default_branch>> are missing:"
+                echo "$commits"
+                echo "Refusing to deploy outdated canary."
+                exit 1
+            fi
+
+  set_version:
+    description: >
+      Set WFC_VERSION and CONTAINER_VERSION
+      If we don't set the CONTAINER_VERSION then ccc will use format ${MAJOR_VERSION}.${CIRCLE_BUILD_NUM}-$(git rev-parse --short HEAD) to create the docker tag
+      but we would like to use pipeline number & short sha instead, to keep the client and server version numbers consistent.
+    steps:
+      - run:
+          name: Compute and set a single version
+          command: |
+            set -o errexit
+            set -o nounset
+            version="1.0.<<pipeline.number>>-${CIRCLE_SHA1:0:7}"
+            echo "export WFC_VERSION=${version}" >> ${CIRCLE_SHELL_ENV}
+            echo "export CONTAINER_VERSION=${version}" >> ${CIRCLE_SHELL_ENV}  
+
+  restore-m2-and-target-cache:
+    steps:
+      - restore_cache:
+          keys:
+            - deps-v4-{{ .Branch }}-
+            - deps-v4-main-
+
+  save-m2-and-target-cache:
+    steps:
+      - save_cache:
+          key: deps-v4-{{ .Branch }}-{{ .Revision }}
+          paths:
+            - ~/.m2
+            - target
+
+  run_db_migration:
+    description: "The command to perform a db migration"
+    steps:
+      - run:
+          name: Run workflows-conductor PostgreSQL Migrations
+          command: |
+            run-migrations
+          environment:
+            DATABASE_MIGRATIONS: migrator/sql
+            DATABASE_USER: postgres
+            DATABASE_URL: "jdbc:postgresql://localhost:5432/circle_test"
+
+  test_splitting:
+    steps:
+      - run:
+          name: Test splitting
+          command: |
+            set -x
+
+            find test client/test \
+              -type f \
+              -name '*_test.clj' \
+              -exec grep '^(ns ' {} + | awk '{print $2}' | sed -e 's,)$,,' \
+            > test.namespaces
+
+            # Attempt to split by times
+            circleci tests split --split-by=timings --timings-type=classname < test.namespaces > test.namespaces.split
+            # Fail if we can't split
+            if [ "$(wc -l < test.namespaces.split | sed -e 's,[^0-9],,g')" = "0" ]; then
+              echo "Failed to split tests"
+              exit 1
+            fi
+
+  structure_is_current:
+    steps:
+      - run:
+          name: Ensure migration files are not kebab-cased
+          command: |
+            # If `test` exit code is not zero, kebab-cased migration
+            # scripts may have been added. Please use snake casing for
+            # migration scripts.
+
+            # There is one kebab-cased migration script that was created
+            # by mistake. This ensures that no more are created.
+            test $(find migrator/sql -name '*-*.sql' | wc -l) -eq 1
+      - run:
+          name: Dump migrated schema
+          command: ./scripts/dump-schema
+          environment:
+            DATABASE: circle_test
+            PGUSER: postgres
+            FILENAME: structure-after-migration.sql
+            PG_DUMP_COMMAND: pg_dump --host=localhost
+      - run:
+          name: Check that structure.sql accounts for migrations
+          command: |
+            # If the `diff` exit code is not zero, the structure.sql file is
+            # out-of date. Read https://github.com/circleci/workflows-conductor#create-migrations
+            # for instructions on creating migrations.
+            diff -u --ignore-blank-lines structure.sql structure-after-migration.sql
+
+jobs:
+  clj-kondo:
+    resource_class: large
+    docker:
+      - *lein_image
+    steps:
+      - checkout
+      - restore-m2-and-target-cache
+      - restore_cache:
+          keys:
+            - v4-clj-kondo-{{ checksum "project.clj" }}
+      - run:
+          name: Update clj-kondo's cache
+          command: |
+            lein clj-kondo --lint "$(lein classpath)" \
+                           --dependencies \
+                           --parallel \
+                           --copy-configs
+
+      - save_cache:
+          paths:
+            - .clj-kondo/.cache
+          key: v4-clj-kondo-{{ checksum "project.clj" }}
+      - save-m2-and-target-cache
+      - run:
+          name: Run clj-kondo over source and test files
+          command: |
+            # Turn off errexit as we want to continue and catch the error code ourselves
+            set +e
+
+            lein clj-kondo --lint src
+            ret_code_src=$?
+
+            echo
+
+            # For tests we allow private-call; otherwise use the same config as src
+            lein clj-kondo --config '{:linters {:private-call {:level :off}}}' --lint test
+            ret_code_test=$?
+
+            # Now fail the job if *either* of the src or test
+            # invocations returned a non-zero error code
+            [ "$ret_code_src" -eq 0 -a "$ret_code_test" -eq 0 ]
+
+  check_client_syntax:
+    docker:
+      - *client_lein_image
+    steps:
+      - checkout
+      - restore-m2-and-target-cache
+      - run:
+          name: Check for syntax errors
+          command: lein check
+          working_directory: client
+      - save-m2-and-target-cache
+
+  check_syntax:
+    docker:
+      - *lein_image
+    steps:
+      - checkout
+      - restore-m2-and-target-cache
+      - run:
+          name: Check blacklisted namespaces
+          command: lein blacklist
+      - run:
+          name: Check formatting
+          command: |
+            # If this returns a non-zero exit code:
+            #   1. run lein cljfmt fix
+            #   2. commit the changes
+            #   3. trigger a new build
+            lein cljfmt check
+      - save-m2-and-target-cache
+
+  test:
+    resource_class: xlarge
+    parallelism: 2
+    docker:
+      - *lein_image
+      - *db_image
+      - *mongo_image
+      - *redis_image
+      - *rmq_image
+    steps:
+      - checkout
+      - run:
+          name: Create /etc/hosts entries
+          command: |
+            echo 127.0.0.1 postgres redis >> /etc/hosts
+      - restore-m2-and-target-cache
+      - run_db_migration
+      - test_splitting
+      - run:
+          name: Run tests
+          command: |
+            lein test --reporter documentation \
+                      --plugin profiling \
+                      --plugin junit-xml \
+                      --junit-xml-file target/test-results/results.xml \
+                      $(shuf test.namespaces.split | xargs -I {} echo " --focus {} --only-load-ns {}")
+          environment:
+            <<: *db_env
+            <<: *service_env
+            <<: *rmq_env
+            <<: *cache_env
+      - save-m2-and-target-cache
+      - store_test_results:
+          path: target/test-results
+      - store_artifacts:
+          path: target/test-results
+          destination: raw-test-results
+
+  test-schema:
+    resource_class: small
+    docker:
+      - *lein_image
+      - *db_image
+    steps:
+      - checkout
+      - run:
+          name: Download PostgreSQL client
+          command: |
+            curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+            echo "deb http://apt.postgresql.org/pub/repos/apt/ buster-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-client-12
+      - restore-m2-and-target-cache
+      - run_db_migration
+      - structure_is_current
+
+  publish-migrator:
+    working_directory: /root/workflows-conductor
+    docker:
+      - <<: *ccc_image
+        environment:
+          NAME: workflows-conductor-migrator
+          DOCKER_REGISTRY: all
+          MIGRATIONS_SQL_PATH: sql
+    steps:
+      - checkout
+      - set_version
+      - setup_remote_docker:
+          version: 19.03.8
+      - run:
+          name: Build and publish the workflows-conductor migrator image
+          command: publish
+          working_directory: migrator
+      - run:
+          name: Rename docker_image.tag
+          command: mv docker_image.tag migrator_docker_image.tag
+          working_directory: migrator
+      - persist_to_workspace:
+          root: migrator
+          paths:
+            - migrator_docker_image.tag
+
+  deploy-migrator:
+    resource_class: small
+    working_directory: /root/workflows-conductor
+    docker:
+      - <<: *ccc_image
+        environment:
+          NAME: workflows-conductor-migrator
+          VALUES_FILE: /root/workflows-conductor/circle-helm-charts/migrator-values.yml
+          ATOMIC_DEPLOY: true
+    steps:
+      - setup_remote_docker:
+          version: 19.03.8
+      - checkout
+      - attach_workspace: { at: /root/workflows-conductor/migrator }
+      - run:
+          name: Rename docker_image.tag
+          command: mv migrator_docker_image.tag docker_image.tag
+          working_directory: migrator
+      - run:
+          name: Deploy workflows-conductor migrator
+          command: deploy
+          working_directory: migrator
+
+  uberjar:
+    docker:
+      - *lein_image
+    steps:
+      - checkout
+      - restore-m2-and-target-cache
+      - set_version
+      - run:
+          name: uberjar
+          command: lein uberjar
+      - run:
+          name: copy uberjar
+          command: mv ./target/workflows-conductor-${WFC_VERSION}-standalone.jar ./target/workflows-conductor-standalone.jar
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target/workflows-conductor-standalone.jar
+
+  publish-service:
+    working_directory: /root/workflows-conductor
+    docker:
+      - <<: *ccc_image
+        environment:
+          NAME: workflows-conductor
+          CONTAINER_ORG: circleci
+          DOCKERFILE_PATH: /root/workflows-conductor/scripts/deploy-container/Dockerfile
+          DOCKER_REGISTRY: all
+    steps:
+      - checkout
+      - set_version
+      - setup_remote_docker
+      - attach_workspace: {at: .}
+      - run:
+          name: move uberjar to Dockerfile dir
+          command: mv ./target/workflows-conductor-standalone.jar ./scripts/deploy-container/
+      - run:
+          name: Publish docker image
+          command: cd scripts/deploy-container && publish
+      - persist_to_workspace:
+          root: .
+          paths:
+            - scripts/deploy-container/docker_image.tag
+
+  deploy-event-consumer:
+    working_directory: /root/workflows-conductor
+    docker:
+      - <<: *ccc_image
+        environment:
+          NAME: workflows-conductor-helm
+          IMAGE_NAME: circleci/workflows-conductor
+          RELEASE_VERSION: event-consumer-v1
+          VALUES_FILE: /root/workflows-conductor/circle-helm-charts/service-event-consumer-values.yml
+          ATOMIC_DEPLOY: true
+    steps:
+      - checkout
+      - set_version
+      - attach_workspace: {at: .}
+      - run:
+          name: Merge Service Values
+          command: /deploy/merge-values service-base.yml event-consumer-override.yml > service-event-consumer-values.yml
+          working_directory: circle-helm-charts
+      - run:
+          name: mv docker_image.tag
+          command: mv ./scripts/deploy-container/docker_image.tag .
+      - run:
+          name: Deploy docker image
+          command: deploy
+
+  deploy-event-consumer-canary:
+    working_directory: /root/workflows-conductor
+    docker:
+      - <<: *ccc_image
+        environment:
+          NAME: workflows-conductor-helm
+          IMAGE_NAME: circleci/workflows-conductor
+          RELEASE_VERSION: event-consumer-canary1
+          VALUES_FILE: /root/workflows-conductor/circle-helm-charts/service-event-consumer-canary-values.yml
+    steps:
+      - checkout
+      - ensure_branch_up_to_date
+      - set_version
+      - attach_workspace: {at: .}
+      - run:
+          name: Merge Canary Values
+          command: /deploy/merge-values service-base.yml event-consumer-canary-override.yml > service-event-consumer-canary-values.yml
+          working_directory: circle-helm-charts
+      - run:
+          name: mv docker_image.tag
+          command: mv ./scripts/deploy-container/docker_image.tag .
+      - run:
+          name: Deploy docker image
+          command: deploy
+          environment:
+            ROLLBAR_ACCESS_TOKEN: "" # Prevent CCC from notifying Rollbar
+      - rollbar/notify_deploy:
+          environment: canary
+
+  delete-event-consumer-canary:
+    docker:
+      - <<: *ccc_image
+    steps:
+      - checkout
+      - run: .circleci/delete-canary.sh workflows-conductor-helm-event-consumer-canary1
+
+  deploy-grpc-handler:
+    working_directory: /root/workflows-conductor
+    docker:
+      - <<: *ccc_image
+        environment:
+          NAME: workflows-conductor-grpc
+          IMAGE_NAME: circleci/workflows-conductor
+          RELEASE_VERSION: v1
+          VALUES_FILE: /root/workflows-conductor/circle-helm-charts/service-grpc-handler-values.yml
+          ATOMIC_DEPLOY: true
+    steps:
+      - checkout
+      - set_version
+      - attach_workspace: {at: .}
+      - run:
+          name: Merge Service Values
+          command: /deploy/merge-values service-base.yml grpc-handler-override.yml > service-grpc-handler-values.yml
+          working_directory: circle-helm-charts
+      - run:
+          name: mv docker_image.tag
+          command: mv ./scripts/deploy-container/docker_image.tag .
+      - run:
+          name: Deploy docker image
+          command: deploy
+
+  deploy-grpc-handler-canary:
+    working_directory: /root/workflows-conductor
+    docker:
+      - <<: *ccc_image
+        environment:
+          NAME: workflows-conductor-grpc
+          IMAGE_NAME: circleci/workflows-conductor
+          RELEASE_VERSION: canary1
+          VALUES_FILE: /root/workflows-conductor/circle-helm-charts/service-grpc-handler-canary-values.yml
+    steps:
+      - checkout
+      - ensure_branch_up_to_date
+      - set_version
+      - attach_workspace: {at: .}
+      - run:
+          name: Merge Canary Values
+          command: /deploy/merge-values service-base.yml grpc-handler-canary-override.yml > service-grpc-handler-canary-values.yml
+          working_directory: circle-helm-charts
+      - run:
+          name: mv docker_image.tag
+          command: mv ./scripts/deploy-container/docker_image.tag .
+      - run:
+          name: Deploy docker image
+          command: deploy
+          environment:
+            ROLLBAR_ACCESS_TOKEN: "" # Prevent CCC from notifying Rollbar
+      - rollbar/notify_deploy:
+          environment: canary
+
+  delete-grpc-handler-canary:
+    docker:
+      - <<: *ccc_image
+    steps:
+      - checkout
+      - run: .circleci/delete-canary.sh workflows-conductor-grpc-canary1
+  
+  deploy-background-jobs:
+    working_directory: /root/workflows-conductor
+    docker:
+      - <<: *ccc_image
+        environment:
+          NAME: workflows-conductor-background-jobs
+          IMAGE_NAME: circleci/workflows-conductor
+          RELEASE_VERSION: v1
+          VALUES_FILE: /root/workflows-conductor/circle-helm-charts/service-background-jobs-values.yml
+          ATOMIC_DEPLOY: true
+    steps:
+      - checkout
+      - set_version
+      - attach_workspace: {at: .}
+      - run:
+          name: Merge Service Values
+          command: /deploy/merge-values service-base.yml background-jobs-override.yml > service-background-jobs-values.yml
+          working_directory: circle-helm-charts
+      - run:
+          name: mv docker_image.tag
+          command: mv ./scripts/deploy-container/docker_image.tag .
+      - run:
+          name: Deploy docker image
+          command: deploy
+
+  deploy-background-jobs-canary:
+    working_directory: /root/workflows-conductor
+    docker:
+      - <<: *ccc_image
+        environment:
+          NAME: workflows-conductor-background-jobs
+          IMAGE_NAME: circleci/workflows-conductor
+          RELEASE_VERSION: canary1
+          VALUES_FILE: /root/workflows-conductor/circle-helm-charts/service-background-jobs-canary-values.yml
+    steps:
+      - checkout
+      - ensure_branch_up_to_date
+      - set_version
+      - attach_workspace: {at: .}
+      - run:
+          name: Merge Canary Values
+          command: /deploy/merge-values service-base.yml background-jobs-canary-override.yml > service-background-jobs-canary-values.yml
+          working_directory: circle-helm-charts
+      - run:
+          name: mv docker_image.tag
+          command: mv ./scripts/deploy-container/docker_image.tag .
+      - run:
+          name: Deploy docker image
+          command: deploy
+          environment:
+            ROLLBAR_ACCESS_TOKEN: "" # Prevent CCC from notifying Rollbar
+      - rollbar/notify_deploy:
+          environment: canary
+
+  delete-background-jobs-canary:
+    docker:
+      - <<: *ccc_image
+    steps:
+      - checkout
+      - run: .circleci/delete-canary.sh workflows-conductor-background-jobs-canary1
+
+  deploy-client:
+    docker:
+      - <<: *client_lein_image
+    steps:
+      - checkout
+      - set_version
+      - restore-m2-and-target-cache
+      - attach_workspace: {at: .}
+      - run:
+          name: Deploy client
+          command: |
+            lein deploy circle-s3
+          working_directory: client
+
+  run-shellcheck:
+    resource_class: small
+    docker:
+      - image: 'cimg/base:stable'
+    steps:
+      - checkout
+      - shellcheck/install
+      - shellcheck/check
+
+workflows:
+  version: 2
+  build-and-deploy:
+    jobs:
+      - run-shellcheck
+      - check_client_syntax:
+          context: org-global
+      - clj-kondo:
+          context: org-global
+      - check_syntax:
+          context: org-global
+      - test:
+          context: org-global
+      - test-schema:
+          context: org-global
+      - publish-migrator:
+          context: org-global
+          requires:
+            - test-schema
+      - deploy-migrator:
+          context: org-global
+          requires:
+            - publish-migrator
+          filters:
+            branches:
+              only: main
+      - uberjar:
+          context: org-global
+      - publish-service:
+          context: org-global
+          requires:
+            - uberjar
+      - deploy-grpc-handler:
+          context: org-global
+          requires:
+            - test
+            - test-schema
+            - check_syntax
+            - clj-kondo
+            - publish-service
+          filters:
+            branches:
+              only: main
+      - launch-grpc-handler-canary:
+          type: approval
+          filters:
+            branches:
+              ignore:
+                - main
+                - /server.*/
+          requires:
+            - test
+            - test-schema
+            - check_syntax
+            - clj-kondo
+      - deploy-grpc-handler-canary:
+          context: org-global
+          filters:
+            branches:
+              ignore:
+                - main
+                - /server.*/
+          requires:
+            - launch-grpc-handler-canary
+            - publish-service
+      - terminate-grpc-handler-canary:
+          type: approval
+          requires:
+            - deploy-grpc-handler-canary
+      - delete-grpc-handler-canary:
+          context: org-global
+          requires:
+            - terminate-grpc-handler-canary
+      - deploy-event-consumer:
+          context: org-global
+          requires:
+            - test
+            - test-schema
+            - check_syntax
+            - clj-kondo
+            - publish-service
+          filters:
+            branches:
+              only: main
+      - launch-event-consumer-canary:
+          type: approval
+          filters:
+            branches:
+              ignore:
+                - main
+                - /server.*/
+          requires:
+            - test
+            - test-schema
+            - check_syntax
+            - clj-kondo
+      - deploy-event-consumer-canary:
+          context: org-global
+          filters:
+            branches:
+              ignore:
+                - main
+                - /server.*/
+          requires:
+            - publish-service
+            - launch-event-consumer-canary
+      - terminate-event-consumer-canary:
+          type: approval
+          requires:
+            - deploy-event-consumer-canary
+      - delete-event-consumer-canary:
+          context: org-global
+          requires:
+            - terminate-event-consumer-canary
+      - deploy-background-jobs:
+          context: org-global
+          requires:
+            - test
+            - test-schema
+            - check_syntax
+            - clj-kondo
+            - publish-service
+          filters:
+            branches:
+              only: main
+      - launch-background-jobs-canary:
+          type: approval
+          filters:
+            branches:
+              ignore:
+                - main
+                - /server.*/
+          requires:
+            - test
+            - test-schema
+            - check_syntax
+            - clj-kondo
+      - deploy-background-jobs-canary:
+          context: org-global
+          filters:
+            branches:
+              ignore:
+                - main
+                - /server.*/
+          requires:
+            - launch-background-jobs-canary
+            - publish-service
+      - terminate-background-jobs-canary:
+          type: approval
+          requires:
+            - deploy-background-jobs-canary
+      - delete-background-jobs-canary:
+          context: org-global
+          requires:
+            - terminate-background-jobs-canary
+      - deploy-client:
+          context: org-global
+          requires:
+            - check_client_syntax
+            - test
+          filters:
+            branches:
+              only:
+                - main
+      - scotty-orb/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          promotion_component_list: "circleci/workflows-conductor circleci/workflows-conductor-migrator"
+          requires:
+            - publish-migrator
+            - publish-service
+          filters:
+            branches:
+              only:
+                - main
+                - /^server-\d.*/

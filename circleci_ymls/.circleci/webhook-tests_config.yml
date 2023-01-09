@@ -1,0 +1,98 @@
+version: 2.1
+
+orbs:
+  slack: circleci/slack@4.4.2
+
+executors:
+  clj:
+    docker:
+      - image: cimg/clojure:1.10.1
+
+jobs:
+  test:
+    executor: clj
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - maven-v1-{{ checksum "project.clj" }}
+      - run:
+          name: Install ngrok
+          command: |
+            # I can't think of another way to programmatically install ngrok
+            wget https://bin.equinox.io/c/4VmDzA7iaHb/ngrok-stable-linux-amd64.zip
+            unzip ngrok-stable-linux-amd64.zip
+      - run:
+          name: Start ngrok
+          command: |
+            ./ngrok http https://localhost:60051 --log stdout --authtoken $NGROK_AUTH_TOKEN
+          background: true
+      - run:
+          name: Run tests
+          command: |
+            mkdir build
+            lein greenlight --junit-report build/junit.xml
+      - store_test_results:
+          path: build
+      - save_cache:
+          key: maven-v1-{{ checksum "project.clj" }}
+          paths: ["~/.m2"]
+      - when:
+          condition:
+            equal: [main, << pipeline.git.branch >>]
+          steps:
+            - slack/notify:
+                event: fail
+                custom: |
+                  {
+                    "blocks": [
+                      {
+                        "type": "header",
+                        "text": {
+                          "type": "plain_text",
+                          "text": "Webhook E2E Tests Failed. :red_circle:",
+                          "emoji": true
+                        }
+                      },
+                      {
+                        "type": "section",
+                        "fields": [
+                          {
+                            "type": "mrkdwn",
+                            "text": "*Job*: ${CIRCLE_JOB}"
+                          }
+                        ]
+                      },
+                      {
+                        "type": "section",
+                        "fields": [
+                          {
+                            "type": "mrkdwn",
+                            "text": "*Project*: $CIRCLE_PROJECT_REPONAME"
+                          },
+                          {
+                            "type": "mrkdwn",
+                            "text": "*Branch*: $CIRCLE_BRANCH"
+                          }
+                        ]
+                      },
+                      {
+                        "type": "actions",
+                        "elements": [
+                          {
+                            "type": "button",
+                            "text": {
+                              "type": "plain_text",
+                              "text": "View Job"
+                            },
+                            "url": "${CIRCLE_BUILD_URL}"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+
+workflows:
+  tests:
+    jobs:
+      - test

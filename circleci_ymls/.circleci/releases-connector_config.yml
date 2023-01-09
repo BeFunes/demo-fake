@@ -1,0 +1,318 @@
+version: 2.1
+
+orbs:
+  slack: circleci/slack@4.7.0
+
+parameters:
+  # Sent from Vamp when an automated rollback is requested.
+  rollback_version:
+    type: string
+    default: ""
+
+ccc_image: &ccc_image
+  image: circleci/command-convenience:0.1
+  auth:
+    username: $DOCKER_HUB_USER
+    password: $DOCKER_HUB_PASSWORD
+
+clojure_service_image: &clojure_service_image
+  image: circleci/clojure-service:0.7-dev
+  auth:
+    username: $DOCKER_HUB_USER
+    password: $DOCKER_HUB_PASSWORD
+  environment:
+    POSTGRESQL__DATABASE__URI: "jdbc:postgresql://localhost:5432/releases-connector?user=releases-connector"
+
+posgtres_db_image: &posgtres_db_image
+  image: cimg/postgres:13.3
+  environment:
+    POSTGRES_USER: releases-connector
+    POSTGRES_DB: releases-connector
+    POSTGRES_HOST_AUTH_METHOD: trust
+
+executors:
+  ccc:
+    docker:
+      - *ccc_image
+  lein-only:
+    docker:
+      - *clojure_service_image
+  service-with-db:
+    docker:
+      - *clojure_service_image
+      - *posgtres_db_image
+
+commands:
+  with_cache:
+    parameters:
+      steps: { type: steps }
+    steps:
+      - restore_cache:
+          keys:
+            - maven-{{ checksum ".circleci/config.yml" }}-{{ checksum "project.clj" }}
+      - steps: << parameters.steps >>
+      - save_cache:
+          key: maven-{{ checksum ".circleci/config.yml" }}-{{ checksum "project.clj" }}
+          paths: ["~/.m2"]
+  install_postgres_client:
+    steps:
+      - run:
+          name: Download PostgreSQL client
+          command: |
+            curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+            echo "deb http://apt.postgresql.org/pub/repos/apt/ buster-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-client-13
+  run_migrations:
+    steps:
+      - run:
+          name: Run database migrations
+          command: run-migrations
+          environment:
+            DATABASE_SCHEMA_TABLE: flyway_schema_history
+            DATABASE_MIGRATIONS: sql/migrations
+            DATABASE_USER: releases-connector
+            DATABASE_URL: "jdbc:postgresql://localhost:5432/releases-connector"
+  slack-notify-on-failure:
+    steps:
+      - slack/notify:
+          event: fail
+          template: basic_fail_1
+          branch_pattern: main
+jobs:
+  rollback-deployment:
+    executor: ccc
+    environment:
+      NAME: releases-connector
+      RELEASE_VERSION: v1
+    steps:
+      - checkout
+      - run: rollback << pipeline.parameters.rollback_version >>
+  clj-fmt:
+    executor: lein-only
+    steps:
+      - checkout
+      - with_cache:
+          steps:
+            - run:
+                name: Check formatting
+                command: lein cljfmt check
+            - slack-notify-on-failure
+  clj-kondo:
+    executor: lein-only
+    steps:
+      - checkout
+      - with_cache:
+          steps:
+            - run:
+                name: Check linting
+                command: lein clj-kondo
+            - slack-notify-on-failure
+  check-migrations:
+    executor: lein-only
+    steps:
+      - checkout
+      - run:
+          name: Check for out-of-order migrations
+          command: scripts/check_migrations_order.sh
+      - slack-notify-on-failure
+  check-schema:
+    executor: service-with-db
+    steps:
+      - checkout
+      - install_postgres_client
+      - run_migrations
+      - run:
+          name: Generate schema.sql
+          environment:
+            PG_DUMP_COMMAND: pg_dump -h localhost
+            PG_DATABASE: releases-connector
+            PG_USER: releases-connector
+          command: scripts/dump_schema.sh
+      - store_artifacts:
+          path: sql/schema.sql
+      - run:
+          name: Make sure schema.sql is up to date
+          command: |
+            if ! git diff --exit-code HEAD -- sql/schema.sql; then
+              echo "schema.sql is out of date!"
+              echo "Either:"
+              echo "- run scripts/dump_schema.sh, or"
+              echo "- download the schema.sql artifact"
+              exit 1;
+            fi
+      - slack-notify-on-failure
+  test:
+    executor: service-with-db
+    steps:
+      - checkout
+      - install_postgres_client
+      - run_migrations
+      - run:
+          name: Run Tests
+          command: lein kaocha --plugin cloverage --plugin kaocha.plugin/junit-xml
+      - store_test_results:
+          path: target/test-results
+      - store_artifacts:
+          path: target/coverage
+      - slack-notify-on-failure
+  uberjar:
+    executor: lein-only
+    steps:
+      - checkout
+      - with_cache:
+          steps:
+            - run:
+                name: Build Uberjar
+                command: |
+                  lein uberjar
+                  cp -v target/releases-connector-*-standalone.jar target/releases-connector-standalone.jar
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target/releases-connector-standalone.jar
+      - slack-notify-on-failure
+  twistlock-check:
+    executor: ccc
+    environment:
+      NAME: releases-connector
+      DEPLOY_CLOJURE_JARFILE: target/releases-connector-standalone.jar
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run: scan
+      - slack-notify-on-failure
+  canary:
+    executor: ccc
+    environment:
+      NAME: releases-connector
+      DOCKER_REGISTRY: all
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/releases-connector
+      DEPLOY_CLOJURE_JARFILE: target/releases-connector-standalone.jar
+      RELEASE_VERSION: v1-canary
+      VALUES_FILE: deploy/canary.yml
+      ATOMIC_DEPLOY: "true"
+      PIPELINE_ID: << pipeline.id >>
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run: /deploy/merge-values deploy/k8s-values.yml deploy/k8s-canary-overrides.yml > deploy/canary.yml
+      - run: publish
+      - run: deploy
+  deploy:
+    executor: ccc
+    environment:
+      NAME: releases-connector
+      DOCKER_REGISTRY: all
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/releases-connector
+      DEPLOY_CLOJURE_JARFILE: target/releases-connector-standalone.jar
+      VALUES_FILE: deploy/k8s-values.yml
+      ATOMIC_DEPLOY: "true"
+      PIPELINE_ID: << pipeline.id >>
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run: publish
+      - run: deploy
+      - slack-notify-on-failure
+  deploy-migrator:
+    executor: ccc
+    environment:
+      NAME: releases-connector-migrator
+      DOCKER_REGISTRY: ecr
+      CONFIGURE_ECR_REPO: "true"
+      ECR_OWNER_TEAM: Deploy
+      MIGRATIONS_SQL_PATH: sql/migrations
+      VALUES_FILE: deploy/k8s-migrator-values.yml
+    steps:
+      - checkout
+      - run:
+          name: Ensure sql/migrations directory exists
+          command: mkdir -p sql/migrations
+      - setup_remote_docker
+      - run: publish
+      - run: deploy
+      - slack-notify-on-failure
+  slack-notification-success:
+    docker:
+      - image: "cimg/base:stable"
+    steps:
+      - slack/notify:
+          event: pass
+          template: success_tagged_deploy_1
+
+workflows:
+  rollback:
+    when: << pipeline.parameters.rollback_version >>
+    jobs:
+      - rollback-deployment:
+          context: org-global
+
+  build-test-deploy:
+    when:
+      not: << pipeline.parameters.rollback_version >>
+    jobs:
+      - clj-fmt:
+          context: [org-global, deploy-and-release-slack-notifications]
+      - clj-kondo:
+          context: [org-global, deploy-and-release-slack-notifications]
+      - check-migrations:
+          context: [org-global, deploy-and-release-slack-notifications]
+      - check-schema:
+          context: [org-global, deploy-and-release-slack-notifications]
+      - test:
+          context: [org-global, deploy-and-release-slack-notifications]
+      - uberjar:
+          context: [org-global, deploy-and-release-slack-notifications]
+      - twistlock-check:
+          context: [org-global, deploy-and-release-slack-notifications]
+          requires:
+            - test
+            - uberjar
+          filters:
+            branches:
+              ignore:
+                - main
+                - canary
+      - deploy-migrator:
+          context: [org-global, deploy-and-release-slack-notifications]
+          requires:
+            - test
+            - uberjar
+            - check-schema
+          filters:
+            branches:
+              only: main
+      - canary:
+          context: [org-global, deploy-and-release-slack-notifications]
+          requires:
+            - test
+            - uberjar
+            - check-schema
+          filters:
+            branches:
+              only: canary
+      - deploy:
+          context: [org-global, deploy-and-release-slack-notifications]
+          requires:
+            - test
+            - uberjar
+            - check-schema
+            - deploy-migrator
+          filters:
+            branches:
+              only: main
+      - slack-notification-success:
+          context:
+            - deploy-and-release-slack-notifications
+          requires:
+            - deploy
+          filters:
+            branches:
+              only: main

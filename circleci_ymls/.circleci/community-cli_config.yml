@@ -1,0 +1,92 @@
+version: 2.1
+
+executors:
+  default:
+    docker:
+      - image: circleci/node:12.16.2-stretch
+    environment:
+      TZ: "Asia/Tokyo"
+
+parameters:
+  update_blog_links:
+    type: boolean
+    default: false
+
+jobs:
+  test:
+    executor: default
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+          - v1-app-{{ checksum "yarn.lock" }}
+          - v1-app-
+      - run: yarn install
+      - run:
+          name: setup cdu command
+          command: sudo npm link
+      - save_cache:
+          paths:
+            - node_modules
+          key: v1-app-{{ checksum "yarn.lock" }}
+      - run:
+          name: Run tests with JUnit as reporter
+          command: yarn run ci-test
+      - store_test_results:
+          path: reports
+      - store_artifacts:
+          path: reports
+  sync-blog_links:
+    executor: default
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+          - v1-app-{{ checksum "yarn.lock" }}
+          - v1-app-
+      - run: yarn install
+      - run:
+          name: setup cdu command
+          command: sudo npm link
+      - save_cache:
+          paths:
+            - node_modules
+          key: v1-app-{{ checksum "yarn.lock" }}
+      - run:
+          name: decode environments to files
+          command: |
+            echo $GOOGLE_CREDENTIALS | base64 --decode > credentials.json
+            echo $GOOGLE_TOKEN | base64 --decode > token.json
+            echo $AWS_CONFIG | base64 --decode > aws_config.json
+      - run: mkdir outputs
+      - run:
+          name: import tweets
+          command: cdu blogLink get > outputs/tweets.json
+      - run:
+          name: upload tweets to spreadsheet
+          command: cdu blogLink upload -i outputs/tweets.json
+      - store_artifacts:
+          path: outputs
+
+workflows:
+  test:
+    jobs:
+      - test
+  api:
+    when: << pipeline.parameters.update_blog_links >>
+    jobs:
+      - sync-blog_links:
+          filters:
+            branches:
+              only: master
+  weekly:
+    triggers:
+      - schedule:
+          cron: "0 0 * * 4" # every Thursday update value
+          filters:
+            branches:
+              only:
+                - master
+    jobs:
+      - sync-blog_links:
+          name: weekly-sync-blog_links

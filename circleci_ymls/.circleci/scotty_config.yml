@@ -1,0 +1,162 @@
+version: 2.1
+
+orbs:
+  slack: circleci/slack@4.2.1
+
+references:
+  project: &project scotty
+  dir: &dir ~/scotty
+  ccc-job: &ccc-job
+
+executors:
+  ccc:
+    working_directory: *dir
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: *project
+          DOCKER_REGISTRY: ecr
+          DOCKERFILE_PATH: "./Dockerfile"
+          CUSTOM_CHART: scotty-chart
+  python:
+    docker:
+      - image: python:3.9
+    environment:
+      POETRY_VIRTUALENVS_PATH: /virtualenvs/envs
+      POETRY_CACHE_DIR: /virtualenvs/cache
+
+commands:
+  add-slack-prereqs-alpine:
+    steps:
+      - run:
+          command: apk add curl jq
+          when: always
+
+  slack-notify-on-failure:
+    parameters:
+      install-alpine-dependencies:
+        type: boolean
+        default: false
+    steps:
+      - when:
+          condition:
+            equal: [true, << parameters.install-alpine-dependencies >>]
+          steps:
+            - add-slack-prereqs-alpine
+      - slack/notify:
+          event: fail
+          template: basic_fail_1
+          branch_pattern: main
+
+  setup-python-dependencies:
+    description: Setup the python environment for testing and linting
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - poetry-cache-{{ arch }}-{{ .Branch }}-{{ checksum "poetry.lock" }}
+            - poetry-cache-{{ arch }}-{{ .Branch }}
+            - poetry-cache
+      - restore_cache:
+          keys:
+            - pip-cache-{{ arch }}-{{ .Branch }}
+            - pip-cache
+      - run: echo "export PATH=$PATH:$HOME/.local/bin" >> $BASH_ENV
+      - run: pip install --user poetry
+      - run: poetry install
+      - save_cache:
+          key: poetry-cache-{{ arch }}-{{ .Branch }}-{{ checksum "poetry.lock" }}
+          paths: /virtualenvs
+      - save_cache:
+          key: pip-cache-{{ arch }}-{{ .Branch }}
+          paths: ~/.local
+
+  publish:
+    description: Run cci publish to build and push the docker container.
+    steps:
+      - setup_remote_docker
+      - run: publish
+      - store_artifacts:
+          path: ccc-image-scan-results
+
+  deploy:
+    description: Run cci deploy to deploy the application.
+    steps:
+      - run: deploy
+
+jobs:
+  lint:
+    executor: python
+    steps:
+      - setup-python-dependencies
+      - run: poetry run pylint scotty tests
+      - run: poetry run black --check scotty tests
+
+  test:
+    executor: python
+    steps:
+      - setup-python-dependencies
+      - run: poetry run pytest
+
+  test-coverage:
+    executor: python
+    steps:
+      - setup-python-dependencies
+      - run: poetry run coverage run -m pytest && poetry run coverage report -m
+
+  publish-and-deploy:
+    executor: ccc
+    steps:
+      - checkout
+      - publish
+      - deploy
+
+  publish-and-deploy-dry-run:
+    executor: ccc
+    environment:
+      DOCKER_REGISTRY: none
+    steps:
+      - checkout
+      - publish
+      - run: 
+          name: Run cci deploy dry-run
+          command: /deploy/dry-run
+
+workflows:
+  test-publish-deploy:
+    jobs:
+      # lint and test
+      - lint
+      - test
+      - test-coverage:
+          requires:
+            - test
+      - publish-and-deploy-dry-run:
+          context:
+            - org-global
+            - scotty-common
+          filters:
+            branches:
+              ignore:
+                - main
+          requires:
+            - test-coverage
+
+      # prod deploy
+      - publish-and-deploy:
+          context:
+            - org-global
+            - scotty-common
+          filters:
+            branches:
+              only:
+                - main
+          post-steps:
+            - slack-notify-on-failure:
+                install-alpine-dependencies: true
+          requires:
+            - test-coverage
+            - lint

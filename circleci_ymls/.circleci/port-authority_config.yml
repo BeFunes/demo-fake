@@ -1,0 +1,54 @@
+version: 2.1
+
+orbs:
+  codecov: codecov/codecov@1.1.3
+
+jobs:
+  test:
+    docker:
+      - image: circleci/clojure
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - jars-{{ checksum "project.clj" }}
+            - jars
+      - run: lein check
+      - run: lein test2junit
+      - run: lein cloverage --codecov
+      - store_test_results:
+          path: test-results
+      - store_artifacts:
+          path: test-results
+      - store_artifacts:
+          path: target/coverage
+      - save_cache:
+          key: jars-{{ checksum "project.clj" }}
+          paths:
+            - ~/.m2
+      - codecov/upload
+
+  deploy:
+    docker:
+      - image: circleci/clojure
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - jars-{{ checksum "project.clj" }}
+            - jars
+      - run: lein deploy circle-s3
+
+workflows:
+  version: 2
+  test:
+    jobs:
+      - test
+      - deploy:
+          context: org-global
+          requires:
+            - test
+          filters:
+            branches:
+              only:
+                - master

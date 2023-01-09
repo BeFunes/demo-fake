@@ -1,0 +1,312 @@
+version: 2.1
+
+orbs:
+  aws-cli: circleci/aws-cli@0.1.20
+  slack: circleci/slack@4.4.4
+
+x-data:
+  big_resource_class: &big_resource_class
+    resource_class: xlarge
+    environment:
+      GOMAXPROCS: 8
+
+workflows:
+  main:
+    jobs:
+      - lint
+      - test
+      - build
+      - helm-package-dry-run:
+          context: org-global
+          filters:
+            branches:
+              ignore: main
+      - docker-image:
+          context: org-global
+          requires:
+            - lint
+            - test
+            - build
+      - deploy:
+          filters:
+            branches:
+              only: main
+          context: org-global
+          requires:
+            - docker-image
+
+executors:
+  default:
+    docker:
+      - image: &goimage cimg/go:1.18
+    working_directory: ~/project
+    <<: *big_resource_class
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    environment:
+      NAME: output
+      DOCKERFILE_PATH: Dockerfile
+      CUSTOM_CHART: deploy/
+
+    working_directory: ~/project
+
+jobs:
+  lint:
+    executor: default
+    steps:
+      - setup
+      - run:
+          name: verify modules are tidy
+          command: |
+            go mod tidy -v
+            git diff --ignore-matching-lines='Generated on ' --exit-code
+      - run: ./do lint-report
+      - store_results
+      - notify_failing_main
+
+  test:
+    docker:
+      - image: *goimage
+        environment:
+          GOOGLE_APPLICATION_CREDENTIALS: /tmp/google_application_credentials.json
+      - image: circleci/postgres:12.4-ram
+        environment:
+          POSTGRES_USER: distributor
+          POSTGRES_PASSWORD: distributor
+          POSTGRES_DB: distributor
+      - image: minio/minio
+        environment:
+          MINIO_ROOT_USER: 'minio'
+          MINIO_ROOT_PASSWORD: 'minio123'
+          CI: 'true'
+        command: [
+          'server',
+          '/data/1', '/data/2','/data/3', '/data/4',
+          '--address', ':9123',
+        ]
+    <<: *big_resource_class
+    steps:
+      - setup
+      - run:
+          name: Prepare Google Application Credentials
+          command: echo $GCP_EXECUTION_DEV_KEY | base64 --decode > $GOOGLE_APPLICATION_CREDENTIALS
+      - run: ./do create-stub-test-files
+      - run:
+          name: run tests
+          command: ./do test ./... -timeout=2m
+      - store_results
+      - notify_failing_main
+
+  build:
+    executor: default
+    steps:
+      - setup
+      - run: ./do generate
+      - run: ./do build
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target
+      - notify_failing_main
+
+  docker-image:
+    executor: ccc
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - create_and_scan_docker_image
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.tag
+      - notify_failing_main
+
+  deploy:
+    executor: ccc
+    environment:
+      AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run: apk --no-cache add openssl jq
+      - aws-cli/setup:
+          profile-name: cci
+          aws-access-key-id: BINARY_S3_AWS_ACCESS_KEY_ID
+          aws-secret-access-key: BINARY_S3_AWS_SECRET_ACCESS_KEY
+      - run: apk --no-cache add openssl jq
+      - run: ./do publish-s3-binaries
+      - run: ./do release-s3-binaries
+      - run: deploy
+      - notify_failing_main
+      - notify_slack
+      - notify_honeycomb
+
+  helm-package-dry-run:
+    executor: ccc
+    steps:
+      - checkout
+      - run: IGNORE_VERSION=1 /deploy/dry-run
+      - run:
+          name: Install GitHub CLI
+          command: |
+            curl -fsSL 'https://github.com/cli/cli/releases/download/v1.11.0/gh_1.11.0_linux_amd64.tar.gz' | tar -C /usr/local --strip-components=1 -xz
+      - run:
+          name: Comment on pull request
+          command: |
+            if [ ! -s ".helm.diff" ]; then
+              echo "No diff found"
+              exit 0
+            fi
+            if [ ! -n "$CI_PULL_REQUEST" ]; then
+              echo "No PR Found"
+              exit 0
+            fi
+            echo "## Helm diff: <sup>[CI link]( $CIRCLE_BUILD_URL )</sup>" > comment.txt
+            echo '<details><summary>Details (click me)</summary>' >> comment.txt
+            echo '' >> comment.txt
+            echo '```diff' >> comment.txt
+            cat '.helm.diff' >> comment.txt
+            echo '```' >> comment.txt
+            echo '</details>' >> comment.txt
+            gh pr comment "${CI_PULL_REQUEST}" --body-file comment.txt
+
+commands:
+
+  setup:
+    steps:
+      - checkout
+      - run: ./do install-devtools
+
+  remote_docker:
+    steps:
+      - setup_remote_docker:
+          version: "18.09.3"
+      - run: docker version
+
+  store_results:
+    steps:
+      - run:
+          name: Strip ANSI codes from xunit output
+          when: always
+          command: |
+            # The test output produces ANSI codes, which the XML writer converts into annoying
+            # \0xfffd characters - we'll strip these out to make the XML a bit more readable
+            sed -i 's/�\[[0-9;]*[a-zA-Z]//g' test-reports/*.xml || true
+      - store_artifacts:
+          path: test-reports
+      - store_test_results:
+          path: test-reports
+
+  create_and_scan_docker_image:
+    steps:
+      - remote_docker
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: create and scan docker image
+          command: |
+            set -x
+            if [[ "$CIRCLE_BRANCH" = "main" || "$CIRCLE_BRANCH" = "canary" ]]; then
+              export DOCKER_REGISTRY=all
+            else
+              # this is how we tell CCC not to actually publish
+              export DOCKER_REGISTRY=none
+            fi
+
+            publish
+
+  # Cribbed from the slack orb, then modified to suit
+  notify_slack:
+    steps:
+      - run:
+          name: Slack Notification
+          command: |
+            # Provide error if no webhook is set and error. Otherwise continue
+            if [ -z "${SLACK_WEBHOOK}" ]; then
+              echo '$SLACK_WEBHOOK not set'
+              exit 1
+            fi
+
+            version=$(<docker_image.tag)
+            message=$(git show HEAD --no-patch --format=%s | jq -R '.' | sed -e 's/^"//' -e 's/"$//')
+
+            cat \<< EOF | tee /tmp/slack-webhook-body
+            {
+            	"blocks": [
+            		{
+            			"type": "header",
+            			"text": {
+            				"type": "plain_text",
+            				"text": "Helm deployment triggered",
+            				"emoji": true
+            			}
+            		},
+            		{
+            			"type": "section",
+            			"fields": [
+            				{
+            					"type": "mrkdwn",
+            					"text": "*Project:*\n$CIRCLE_PROJECT_REPONAME"
+            				},
+            				{
+            					"type": "mrkdwn",
+            					"text": "*Author:*\n$CIRCLE_USERNAME"
+            				}
+            			]
+            		},
+            		{
+            			"type": "section",
+            			"fields": [
+            				{
+            					"type": "mrkdwn",
+            					"text": "*Version:*\n$version"
+            				},
+            				{
+            					"type": "mrkdwn",
+            					"text": "*CircleCI Build:*\n<$CIRCLE_BUILD_URL|$CIRCLE_BUILD_NUM>"
+            				}
+            			]
+            		},
+            		{
+            			"type": "section",
+            			"text": {
+            				"type": "mrkdwn",
+            				"text": "*Commit Message:*\n$message"
+            			}
+            		}
+            	]
+            }
+            EOF
+
+            curl --fail -H 'Content-type: application/json' \
+                --data @/tmp/slack-webhook-body "${SLACK_WEBHOOK}"
+
+  notify_honeycomb:
+    steps:
+      - run:
+          name: Notify Honeycomb
+          command: |
+            cat \<< EOF | tee /tmp/honeycomb-marker
+            {
+              "message": "Deploying output $(<docker_image.tag)",
+              "type":"deploy"
+            }
+            EOF
+            curl https://api.honeycomb.io/1/markers/execution \
+              -H "X-Honeycomb-Team: $HONEYCOMB_WRITEKEY" \
+              -d @/tmp/honeycomb-marker
+
+  notify_failing_main:
+    steps:
+      - slack/notify:
+          channel: tasks-alerts
+          branch_pattern: main
+          event: fail
+          template: basic_fail_1

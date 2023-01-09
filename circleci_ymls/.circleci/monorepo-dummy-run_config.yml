@@ -1,0 +1,49 @@
+version: 2.1
+
+# The lein image needed for most things.
+lein_image: &lein_image
+  image: circleci/ruby:2.4.1
+  auth:
+    username: $DOCKER_HUB_USER
+    password: $DOCKER_HUB_PASSWORD
+jobs:
+  build:
+    docker:
+      - *lein_image
+    steps:
+      - run: echo "this is the build job"
+  check_syntax:
+    docker:
+      - *lein_image
+    steps:
+      - run: echo "this is the check_syntax job"
+  test:
+    docker:
+      - *lein_image
+    steps:
+      - run: echo "this is the test job"
+  coverage:
+    docker:
+      - image: circleci/ruby:2.4.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    steps:
+      - run: exit 0
+  job6:
+    docker:
+      - *lein_image
+    steps:
+      - run: echo "this is the 6job job"
+
+
+workflows:
+  version: 2
+            
+  workflow-with-fan-in:
+    jobs:
+      - check_syntax
+      - job6:
+          requires:
+            - check_syntax
+

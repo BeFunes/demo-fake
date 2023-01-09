@@ -1,0 +1,111 @@
+version: 2.1
+
+references:
+  project: &project   predictions
+  dir:     &dir     ~/predictions
+  ccc-job: &ccc-job
+
+
+executors:
+  ccc:
+    working_directory: *dir
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: *project
+          DOCKER_REGISTRY: ecr
+          NAMESPACE: data
+          TWISTLOCK_ENFORCE: false
+          DOCKERFILE_PATH: "./Dockerfile"
+          DEPLOY_CONTAINER_NAME: "183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/predictions"
+  python:
+    docker:
+      - image: python:3.8
+    environment:
+      POETRY_VIRTUALENVS_PATH: /virtualenvs/envs
+      POETRY_CACHE_DIR: /virtualenvs/cache
+
+commands:
+  setup-python-dependencies:
+    description: Setup the python environment for testing and linting
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - poetry-cache-v2-{{ arch }}-{{ .Branch }}-{{ checksum "poetry.lock" }}
+            - poetry-cache-v2-{{ arch }}-{{ .Branch }}
+            - poetry-cache-v2
+      - restore_cache:
+          keys:
+            - pip-cache-v2-{{ arch }}-{{ .Branch }}
+            - pip-cache-v2
+      - run: echo "export PATH=$PATH:$HOME/.local/bin" >> $BASH_ENV
+      - run: pip install --user poetry
+      - run: apt update -y && apt install build-essential -y
+      - run:
+          name: install python dependecies
+          command: poetry install --no-interaction --no-ansi
+          no_output_timeout: 45m
+      - save_cache:
+          key: poetry-cache-v2-{{ arch }}-{{ .Branch }}-{{ checksum "poetry.lock" }}
+          paths: /virtualenvs
+      - save_cache:
+          key: pip-cache-v2-{{ arch }}-{{ .Branch }}
+          paths: ~/.local
+  publish:
+    description: Run cci publish to building and push the docker container.
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: publish
+      - store_artifacts:
+          path: ccc-image-scan-results
+
+jobs:
+  lint:
+    executor: python
+    steps:
+      - setup-python-dependencies
+      - run: poetry run pylint predictions
+      - run: poetry run mypy predictions
+  test:
+    executor: python
+    steps:
+      - setup-python-dependencies
+      - run: poetry run pytest
+  publish-branch:
+    executor: ccc
+    steps:
+      - publish
+  publish-latest:
+    executor: ccc
+    steps:
+      - publish
+    environment:
+      CONTAINER_VERSION: latest
+
+workflows:
+  commit:
+    jobs:
+      # lint and test
+      - lint
+      - test
+      # staging and dev deploy
+      - publish-branch:
+          context: org-global
+          requires:
+            - lint
+            - test
+      # prod deploy
+      - publish-latest:
+          context: org-global
+          filters:
+            branches:
+              only:
+                - master
+          requires:
+            - lint
+            - test

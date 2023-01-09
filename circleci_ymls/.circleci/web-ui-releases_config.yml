@@ -1,0 +1,224 @@
+version: 2.1
+
+orbs:
+  web-ui-orb: sandbox/web-ui-orb@5.3.1
+  slack: circleci/slack@4.10.1
+
+parameters:
+  # Sent from Vamp when an automated rollback is requested.
+  rollback_version:
+    type: string
+    default: ""
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+references:
+  version_js: &version_js 1
+  version_cypress: &version_cypress 1
+  version_nextjs: &version_nextjs 1
+  image_name: &image_name web-ui-releases
+  hostname: &hostname ui.circleci.com
+
+commands:
+  save-nextjs-build-cache:
+    parameters:
+      cache_version:
+        description:
+          The version number of the cached build directory to retrieve and save
+          for Next.js.
+        type: integer
+        default: 1
+    steps:
+      - save_cache:
+          key:
+            v<< parameters.cache_version>>-nextjs-build-cache-<<pipeline.git.branch >>-{{ checksum
+            "yarn.lock" }}
+          paths:
+            - .next/cache
+  restore-nextjs-build-cache:
+    parameters:
+      cache_version:
+        description:
+          The version number of the cached build directory to retrieve and save
+          for Next.js.
+        type: integer
+        default: 1
+    steps:
+      - restore_cache:
+          key:
+            v<< parameters.cache_version>>-nextjs-build-cache-<<pipeline.git.branch >>-{{ checksum
+            "yarn.lock" }}
+
+jobs:
+  rollback-deployment:
+    executor: ccc
+    environment:
+      NAME: *image_name
+      RELEASE_VERSION: v1
+    steps:
+      - checkout
+      - run: rollback << pipeline.parameters.rollback_version >>
+  build-static-assets:
+    executor: web-ui-orb/node
+    steps:
+      - checkout
+      - web-ui-orb/restore-js-deps:
+          cache_version: *version_js
+      - restore-nextjs-build-cache:
+          cache_version: *version_nextjs
+      - run:
+          name: Build static assets
+          command: BUILD_ID="$CIRCLE_SHA1" yarn build
+      - save-nextjs-build-cache:
+          cache_version: *version_nextjs
+      - persist_to_workspace:
+          paths:
+            - src/.next
+            - .next
+          root: .
+  check-graphql-generated-types:
+    executor: web-ui-orb/node
+    steps:
+      - checkout
+      - web-ui-orb/restore-js-deps:
+          cache_version: *version_js
+      - run:
+          name: Generate TypeScript definitions for GraphQL schema
+          command: yarn generate:graphql-types
+      - run:
+          name: Make sure type definitions are up-to-date
+          command: |
+            CHANGED="$(git diff HEAD -- src/graphql/types.ts)"
+            if [ -n "$CHANGED" ]; then
+              echo "src/graphql/types.ts is out of date!"
+              echo "run yarn generate:graphql-types to re-generate"
+              exit 1;
+            fi
+  slack-notification-success:
+    docker:
+      - image: 'cimg/base:stable'
+    steps:
+      - slack/notify:
+          event: pass
+          template: success_tagged_deploy_1
+
+workflows:
+  rollback:
+    when: << pipeline.parameters.rollback_version >>
+    jobs:
+      - rollback-deployment:
+          context: org-global
+
+  build-test-and-deploy:
+    when:
+      not: << pipeline.parameters.rollback_version >>
+    jobs:
+      - web-ui-orb/dependencies:
+          name: dependencies
+          context: [web-ui-npm, deploy-and-release-slack-notifications]
+          cache_version_js_dependencies: *version_js
+          cache_version_cypress_dependencies: *version_cypress
+      - check-graphql-generated-types:
+          name: check-graphql-generated-types
+          requires:
+            - dependencies
+      - web-ui-orb/storybook-build:
+          name: storybook-build
+          cache_version_js_dependencies: *version_js
+          context: deploy-and-release-slack-notifications
+          build_storybook_command:
+            NODE_ENV=test ASSET_PREFIX='' yarn build-storybook
+          requires:
+            - dependencies
+      - web-ui-orb/test:
+          name: unit-tests
+          cache_version_js_dependencies: *version_js
+          codecov: false
+          context: deploy-and-release-slack-notifications
+          requires:
+            - dependencies
+      - web-ui-orb/chromatic-snapshot:
+          name: chromatic-snapshot
+          cache_version_js_dependencies: *version_js
+          context: deploy-and-release-slack-notifications
+          requires:
+            - storybook-build
+      - web-ui-orb/test-production-docker-image:
+          name: test-production-docker-image
+          build_static_assets: false
+          parallelism: 2
+          image_name: *image_name
+          cache_version_js_dependencies: *version_js
+          hostname: *hostname
+          requires:
+            - build-static-assets
+          context: [web-ui-npm, deploy-and-release-slack-notifications]
+      - web-ui-orb/deploy-static:
+          name: deploy-static-assets
+          bucket_name: circleci-web-ui-releases-assets/releases
+          cdn_url: https://assets-releases.circleci.com/releases
+          context: [web-ui-releases-assets, web-ui-npm, web-ui-datadog, deploy-and-release-slack-notifications]
+          build_dir: ./.next
+          filters:
+            branches:
+              only: main
+          requires:
+            - build-static-assets
+      - build-static-assets:
+          name: build-static-assets
+          requires:
+            - dependencies
+      - web-ui-orb/build-and-publish-container:
+          name: scan-production-docker-image
+          image_name: *image_name
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          scan_only: true
+          context: [web-ui-npm, org-global]
+          filters:
+            branches:
+              ignore: main
+          requires:
+            - build-static-assets
+      - web-ui-orb/build-and-publish-container:
+          name: scan-and-publish-production-docker-image
+          image_name: *image_name
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          configure_ecr_repo: true
+          ecr_owner_team: 'Deploy'
+          context: [web-ui-npm, org-global, deploy-and-release-slack-notifications]
+          filters:
+            branches:
+              only: main
+          requires:
+            - deploy-static-assets
+      - web-ui-orb/deploy-container:
+          name: deploy-container
+          image_name: *image_name
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [web-ui-npm, org-global, deploy-and-release-slack-notifications]
+          pipeline_id: << pipeline.id >>
+          filters:
+            branches:
+              only: main
+          requires:
+            - unit-tests
+            - test-production-docker-image
+            - deploy-static-assets
+            - scan-and-publish-production-docker-image
+      - slack-notification-success:
+         context:
+           - deploy-and-release-slack-notifications
+         requires:
+           - deploy-container
+         filters:
+            branches:
+              only: main

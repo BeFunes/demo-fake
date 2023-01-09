@@ -1,0 +1,987 @@
+version: "2.1"
+
+orbs:
+  aws-cli: circleci/aws-cli@0.1.13
+  codecov: codecov/codecov@3.1.1
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+  slack: circleci/slack@2.6.0
+
+parameters:
+  # Sent from Vamp when an automated rollback is requested.
+  rollback_version:
+    type: string
+    default: ""
+
+references:
+  ccc_image_name: &ccc_image_name circleci/command-convenience:0.1
+
+  uberjar: &uberjar target/uberjar/insights-service-standalone.jar
+
+  test_db_image: &test_db_image
+    image: postgres:11.5-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: insightsservice
+
+  clojure_image: &clojure_image
+    image: circleci/clojure-service:java11-0.8-dev
+    auth:
+      username: $DOCKER_HUB_USER
+      password: $DOCKER_HUB_PASSWORD
+
+  clojure_image_java_8: &clojure_image_java_8
+    image: circleci/clojure-service:0.8-dev
+    auth:
+      username: $DOCKER_HUB_USER
+      password: $DOCKER_HUB_PASSWORD
+
+  rabbit_mq_image: &rabbit_mq_image
+    image: rabbitmq:3.7.11-alpine
+    environment:
+      RABBITMQ_NODE_PORT: 5673
+      RABBITMQ_NODENAME: rabbit2
+
+  redis_image: &redis_image
+    image: redis:5.0.6-alpine
+    command: ["--port", "6381"]
+
+  minio_image: &minio_image
+    image: minio/minio:RELEASE.2021-06-07T21-40-51Z
+    command: ["server", "/data"]
+    environment:
+      MINIO_ACCESS_KEY: "minio-access-key"
+      MINIO_SECRET_KEY: "minio-secret-key"
+
+commands:
+  save-coverage-directory:
+    steps:
+      - run:
+          name: Update $COVERAGE_DIRECTORY and $COVERAGE_FILE
+          command: |
+            echo 'export COVERAGE_DIRECTORY=target/$CIRCLE_NODE_INDEX/coverage' >> $BASH_ENV
+            echo 'export COVERAGE_FILE=$COVERAGE_DIRECTORY/codecov.json' >> $BASH_ENV
+            echo 'Coverage will be saved to $COVERAGE_FILE'
+            source $BASH_ENV
+
+  slack-notify-on-failure:
+    steps:
+      - slack/status:
+          fail_only: true
+          only_for_branch: "main"
+
+  save_deps:
+    steps:
+      - save_cache:
+          key: deps-v1-{{ checksum "project.clj" }}
+          paths:
+            - ~/.m2
+
+  restore_deps:
+    steps:
+      - restore_cache:
+          keys:
+            - deps-v1-{{ checksum "project.clj" }}
+            - deps-v1-
+
+  persist_target:
+    steps:
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target
+
+  attach_target:
+    steps:
+      - attach_workspace:
+          at: .
+
+  check-formatting:
+    steps:
+      - run:
+          name: Check code formatting
+          command: lein check
+      - run:
+          name: cljfmt insights
+          command: circleci tests glob 'src/**/*.clj' | circleci tests split | xargs lein cljfmt check
+
+  static-analysis:
+    steps:
+      - run:
+          name: Analyze service
+          command: lein clj-kondo --lint src:test
+      - run:
+          name: Analyze client
+          command: lein clj-kondo --lint client/src:client/test
+
+  create-bucket:
+    steps:
+      - run:
+          name: Create Bucket
+          command: |
+            sha=$(curl https://dl.min.io/client/mc/release/linux-amd64/mc.sha256sum | awk '{print $1}')
+            curl -sSL https://dl.minio.io/client/mc/release/linux-amd64/mc -o ${GOPATH}/bin/mc
+            if ! echo "$sha ${GOPATH}/bin/mc" | sha256sum -c -; then
+                 echo "Checksum failed" >&2
+                 exit 1
+            fi
+            chmod +x ${GOPATH}/bin/mc
+            mc config host add myminio http://localhost:9000 minio-access-key minio-secret-key
+            mc mb myminio/test-bucket
+            exit 0
+
+  test:
+    steps:
+      - create-bucket
+      - run:
+          name: Run automated tests
+          command: |
+            set -o errexit
+            set -o nounset
+            set -o pipefail
+            set -o xtrace
+
+            #Find all tests
+            find test client/test dev-test -type f -name "*_test.clj" -exec grep '^(ns ' {} + | awk '{print $2}' | sed -e 's,)$,,' > test.namespaces
+
+            # Attempt to split by times
+            circleci tests split --split-by=timings --timings-type=classname < test.namespaces > test.namespaces.split
+
+            # Split by name if we can't
+            if [ "$(wc -l < test.namespaces.split | sed -e 's,[^0-9],,g')" = "0" ]; then
+              circleci tests split < test.namespaces > test.namespaces.split
+
+              # Fail if we can't split
+              if [ "$(wc -l < test.namespaces.split | sed -e 's,[^0-9],,g')" = "0" ]; then
+                echo "Failed to split tests"
+                exit 1
+              fi
+            fi
+             # Actually run the tests
+             lein kaocha $(cat test.namespaces.split | xargs -I {} echo " --focus {}") --plugin cloverage --cov-summary --codecov --no-cov-html --cov-output $COVERAGE_DIRECTORY
+
+  download-psql-client:
+    steps:
+      - run:
+          name: Download PostgreSQL client
+          command: |
+            apt-get update
+            apt-get install -y postgresql-11
+
+  dump-schema:
+    steps:
+      - run:
+          name: Dump migrated schema
+          command: |
+            env FILENAME="schema-after.sql" \
+              PG_DUMP_COMMAND="pg_dump --host=localhost" \
+              ./scripts/dump-schema
+
+  diff-schema:
+    steps:
+      - run:
+          name: Check that schema.sql is up-to-date
+          command: |
+            # If the `diff` exit code is non-zero, the schema.sql file is
+            # out-of-date. Execute `./scripts/dump-schema` and check in the
+            # changes to schema.sql.
+            diff schema.sql schema-after.sql
+
+executors:
+  ccc:
+    docker:
+      - image: *ccc_image_name
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: insights-service
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/insights-service
+  lein:
+    docker:
+      - *clojure_image
+  lein_java_8:
+    docker:
+      - *clojure_image_java_8
+  integration:
+    docker:
+      - *clojure_image
+      - *rabbit_mq_image
+      - *redis_image
+      - *test_db_image
+      - *minio_image
+    environment:
+      - POSTGRESQL__INSIGHTSSERVICE__URI: jdbc:postgresql://localhost:5432/insightsservice?user=postgres
+      - RABBITMQ__URI: amqp://localhost:5672
+      - RABBITMQ__K8S_URI: amqp://localhost:5673
+      - FLYWAY_DB_URL: jdbc:postgresql://localhost:5432/insightsservice
+  node:
+    docker:
+      - image: cimg/node:10
+  python:
+    docker:
+      - image: cimg/python:3.7.3
+
+jobs:
+  build-cache:
+    executor: lein
+    steps:
+      - checkout
+      - restore_deps
+      - run: lein javac
+      - save_deps
+      - persist_target
+
+  lint:
+    executor: lein
+    parallelism: 4
+    resource_class: large
+    steps:
+      - checkout
+      - restore_deps
+      - attach_target
+      - check-formatting
+      - static-analysis
+
+  test:
+    executor: integration
+    parallelism: 10
+    steps:
+      - checkout
+      - restore_deps
+      - attach_target
+      - run:
+          name: Run db migrations
+          command: lein flyway migrate
+      - save-coverage-directory
+      - test
+      - codecov/upload:
+          file: "$(COVERAGE_FILE)"
+      - store_test_results:
+          path: test-results
+
+  check-schema:
+    executor: integration
+    steps:
+      - checkout
+      - run:
+          name: Run db migrations
+          command: lein flyway migrate
+      - download-psql-client
+      - dump-schema
+      - diff-schema
+
+  test-container-build:
+    executor: ccc
+    environment:
+      DOCKER_REGISTRY: none
+      DEPLOY_CLOJURE_JARFILE: *uberjar
+      DEPLOY_CLOJURE_JARFILE_JAVA_VERSION: 11
+    working_directory: /root/insights-service
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /root/insights-service
+      - setup_remote_docker
+      - run: publish
+      - slack-notify-on-failure
+
+  build-uberjar:
+    working_directory: ~/project
+    executor: lein
+    steps:
+      - checkout: { path: ~/project }
+      - run:
+          name: Build Uberjar
+          command: |
+            lein uberjar
+            cp -v target/uberjar/insights-service-*-standalone.jar target/uberjar/insights-service-standalone.jar
+      - persist_to_workspace:
+          root: .
+          paths:
+            - *uberjar
+
+  publish-service:
+    executor: ccc
+    environment:
+      DEPLOY_CLOJURE_JARFILE: *uberjar
+      DEPLOY_CLOJURE_JARFILE_JAVA_VERSION: 11
+      DOCKER_REGISTRY: all
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - attach_workspace: { at: ~/project }
+      - run: publish
+      - run: mv docker_image.tag service_docker_image.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - service_docker_image.tag
+      - slack-notify-on-failure
+
+  deploy-service:
+    executor: ccc
+    environment:
+      CUSTOM_CHART: deployments/deploy
+      PIPELINE_ID: << pipeline.id >>
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - attach_workspace: { at: ~/project }
+      - run: mv service_docker_image.tag docker_image.tag
+      - run: deploy
+      - slack-notify-on-failure
+
+  publish-workflow-and-job-execution-processor:
+    executor: ccc
+    environment:
+      DEPLOY_CLOJURE_JARFILE: *uberjar
+      DEPLOY_CLOJURE_JARFILE_JAVA_VERSION: 11
+      DOCKER_REGISTRY: all
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - attach_workspace: { at: ~/project }
+      - run: publish
+      - run: mv docker_image.tag workflow-and-job-execution-processor_docker_image.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - workflow-and-job-execution-processor_docker_image.tag
+      - slack-notify-on-failure
+
+  deploy-workflow-and-job-execution-processor:
+    executor: ccc
+    environment:
+      DEPLOY_CLOJURE_JARFILE: *uberjar
+      DOCKER_REGISTRY: all
+      RELEASE_VERSION: wfjexec-processor
+      CUSTOM_CHART: deployments/workflow-and-job-execution-processor/
+      PIPELINE_ID: << pipeline.id >>
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - attach_workspace: { at: ~/project }
+      - run: mv workflow-and-job-execution-processor_docker_image.tag docker_image.tag
+      - run: deploy
+      - slack-notify-on-failure
+
+  deploy-workflow-and-job-execution-processor-canary:
+    executor: ccc
+    environment:
+      DEPLOY_CLOJURE_JARFILE: *uberjar
+      DEPLOY_CLOJURE_JARFILE_JAVA_VERSION: 11
+      DOCKER_REGISTRY: all
+      RELEASE_VERSION: wfjexec-processor-canary
+      CUSTOM_CHART: deployments/workflow-and-job-execution-processor/
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - attach_workspace: { at: ~/project }
+      - run:
+          name: Generate canary values file
+          command: |
+            mv deployments/workflow-and-job-execution-processor/values.yaml deployments/workflow-and-job-execution-processor/production.yaml
+            /deploy/merge-values deployments/workflow-and-job-execution-processor/production.yaml deployments/workflow-and-job-execution-processor/canary.yaml > deployments/workflow-and-job-execution-processor/values.yaml
+      - run: publish
+      - run: deploy
+
+  publish-etl-processor:
+    executor: ccc
+    environment:
+      DEPLOY_CLOJURE_JARFILE: *uberjar
+      DEPLOY_CLOJURE_JARFILE_JAVA_VERSION: 11
+      DOCKER_REGISTRY: all
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - attach_workspace: { at: ~/project }
+      - run: publish
+      - run: mv docker_image.tag etl_processor_docker_image.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - etl_processor_docker_image.tag
+      - slack-notify-on-failure
+
+  deploy-etl-processor:
+    executor: ccc
+    environment:
+      DEPLOY_CLOJURE_JARFILE: *uberjar
+      DOCKER_REGISTRY: all
+      RELEASE_VERSION: etl
+      CUSTOM_CHART: deployments/etl-processor/
+      PIPELINE_ID: << pipeline.id >>
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - attach_workspace: { at: ~/project }
+      - run: mv etl_processor_docker_image.tag docker_image.tag
+      - run: deploy
+      - slack-notify-on-failure
+
+  deploy-etl-processor-canary:
+    executor: ccc
+    environment:
+      DEPLOY_CLOJURE_JARFILE: *uberjar
+      DEPLOY_CLOJURE_JARFILE_JAVA_VERSION: 11
+      DOCKER_REGISTRY: all
+      RELEASE_VERSION: etl-canary
+      CUSTOM_CHART: deployments/etl-processor/
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - attach_workspace: { at: ~/project }
+      - run:
+          name: Generate ETL processor workload values file
+          command: |
+            mv deployments/etl-processor/values.yaml deployments/etl-processor/production.yaml
+            /deploy/merge-values deployments/etl-processor/production.yaml deployments/etl-processor/canary.yaml > deployments/etl-processor/values.yaml
+      - run: publish
+      - run: deploy
+
+  deploy-workflow-aggregate-etl-canary:
+    executor: ccc
+    environment:
+      DEPLOY_CLOJURE_JARFILE: *uberjar
+      DEPLOY_CLOJURE_JARFILE_JAVA_VERSION: 11
+      DOCKER_REGISTRY: all
+      RELEASE_VERSION: wkf-agg-etl-canary
+      CUSTOM_CHART: deployments/workflow-aggregate/
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - attach_workspace: { at: ~/project }
+      - run:
+          name: Generate canary values file
+          command: |
+            mv deployments/workflow-aggregate/values.yaml deployments/workflow-aggregate/production.yaml
+            /deploy/merge-values deployments/workflow-aggregate/production.yaml deployments/workflow-aggregate/canary.yaml > deployments/workflow-aggregate/values.yaml
+      - run: publish
+      - run: deploy
+
+  deploy-workflow-aggregate-all-branches-etl-canary:
+    executor: ccc
+    environment:
+      DEPLOY_CLOJURE_JARFILE: *uberjar
+      DEPLOY_CLOJURE_JARFILE_JAVA_VERSION: 11
+      DOCKER_REGISTRY: all
+      RELEASE_VERSION: wkf-agg-all-brch-canary
+      CUSTOM_CHART: deployments/workflow-aggregate-all-branches/
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - attach_workspace: { at: ~/project }
+      - run:
+          name: Generate canary values file
+          command: |
+            mv deployments/workflow-aggregate-all-branches/values.yaml deployments/workflow-aggregate-all-branches/production.yaml
+            /deploy/merge-values deployments/workflow-aggregate-all-branches/production.yaml deployments/workflow-aggregate-all-branches/canary.yaml > deployments/workflow-aggregate-all-branches/values.yaml
+      - run: publish
+      - run: deploy
+
+  deploy-canary:
+    executor: ccc
+    environment:
+      DEPLOY_CLOJURE_JARFILE: *uberjar
+      DEPLOY_CLOJURE_JARFILE_JAVA_VERSION: 11
+      DOCKER_REGISTRY: all
+      RELEASE_VERSION: canary
+      CUSTOM_CHART: deployments/deploy/
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - attach_workspace: { at: ~/project }
+      - run:
+          name: Generate canary values file
+          command: |
+            mv deployments/deploy/values.yaml deployments/deploy/production.yaml
+            /deploy/merge-values deployments/deploy/production.yaml deployments/deploy/canary.yaml > deployments/deploy/values.yaml
+      - run: publish
+      - run: deploy
+
+  publish-raven:
+    executor: ccc
+    environment:
+      DEPLOY_CLOJURE_JARFILE: *uberjar
+      DEPLOY_CLOJURE_JARFILE_JAVA_VERSION: 11
+      DOCKER_REGISTRY: all
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - attach_workspace: { at: ~/project }
+      - run: publish
+      - run: mv docker_image.tag raven_docker_image.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - raven_docker_image.tag
+
+  deploy-raven:
+    executor: ccc
+    environment:
+      RELEASE_VERSION: raven
+      CUSTOM_CHART: deployments/deploy/
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - attach_workspace: { at: ~/project }
+      - run:
+          name: Generate raven values file
+          command: |
+            mv deployments/deploy/values.yaml deployments/deploy/production.yaml
+            /deploy/merge-values deployments/deploy/production.yaml deployments/deploy/raven.yaml > deployments/deploy/values.yaml
+      - run: mv raven_docker_image.tag docker_image.tag
+      - run: deploy
+
+  publish-workflow-aggregate:
+    executor: ccc
+    environment:
+      DEPLOY_CLOJURE_JARFILE: *uberjar
+      DEPLOY_CLOJURE_JARFILE_JAVA_VERSION: 11
+      DOCKER_REGISTRY: all
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - attach_workspace: { at: ~/project }
+      - run: publish
+      - run: mv docker_image.tag workflow_aggregate_docker_image.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - workflow_aggregate_docker_image.tag
+      - slack-notify-on-failure
+
+  deploy-workflow-aggregate:
+    executor: ccc
+    environment:
+      RELEASE_VERSION: workflow-aggregate-etl
+      CUSTOM_CHART: deployments/workflow-aggregate/
+      PIPELINE_ID: << pipeline.id >>
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - attach_workspace: { at: ~/project }
+      - run: mv workflow_aggregate_docker_image.tag docker_image.tag
+      - run: deploy
+      - slack-notify-on-failure
+
+  publish-workflow-aggregate-all-branches:
+    executor: ccc
+    environment:
+      DEPLOY_CLOJURE_JARFILE: *uberjar
+      DEPLOY_CLOJURE_JARFILE_JAVA_VERSION: 11
+      DOCKER_REGISTRY: all
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - attach_workspace: { at: ~/project }
+      - run: publish
+      - run: mv docker_image.tag workflow_aggregate_all_branches_docker_image.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - workflow_aggregate_all_branches_docker_image.tag
+      - slack-notify-on-failure
+
+  deploy-workflow-aggregate-all-branches:
+    executor: ccc
+    environment:
+      DEPLOY_CLOJURE_JARFILE: *uberjar
+      DOCKER_REGISTRY: all
+      RELEASE_VERSION: wkf-agg-all-branches-etl
+      CUSTOM_CHART: deployments/workflow-aggregate-all-branches/
+      PIPELINE_ID: << pipeline.id >>
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - attach_workspace: { at: ~/project }
+      - run: mv workflow_aggregate_all_branches_docker_image.tag docker_image.tag
+      - run: deploy
+      - slack-notify-on-failure
+
+  publish-delayed-dispatcher:
+    executor: ccc
+    environment:
+      DEPLOY_CLOJURE_JARFILE: *uberjar
+      DEPLOY_CLOJURE_JARFILE_JAVA_VERSION: 11
+      DOCKER_REGISTRY: all
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - attach_workspace: { at: ~/project }
+      - run: publish
+      - run: mv docker_image.tag delayed_dispatcher_docker_image.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - delayed_dispatcher_docker_image.tag
+      - slack-notify-on-failure
+
+  deploy-delayed-dispatcher:
+    executor: ccc
+    environment:
+      RELEASE_VERSION: delayed-dispatcher
+      CUSTOM_CHART: deployments/delayed-dispatcher
+      PIPELINE_ID: << pipeline.id >>
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - attach_workspace: { at: ~/project }
+      - run: mv delayed_dispatcher_docker_image.tag docker_image.tag
+      - run: deploy
+      - slack-notify-on-failure
+
+  publish-migrator:
+    executor: ccc
+    environment:
+      NAME: insights-service-migrator
+      DOCKER_REGISTRY: all
+      MIGRATIONS_SQL_PATH: migrations
+      ROLLBAR_ACCESS_TOKEN: "" # Prevent CCC from notifying Rollbar when migrator is deployed.
+      DEPLOY_CLOJURE_JARFILE_JAVA_VERSION: 11
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - run: publish
+      - run: mv docker_image.tag migrator_docker_image.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - migrator_docker_image.tag
+      - slack-notify-on-failure
+
+  deploy-migrator:
+    executor: ccc
+    environment:
+      NAME: insights-service-migrator
+      MIGRATIONS_SQL_PATH: migrations
+      VALUES_FILE: migrations/values.yml
+      ROLLBAR_ACCESS_TOKEN: "" # Prevent CCC from notifying Rollbar when migrator is deployed.
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: mv migrator_docker_image.tag docker_image.tag
+      - run: deploy
+      - slack-notify-on-failure
+
+  deploy-client:
+    executor: lein_java_8
+    steps:
+      - checkout
+      - restore_deps
+      - attach_target
+      - run:
+          name: Deploy client
+          command: |
+            lein deploy circle-s3
+          working_directory: client
+      - slack-notify-on-failure
+
+  dry-run-service:
+    executor: ccc
+    environment:
+      NAME: insights-service
+      CUSTOM_CHART: deployments/deploy/
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - run: /deploy/dry-run
+
+  dry-run-delayed-dispatcher:
+    executor: ccc
+    environment:
+      NAME: insights-service
+      CUSTOM_CHART: deployments/delayed-dispatcher/
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - run: /deploy/dry-run
+
+  dry-run-workflow-aggregate:
+    executor: ccc
+    environment:
+      NAME: insights-service
+      CUSTOM_CHART: deployments/workflow-aggregate/
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - run: /deploy/dry-run
+
+  dry-run-workflow-aggregate-all-branches:
+    executor: ccc
+    environment:
+      NAME: insights-service
+      CUSTOM_CHART: deployments/workflow-aggregate-all-branches/
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - run: /deploy/dry-run
+
+  dry-run-etl-processor:
+    executor: ccc
+    environment:
+      NAME: insights-service
+      CUSTOM_CHART: deployments/etl-processor/
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - run: /deploy/dry-run
+
+  dry-run-workflow-and-job-execution-processor:
+    executor: ccc
+    environment:
+      NAME: insights-service
+      CUSTOM_CHART: deployments/workflow-and-job-execution-processor/
+    working_directory: ~/project
+    steps:
+      - checkout: { path: ~/project }
+      - setup_remote_docker
+      - run: /deploy/dry-run
+
+workflows:
+  service:
+    when:
+      not: << pipeline.parameters.rollback_version >>
+    jobs:
+      - build-cache:
+          context: org-global
+      - lint:
+          context: org-global
+      - test:
+          context: org-global
+      - check-schema:
+          context: org-global
+      - build-uberjar:
+          context: org-global
+          requires:
+            - build-cache
+      - test-container-build:
+          context: org-global
+          requires:
+            - build-uberjar
+      - publish-migrator:
+          context: org-global
+          requires:
+            - test
+            - lint
+            - test-container-build
+            - check-schema
+          filters:
+            branches:
+              only:
+                - main
+                - /^server-\d\..+/
+      - deploy-migrator:
+          context: org-global
+          requires:
+            - publish-migrator
+          filters:
+            branches:
+              only: main
+      - deploy-canary:
+          context: org-global
+          requires:
+            - lint
+            - test
+            - test-container-build
+          filters:
+            branches:
+              only:
+                - canary
+                - canary-all
+      - deploy-workflow-and-job-execution-processor-canary:
+          context: org-global
+          requires:
+            - lint
+            - test
+            - test-container-build
+          filters:
+            branches:
+              only:
+                - workflow-and-job-execution-processor-canary
+                - canary-all
+      - deploy-workflow-aggregate-etl-canary:
+          context: org-global
+          requires:
+            - lint
+            - test
+            - test-container-build
+          filters:
+            branches:
+              only:
+                - workflow-aggregate-etl-canary
+                - canary-all
+      - deploy-workflow-aggregate-all-branches-etl-canary:
+          context: org-global
+          requires:
+            - lint
+            - test
+            - test-container-build
+          filters:
+            branches:
+              only:
+                - workflow-aggregate-all-branches-etl-canary
+                - canary-all
+      - deploy-etl-processor-canary:
+          context: org-global
+          requires:
+            - lint
+            - test
+            - test-container-build
+          filters:
+            branches:
+              only:
+                - etl-canary
+                - canary-all
+      - publish-raven:
+          context: org-global
+          requires:
+            - lint
+            - test
+            - test-container-build
+          filters:
+            branches:
+              only: raven
+      - deploy-raven:
+          context: org-global
+          requires:
+            - publish-raven
+          filters:
+            branches:
+              only: raven
+      - publish-workflow-aggregate:
+          context: org-global
+          requires:
+            - deploy-migrator
+          filters:
+            branches:
+              only: main
+      - deploy-workflow-aggregate:
+          context: org-global
+          requires:
+            - publish-workflow-aggregate
+          filters:
+            branches:
+              only: main
+      - publish-workflow-aggregate-all-branches:
+          context: org-global
+          requires:
+            - deploy-migrator
+          filters:
+            branches:
+              only: main
+      - deploy-workflow-aggregate-all-branches:
+          context: org-global
+          requires:
+            - publish-workflow-aggregate-all-branches
+          filters:
+            branches:
+              only: main
+      - publish-service:
+          context: org-global
+          requires:
+            - deploy-migrator
+          filters:
+            branches:
+              only:
+                - main
+                - /^server-\d\..+/
+      - deploy-service:
+          context: org-global
+          requires:
+            - publish-service
+          filters:
+            branches:
+              only: main
+      - publish-etl-processor:
+          context: org-global
+          requires:
+            - deploy-migrator
+          filters:
+            branches:
+              only: main
+      - deploy-etl-processor:
+          context: org-global
+          requires:
+            - publish-etl-processor
+          filters:
+            branches:
+              only: main
+      - publish-workflow-and-job-execution-processor:
+          context: org-global
+          requires:
+            - deploy-migrator
+          filters:
+            branches:
+              only: main
+      - deploy-workflow-and-job-execution-processor:
+          context: org-global
+          requires:
+            - publish-workflow-and-job-execution-processor
+          filters:
+            branches:
+              only: main
+      - publish-delayed-dispatcher:
+          context: org-global
+          requires:
+            - deploy-migrator
+          filters:
+            branches:
+              only: main
+      - deploy-delayed-dispatcher:
+          context: org-global
+          requires:
+            - publish-delayed-dispatcher
+          filters:
+            branches:
+              only: main
+      - deploy-client:
+          context: org-global
+          requires:
+            - deploy-service
+      - scotty-orb/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          promotion_component_list: "circleci/insights-service circleci/insights-service-migrator"
+          requires:
+            - publish-service
+            - publish-migrator
+      - dry-run-service:
+          context: org-global
+      - dry-run-delayed-dispatcher:
+          context: org-global
+      - dry-run-workflow-aggregate:
+          context: org-global
+      - dry-run-etl-processor:
+          context: org-global
+      - dry-run-workflow-and-job-execution-processor:
+          context: org-global

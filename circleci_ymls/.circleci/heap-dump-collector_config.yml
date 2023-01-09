@@ -1,0 +1,183 @@
+version: 2.1
+
+references:
+  name: &name heap-dump-collector
+
+executors:
+  go:
+    docker:
+      - image: circleci/go-service:0.1-dev
+        auth:
+          username: $RO_DOCKER_HUB_USERNAME
+          password: $RO_DOCKER_HUB_PASSWORD
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+jobs:
+
+  build:
+    executor: go
+    working_directory: ~/heap-dump-collector
+    steps:
+      - checkout:
+          path: ~/heap-dump-collector
+      - run: task go-service:private-go-mod-init
+      - run: task go-service:build GO_BINARY_NAME=heap-dump-collector
+      - persist_to_workspace:
+          root: ~/heap-dump-collector
+          paths:
+            - bin
+  lint:
+    executor: go
+    working_directory: ~/heap-dump-collector
+    steps:
+      - checkout:
+          path: ~/heap-dump-collector
+      - run: task go-service:private-go-mod-init
+      - run: task lint
+      - run: task lint-go-mod
+  test:
+    executor: go
+    working_directory: ~/heap-dump-collector
+    steps:
+      - checkout:
+          path: ~/heap-dump-collector
+      - run: task go-service:private-go-mod-init
+      - run: task ci:test RESULTS_DIR=/tmp/test-results
+      - store_test_results:
+          path: /tmp/test-results
+
+  dry-run:
+    executor: ccc
+    environment:
+      NAME: *name
+      GO_BINARY_PATH: ./bin/heap-dump-collector
+      CUSTOM_CHART: chart
+      NAMESPACE: sre
+      CONFIGURE_ECR_REPO: yes
+      ECR_OWNER_TEAM: MeowDivision
+      DOCKER_REGISTRY: ecr
+    working_directory: ~/heap-dump-collector
+    steps:
+      - checkout:
+          path: ~/heap-dump-collector
+      - attach_workspace:
+          at: ~/heap-dump-collector
+      - setup_remote_docker
+      - run: cp chart/Chart.yaml /tmp/Chart.yaml
+      - run: /deploy/merge-values /tmp/Chart.yaml chart-CI-overrides.yml > chart/Chart.yaml
+      - run: cp chart/values.yaml /tmp/values.yaml
+      - run: /deploy/merge-values /tmp/values.yaml k8s-values.yml > chart/values.yaml
+      - run: scan
+      - run: /deploy/dry-run
+
+  publish-deploy:
+    executor: ccc
+    environment:
+      NAME: *name
+      GO_BINARY_PATH: ./bin/heap-dump-collector
+      DOCKER_REGISTRY: ecr
+
+      CUSTOM_CHART: chart
+      NAMESPACE: sre
+      CONFIGURE_ECR_REPO: yes
+      ECR_OWNER_TEAM: MeowDivision
+    working_directory: ~/heap-dump-collector
+    steps:
+      - checkout:
+          path: ~/heap-dump-collector
+      - attach_workspace:
+          at: ~/heap-dump-collector
+      - setup_remote_docker
+      - run: cp chart/Chart.yaml /tmp/Chart.yaml
+      - run: /deploy/merge-values /tmp/Chart.yaml chart-CI-overrides.yml > chart/Chart.yaml
+      - run: cp chart/values.yaml /tmp/values.yaml
+      - run: /deploy/merge-values /tmp/values.yaml k8s-values.yml > chart/values.yaml
+      - run: publish
+      - run: deploy
+
+
+  publish-deploy-canary:
+    executor: ccc
+    environment:
+      NAME: *name
+      GO_BINARY_PATH: ./bin/heap-dump-collector
+      DOCKER_REGISTRY: ecr
+
+      CUSTOM_CHART: chart
+      NAMESPACE: sre
+      CONFIGURE_ECR_REPO: yes
+      ECR_OWNER_TEAM: MeowDivision
+      RELEASE_VERSION: canary
+      DEPLOY_ENVIRONMENT: canary
+    working_directory: ~/heap-dump-collector
+    steps:
+      - checkout:
+          path: ~/heap-dump-collector
+      - attach_workspace:
+          at: ~/heap-dump-collector
+      - setup_remote_docker
+      - run: cp chart/Chart.yaml /tmp/Chart.yaml
+      - run: /deploy/merge-values /tmp/Chart.yaml chart-CI-overrides.yml > chart/Chart.yaml
+      - run: cp chart/values.yaml /tmp/values.yaml
+      - run: /deploy/merge-values /tmp/values.yaml k8s-values.yml > /tmp/pre-values.yaml
+      - run: /deploy/merge-values /tmp/pre-values.yaml canary-values.yml > chart/values.yaml
+      - run: publish
+      - run: deploy
+
+workflows:
+  deploy:
+    jobs:
+      - build:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - lint:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+          requires:
+            - build
+      - test:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+          requires:
+            - build
+      - dry-run:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - build
+          filters:
+            branches:
+              # diffs are included automatically by actual deploys
+              ignore:
+                - main
+      - publish-deploy:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - lint
+            - test
+          filters:
+            branches:
+              only:
+                - main
+      - publish-deploy-canary:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - lint
+            - test
+          filters:
+            branches:
+              only:
+                - canary

@@ -1,0 +1,119 @@
+version: 2.1
+
+orbs:
+  codecov: codecov/codecov@1.2.2
+  gh-pages: sugarshin/gh-pages@0.0.6
+
+references:
+  docker_images: &docker_images
+    - image: circleci/clojure:openjdk-8
+    - image: rabbitmq:3.6-management-alpine
+
+jobs:
+  test-clojure:
+    docker:
+      *docker_images
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - jars-{{ checksum "project.clj" }}
+            - jars
+      - run: lein check
+      - run: lein test2junit
+      - run: lein cloverage --codecov
+      - run: lein docs
+      - store_test_results:
+          path: test-results
+      - store_artifacts:
+          path: test-results
+      - store_artifacts:
+          path: target/coverage
+      - store_artifacts:
+          path: target/docs/doc
+      - save_cache:
+          key: jars-{{ checksum "project.clj" }}
+          paths:
+            - ~/.m2
+      - codecov/upload
+
+  test-pb-go:
+    docker:
+      - image: cimg/go:1.17
+    steps:
+      - checkout
+      - run:
+          name: Compile proto files to Go
+          command: ./scripts/generate-go-pb.sh
+      - run:
+          name: Verify that there is no code diff
+          command: |
+            if [ -n "$(git status --porcelain)" ]; then
+              echo "There is a diff between CI-generated pb.go files and the files which have been committed."
+              echo "Please run the script to compile proto files to Go and commit the changes."
+              exit 1
+            fi
+      - run:
+          name: Test Go library
+          command: cd pb && go test ./...
+
+  deploy:
+    docker:
+      - image: circleci/clojure:openjdk-8
+    steps:
+      - add_ssh_keys:
+          fingerprints:
+            - "bc:20:0a:59:c3:fe:5b:75:1e:9c:9e:8b:a9:d9:0f:38"
+      - checkout
+      - restore_cache:
+          keys:
+            - jars-{{ checksum "project.clj" }}
+            - jars
+      - run:
+          name: Set version
+          command: |
+            if [[ "$CIRCLE_BRANCH" == "main" ]]; then
+              patch_version="${CIRCLE_BUILD_NUM}"
+            else
+              branch="$(echo "$CIRCLE_BRANCH" | tr '/A-Z' '-a-z' | sed 's/^[0-9-]\+//')"
+              patch_version="0-${branch:-experimental}-SNAPSHOT"
+            fi
+            echo "export EVENTS_VERSION=0.1.$patch_version" >> "${BASH_ENV}"
+      - run:
+          name: Push jars and tag the release
+          command: |
+            git config user.email "backplane@circleci.com"
+            git config user.name "Backplane Bot"
+            lein release
+            # If the module is not defined in the repository’s root directory, the module
+            # subdirectory (...) also serves as a prefix for semantic version tags.
+            # - https://go.dev/ref/mod
+            # Additionally, Go expects version semantic tags to start with "v".
+            git tag "pb/v$EVENTS_VERSION"
+            if [[ "$CIRCLE_BRANCH" == "main" ]]; then
+              git push --tags
+            fi
+      - when:
+          condition:
+            equal: [ main, << pipeline.git.branch >> ]
+          steps:
+            - run: lein docs
+            - gh-pages/deploy:
+                build-dir: "target/docs/doc"
+
+workflows:
+  version: 2
+  build-test-deploy:
+    jobs:
+      - test-clojure
+      - test-pb-go
+      - deploy:
+          context: org-global
+          requires:
+            - test-clojure
+            - test-pb-go
+          filters:
+            branches:
+              only:
+                - main
+                - /experimental/.*/

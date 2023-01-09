@@ -1,0 +1,79 @@
+version: 2.1
+
+executors:
+  clj:
+    docker:
+      - image: circleci/clojure-service:0.7-dev
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+jobs:
+  test:
+    executor:
+      name: clj
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - maven-{{ checksum "project.clj" }}
+            - maven
+      - run: lein deps
+      - run: lein test
+      - run:
+          name: Build uberjar
+          command: |
+            lein uberjar
+            cp -v target/uberjar/onboarding-sandbox-*-standalone.jar target/onboarding-sandbox-standalone.jar
+      - save_cache:
+          key: maven-{{ checksum "project.clj" }}
+          paths:
+            - ~/.m2
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target/onboarding-sandbox-standalone.jar
+
+  deploy:
+    executor:
+      name: ccc
+    environment:
+      NAME: onboarding-sandbox
+      DEPLOY_CLOJURE_JARFILE: target/onboarding-sandbox-standalone.jar
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/onboarding-sandbox
+      DEPLOY_TYPE: helm
+      DOCKER_REGISTRY: all
+      VALUES_FILE: values.yaml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run:
+          name: Deploy
+          command: |
+            # These override default values from CCC and the executor.
+            # set Helm RELEASE_VERSION to be the branch without onboarding/ prefix
+            echo "export RELEASE_VERSION=${CIRCLE_BRANCH##onboarding/}" >> "${BASH_ENV}"
+      - run: publish
+      - run: deploy
+
+workflows:
+  deploy:
+    jobs:
+      - test:
+          context: org-global
+      - deploy:
+          context: org-global
+          requires:
+            - test
+          filters:
+            branches:
+              only:
+                - /onboarding\/.*/

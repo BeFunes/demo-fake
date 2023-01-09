@@ -1,0 +1,84 @@
+version: 2.1
+
+orbs:
+  slack: circleci/slack@4.4.4
+  aws: circleci/aws-cli@2.0.0
+
+workflows:
+  ci:
+    jobs:
+      - build
+      - publish-binary:
+          context:
+            - execution-infrastructure-deploy
+          filters:
+            branches:
+              only:
+                - main
+          requires:
+            - build
+      - deploy-binary:
+          context:
+            - execution-infrastructure-deploy
+          filters:
+            branches:
+              only:
+                - main
+          requires:
+            - publish-binary
+
+jobs:
+  build:
+    docker:
+      - image: cimg/go:1.17
+    steps:
+      - checkout
+      - run: go mod download
+      - run: ./do install-devtools
+      - run: ./do build
+      - run: ./do lint-report
+      - run: ./do test
+      - run: echo $(./do version) >> target/version.txt
+
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target
+
+      - store_artifacts:
+          path: test-reports
+
+      - store_test_results:
+          path: test-reports
+      - notify_failing_master
+
+  publish-binary:
+    executor: aws/default
+    steps:
+      - checkout
+      - aws/setup:
+          profile-name: cciexec
+      - attach_workspace:
+          at: .
+      - run: ./scripts/ci/publish.sh $(cat target/version.txt)
+      - notify_failing_master
+
+  deploy-binary:
+    executor: aws/default
+    steps:
+      - checkout
+      - aws/setup:
+          profile-name: cciexec
+      - attach_workspace:
+          at: .
+      - run: ./scripts/ci/deploy.sh $(cat target/version.txt)
+      - notify_failing_master
+
+commands:
+  notify_failing_master:
+    steps:
+      - slack/notify:
+          channel: fleets-alerts
+          branch_pattern: main
+          event: fail
+          template: basic_fail_1

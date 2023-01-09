@@ -1,0 +1,97 @@
+version: 2.1
+
+jobs:
+  scan-or-publish-image:
+    executor: ccc
+    parameters:
+      image_name:
+        type: string
+      upstream_image:
+        type: string
+      upstream_image_version:
+        type: string
+      image_type:
+        type: string
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: 20.10.6
+      - scan-or-publish-image:
+          image_name: "<<parameters.image_name>>"
+          upstream_image: "<<parameters.upstream_image>>"
+          upstream_image_version: "<<parameters.upstream_image_version>>"
+          image_type: "<<parameters.image_type>>"
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+commands:
+  scan-or-publish-image:
+    description: "Scan or deploy an image depending on the current branch"
+    parameters:
+      image_name:
+        type: string
+      upstream_image:
+        type: string
+      upstream_image_version:
+        type: string
+      image_type:
+        type: string
+    steps:
+      - run:
+          environment:
+            NAME: <<parameters.image_name>>
+            DOCKERFILE_PATH: Dockerfile.<<parameters.image_type>>
+            DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/<<parameters.image_name>>
+            DOCKER_REGISTRY: ecr
+          name: "Scan or publish <<parameters.image_name>> from <<parameters.upstream_image>>:<<parameters.upstream_image_version>>"
+          command: |
+
+            apk add jq
+
+            docker pull <<parameters.upstream_image>>:<<parameters.upstream_image_version>>
+
+            BASE_USER=$(
+              docker image inspect <<parameters.upstream_image>>:<<parameters.upstream_image_version>> |
+                jq -r '.[0].Config.User'
+            )
+
+            export EXTRA_DOCKER_BUILD_ARGS="--build-arg BASE_USER=${BASE_USER} --build-arg UPSTREAM_IMAGE=<<parameters.upstream_image>> --build-arg UPSTREAM_IMAGE_VERSION=<<parameters.upstream_image_version>>"
+            export CONTAINER_VERSION="<<parameters.upstream_image_version>>-${CIRCLE_BUILD_NUM}-$(git rev-parse --short HEAD)"
+
+            if [[ "$CIRCLE_BRANCH" = "main" ]]; then
+              # Disable enforcement as these are 3rd party images that we are
+              # upgrading as far as we can, and this consistently blocks
+              # upgrading to newer versions that have security fixes for some,
+              # but not all, CVEs.
+              TWISTLOCK_ENFORCE=false publish
+            else
+              scan
+            fi
+
+            FINAL_BASE_USER="$(docker image inspect circleci/${NAME}:${CONTAINER_VERSION} | jq -r '.[0].Config.User')"
+            echo "DEBUG Base image USER: '${BASE_USER}' / Final image USER: '${FINAL_BASE_USER}'"
+            [ "${BASE_USER}" = "${FINAL_BASE_USER}" ]
+
+workflows:
+  main:
+    jobs:
+      - scan-or-publish-image:
+          name: datadog-cluster-agent
+          context: org-global
+          image_name: datadog-cluster-agent
+          upstream_image: datadog/cluster-agent
+          upstream_image_version: 1.19.0
+          image_type: apt
+      - scan-or-publish-image:
+          name: datadog-agent
+          context: org-global
+          image_name: datadog-agent
+          upstream_image: datadog/agent
+          upstream_image_version: 7.35.1
+          image_type: apt

@@ -1,0 +1,119 @@
+version: 2.0
+jobs:
+  build:
+    docker:
+      - image: clojure:lein-2.8.1
+    working_directory: /home/circleci/grpc
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - grpc-svc-jars-{{ checksum "project.clj" }}
+
+      - run: lein deps
+
+      - save_cache:
+          key: grpc-svc-jars-{{ checksum "project.clj" }}
+          paths:
+            - /root/.m2
+
+      # because for some reason, lein test isn't catching compile errors
+      - run:
+          name: lein check
+          command: lein check
+          
+      - run:
+          name: Run tests
+          command: |
+            set -o pipefail
+            lein test 2>&1 | tee output.txt
+
+      - run:
+          name: Check for reflection warnings
+          command: |
+            ! grep -e '^Reflection warning.*protobuf' output.txt
+
+  nvd:
+    resource_class: large
+    docker:
+      - image: clojure:lein-2.8.1
+    working_directory: /home/circleci/grpc
+
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - grpc-svc-jars-{{ checksum "project.clj" }}
+
+      - restore_cache:
+          keys:
+            - v1-nvd
+
+      - run:
+          name: Download NVD data
+          command: lein nvd update
+
+      - save_cache:
+          key: v1-nvd
+          paths: /tmp/nvd/data
+
+      - run:
+          name: Run NVD checking
+          command: NVD_VERSION=1.0.0 lein nvd check # HACK: https://github.com/rm-hull/lein-nvd/issues/38
+
+      - save_cache:
+          key: v1-grpc-jars-circleci-{{ checksum "project.clj" }}
+          paths:
+            - /home/circleci/.m2
+
+      - store_artifacts:
+          path: target/nvd
+          destination: nvd
+
+  deploy:
+    docker:
+      - image: clojure:lein-2.8.1
+    working_directory: /home/circleci/grpc
+    steps:
+      - checkout
+
+      - restore_cache:
+          key: v1-grpc-jars-circleci-{{ checksum "project.clj" }}
+
+      - run:
+          name: Deploy to circle-s3
+          command: |
+            lein version-spec
+            lein deploy circle-s3
+
+      - run:
+          name: discarding all changes
+          command: git checkout -- .
+
+      - save_cache:
+          key: v1-grpc-jars-circleci-{{ checksum "project.clj" }}
+          paths:
+            - /home/circleci/.m2
+
+workflows:
+  version: 2
+  build-and-deploy:
+    jobs:
+      - build:
+          context: org-global
+      - nvd:
+          context: org-global
+          requires:
+            - build
+          filters:
+            branches:
+              ignore: main
+      - deploy:
+          context: org-global
+          requires:
+            - build
+          filters:
+            branches:
+              only: main

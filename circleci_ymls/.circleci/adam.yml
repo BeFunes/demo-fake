@@ -1,0 +1,14 @@
+version: 2.1
+orbs:
+  # see warning about orb not in use
+  cli: circleci/circleci-cli@0.1.9
+jobs:
+  do-stuff:
+    # if orb is commented out, this line will warn the executor is unknown
+    executor: cli/default
+    steps:
+      - checkout
+workflows:
+  my-workflow:
+    jobs:
+      - do-stuff

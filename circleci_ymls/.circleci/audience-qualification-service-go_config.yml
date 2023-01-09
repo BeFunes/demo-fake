@@ -1,0 +1,276 @@
+version: 2.1
+
+workflows:
+  main-workflow:
+    jobs:
+      - lint:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - test:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - build:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+
+      - db-schema:
+          context:
+            - dockerhub-readonly
+
+      - test-build-docker-image:
+          context: org-global
+          filters:
+            branches:
+              ignore:
+                - main
+          requires:
+            - build
+
+      - test-build-migrator-docker-image:
+          context: org-global
+          filters:
+            branches:
+              ignore:
+                - main
+
+      - deploy:
+          context: org-global
+          filters:
+            branches:
+              only:
+                - main
+          requires:
+            - lint
+            - test
+            - build
+            - db-schema
+
+      - deploy-canary:
+          context: org-global
+          filters:
+            branches:
+              only:
+                - canary
+          requires:
+            - lint
+            - test
+            - build
+            - db-schema
+
+      - deploy-migrator:
+          context: org-global
+          filters:
+            branches:
+              only:
+                - main
+          requires:
+            - lint
+            - test
+            - build
+            - db-schema
+
+executors:
+  go:
+    docker:
+      - image: &goimage circleci/go-service:0.1-dev
+        auth:
+          username: $RO_DOCKER_HUB_USERNAME
+          password: $RO_DOCKER_HUB_PASSWORD
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+jobs:
+  lint:
+    executor: go
+    resource_class: large
+    steps:
+      - setup
+      - run:
+          name: generate
+          command: ./do generate
+      - run:
+          name: go tidy
+          command: go mod tidy -v
+      - run:
+          name: verify no changes
+          command: git diff --ignore-matching-lines='Generated on ' --exit-code
+      - run: ./do lint-report
+      - store_results
+
+  build:
+    executor: go
+    resource_class: large
+    steps:
+      - setup
+      - run: ./do generate
+      - run: ./do build
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target
+
+  deploy-migrator:
+    executor: ccc
+    environment:
+      NAME: audience-qualification-service-go-migrator
+      IMAGE_NAME: circleci/audience-qualification-service-migrator
+      DOCKER_REGISTRY: ecr
+      DEPLOY_TYPE: helm
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/audience-qualification-service-migrator
+      MIGRATIONS_SQL_PATH: "migrations/sql"
+      VALUES_FILE: migrations/k8s-values.yaml
+      ROLLBAR_ACCESS_TOKEN: "" # Prevent CCC from notifying Rollbar when migrator is deployed.
+
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run: publish
+      - run: deploy
+
+  deploy:
+    executor: ccc
+    environment:
+      NAME: audience-qualification-service-go
+      IMAGE_NAME: circleci/audience-qualification-service
+      DOCKER_REGISTRY: ecr
+      DEPLOY_TYPE: helm
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/audience-qualification-service
+      VALUES_FILE: k8s-values.yaml
+      DOCKERFILE_PATH: Dockerfile
+
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run: publish
+      - run: deploy
+
+  deploy-canary:
+    executor: ccc
+    environment:
+      NAME: audience-qualification-service-go
+      IMAGE_NAME: circleci/audience-qualification-service
+      DOCKER_REGISTRY: ecr
+      DEPLOY_TYPE: helm
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/audience-qualification-service
+      VALUES_FILE: k8s-values-canary.yaml
+      DOCKERFILE_PATH: Dockerfile
+      RELEASE_VERSION: canary
+
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run: publish
+      - run: /deploy/merge-values k8s-values.yaml canary-overrides.yaml > k8s-values-canary.yaml
+      - run: deploy
+
+  test-build-docker-image:
+    executor: ccc
+    environment:
+      NAME: audience-qualification-service-go
+      IMAGE_NAME: circleci/audience-qualification-service
+      DOCKER_REGISTRY: none
+      DEPLOY_TYPE: helm
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/audience-qualification-service
+      VALUES_FILE: k8s-values.yaml
+      DOCKERFILE_PATH: ./Dockerfile
+
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run: publish # Only builds and scans since DOCKER_REGISTRY is set to none
+      - run: /deploy/dry-run
+
+  test-build-migrator-docker-image:
+    executor: ccc
+    environment:
+      NAME: audience-qualification-service-go-migrator
+      IMAGE_NAME: circleci/audience-qualification-service-migrator
+      DOCKER_REGISTRY: none
+      DEPLOY_TYPE: helm
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/audience-qualification-service-migrator
+      MIGRATIONS_SQL_PATH: "migrations/sql"
+      VALUES_FILE: migrations/k8s-values.yaml
+
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run: publish # Only builds and scans since DOCKER_REGISTRY is set to none
+      - run: /deploy/dry-run
+
+  test:
+    docker:
+      - image: *goimage
+        auth:
+          username: $RO_DOCKER_HUB_USERNAME
+          password: $RO_DOCKER_HUB_PASSWORD
+      - image: circleci/postgres:13.3-ram
+        environment:
+          POSTGRES_USER: user
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: example
+    resource_class: large
+    steps:
+      - setup
+      - run: ./do create-stub-test-files
+      - run:
+          name: run tests
+          command: task ci:test RESULTS_DIR=test-reports
+      - store_results
+
+  db-schema:
+    machine:
+      image: ubuntu-2004:202010-01
+    steps:
+      - checkout
+      - run:
+          name: docker login
+          command: >
+            echo $RO_DOCKER_HUB_PASSWORD |
+            docker login --username $RO_DOCKER_HUB_USERNAME --password-stdin
+      - run: ./do schema
+      - run:
+          name: Check that the DB schema dump matches migrations
+          command: |
+            # If the `diff` exit code is not zero, the migrations/schema.sql file is
+            # out-of date.
+            # Run ./do schema locally to update it
+            git diff --exit-code
+
+commands:
+  setup:
+    steps:
+      - checkout
+      - run: task go-service:private-go-mod-init
+      - run: ./do install-devtools
+
+  store_results:
+    steps:
+      - run:
+          name: Strip ANSI codes from xunit output
+          when: always
+          command: |
+            # The test output produces ANSI codes, which the XML writer converts into annoying
+            # \0xfffd characters - we'll strip these out to make the XML a bit more readable
+            sed -i 's/�\[[0-9;]*[a-zA-Z]//g' test-reports/*.xml || true
+      - store_artifacts:
+          path: test-reports
+      - store_test_results:
+          path: test-reports

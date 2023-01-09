@@ -1,0 +1,101 @@
+version: 2.1
+
+executors:
+  node:
+    docker:
+      - image: circleci/node:14
+    working_directory: /home/circleci/web-ui
+
+commands:
+  restore-repo:
+    steps:
+      - restore_cache:
+          keys:
+            - v2-repo-{{ .Branch }}-{{ .Revision }}
+            - v2-repo-{{ .Branch }}
+            - v2-repo
+
+  restore-js-deps:
+    steps:
+      - restore_cache:
+          keys:
+            - v12-dependency-js-deps-{{ checksum "yarn.lock" }}
+            - v12-dependency-js-deps
+
+jobs:
+  checkout-code:
+    executor: node
+    steps:
+      - restore-repo
+      - checkout
+      - save_cache:
+          key: v2-repo-{{ .Branch }}-{{ .Revision }}
+          paths:
+            - .
+  dependencies:
+    executor: node
+    steps:
+      - restore-repo
+      - restore-js-deps
+      - run:
+          name: 'Login to npm'
+          command:
+            echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
+
+      - run: yarn install --frozen-lockfile
+      - save_cache:
+          key: v12-dependency-js-deps-{{ checksum "yarn.lock" }}
+          paths:
+            - node_modules
+  test:
+    executor: node
+    environment:
+      JEST_JUNIT_OUTPUT_DIR: 'test-results/jest'
+      JEST_JUNIT_OUTPUT_NAME: 'results.xml'
+    steps:
+      - restore-repo
+      - restore-js-deps
+      - run: yarn typecheck
+      - run: yarn lint
+      - run: yarn test:coverage:ci
+      - run: yarn codecov
+  deploy:
+    executor: node
+    steps:
+      - restore-repo
+      - restore-js-deps
+      - run: yarn build
+
+      # This ssh-rsa public key comes from our "checkout_code" command.
+      # See for example: https://app.circleci.com/jobs/github/eric-hu/cci-sandbox/125/parallel-runs/0/steps/0-101
+      - run: |
+          mkdir -p ~/.ssh
+          echo 'github.com ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEAq2A7hRGmdnm9tUDbO9IDSwBK6TbQa+PXYPCPy6rbTrTtw7PHkccKrpp0yVhp5HdEIcKr6pLlVDBfOLX9QUsyCOV0wzfjIJNlGEYsdlLJizHhbn2mUjvSAHQqZETYP81eFzLQNnPHt4EVVUh7VfDESU84KezmD5QlWpXLmvU31/yMf+Se8xhHTvKSCZIFImWwoG6mbUoWf9nzpIoaSjB+weqqUUmpaaasXVal72J+UX2B+2RPW3RcT0eOzQgqlJL3RKrTJvdsjE3JEAvGq3lGHSZXy28G3skua2SmVi/w4yCE6gbODqnTWlg7+wC604ydGXA8VJiS5ap43JXiUFFAaQ==' >> ~/.ssh/known_hosts
+
+          git config --global user.email "$GH_EMAIL"
+          git config --global user.name "$GH_NAME"
+          echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
+      - run:
+          name: Deploy if there is a changeset
+          command: yarn changeset publish
+
+workflows:
+  version: 2
+  build-test-and-deploy:
+    jobs:
+      - checkout-code
+      - dependencies:
+          context: web-ui-npm
+          requires:
+            - checkout-code
+      - test:
+          requires:
+            - dependencies
+      - deploy:
+          context: web-ui-backplane
+          requires:
+            - dependencies
+            - test
+          filters:
+            branches:
+              only: main

@@ -1,0 +1,57 @@
+version: 2.1
+
+jobs:
+  publish-deploy:
+    parameters:
+      docker_registry:
+        type: string
+        default: ecr
+      dry_run:
+        type: boolean
+        default: false
+    working_directory: /root/pganalyze-service
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: pganalyze-service
+          NAMESPACE: sre
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: << parameters.docker_registry >>
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/pganalyze-service
+          VALUES_FILE: service-values.yml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Login to Quay
+          command: docker login quay.io -u $QUAY_USER -p $QUAY_PASS
+      - run:
+          name: Scan and maybe publish docker image to ECR
+          command: "TWISTLOCK_ENFORCE=false publish"
+      - unless:
+          condition: << parameters.dry_run >>
+          steps:
+            - run:
+                name: Deploy docker image
+                command: deploy
+
+workflows:
+  version: 2
+  test-publish-deploy:
+    jobs:
+      - publish-deploy:
+          context: org-global
+          filters:
+            branches:
+              only: master
+      - publish-deploy:
+          context: org-global
+          docker_registry: none
+          dry_run: true
+          filters:
+            branches:
+              ignore: master

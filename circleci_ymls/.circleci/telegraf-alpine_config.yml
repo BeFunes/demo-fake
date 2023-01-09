@@ -1,0 +1,42 @@
+version: 2.1
+
+jobs:
+  build-image:
+    parameters:
+      docker_registry:
+        type: string
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: telegraf-alpine
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/telegraf-alpine
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: << parameters.docker_registry >>
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Publish docker image to ECR
+          command: publish
+
+workflows:
+  version: 2
+  build-and-publish:
+    jobs:
+      - build-image:
+          context: org-global
+          docker_registry: ecr
+          filters:
+            branches:
+              only: master
+  build-and-scan:
+    jobs:
+      - build-image:
+          context: org-global
+          docker_registry: none
+          filters:
+            branches:
+              ignore: master

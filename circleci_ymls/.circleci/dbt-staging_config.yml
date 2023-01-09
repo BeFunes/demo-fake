@@ -1,0 +1,61 @@
+version: 2.1
+
+executors:
+  python:
+    docker:
+      - image: python:3.10
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    environment:
+      POETRY_VIRTUALENVS_PATH: /virtualenvs/envs
+      DBT_PROFILES_DIR: ~/project
+      SNOWFLAKE_USER: test_user
+      SNOWFLAKE_ROLE: test_role
+      DBT_DEV_SCHEMA: test_schema
+
+commands:
+  setup-python-dependencies:
+    description: Setup the python environment for testing and linting
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-poetry-cache-{{ arch }}-{{ .Branch }}-{{ checksum "poetry.lock" }}
+            - v1-poetry-cache-{{ arch }}-{{ .Branch }}
+            - v1-poetry-cache
+      - run: echo "export PATH=$HOME/.poetry/bin:$PATH" >> $BASH_ENV
+      - run: curl -sSL https://raw.githubusercontent.com/python-poetry/poetry/master/get-poetry.py | python -
+      - run: poetry install
+      - save_cache:
+          key: v1-poetry-cache-{{ arch }}-{{ .Branch }}-{{ checksum "poetry.lock" }}
+          paths: /virtualenvs
+
+jobs:
+  lint:
+    executor: python
+    steps:
+      - setup-python-dependencies
+      - run: poetry run yamllint macros models sources tests
+      - run: poetry run dbt deps
+      # - run: poetry run sqlfluff lint
+  dbt-cloud-deploy:
+    executor: python
+    steps:
+      - checkout
+      - run: pip install requests
+      - run:
+          name: deploy-dbt-models
+          command: python .circleci/prod_dbt_cloud_slimci.py
+
+workflows:
+  commit:
+    jobs:
+      - lint
+      - dbt-cloud-deploy:
+          filters:
+            branches:
+              only:
+                - main
+          requires:
+            - lint

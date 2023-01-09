@@ -1,0 +1,160 @@
+---
+version: "2.1"
+
+executors:
+  generic:
+    docker:
+      - image: circleci/python:3.9
+  generic_and_pg:
+    docker:
+      - image: circleci/python:3.9
+      - image: postgres:12-alpine
+        name: postgres
+        environment:
+          POSTGRES_PASSWORD: postgres
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    working_directory: ~/project
+
+commands:
+  install_deps:
+    steps:
+      - run: pip3 install -r requirements-dev.txt
+
+  save_mypy_cache:
+    steps:
+      - save_cache:
+          key: mypy-v1
+          paths:
+            - ~/project/.mypy
+          when: always
+
+  restore_mypy_cache:
+    steps:
+      - restore_cache:
+          keys:
+            - mypy-v1
+
+jobs:
+  bandit:
+    executor: generic
+    steps:
+      - checkout:
+          path: ~/project
+      - install_deps
+      - run:
+          command: make bandit
+          environment:
+            NO_DOCKER: "1"
+
+  flake8:
+    executor: generic
+    steps:
+      - checkout:
+          path: ~/project
+      - install_deps
+      - run:
+          command: make flake8
+          environment:
+            NO_DOCKER: "1"
+
+  black-check:
+    executor: generic
+    steps:
+      - checkout:
+          path: ~/project
+      - install_deps
+      - run:
+          command: make black-check
+          environment:
+            NO_DOCKER: "1"
+
+  isort-check:
+    executor: generic
+    steps:
+      - checkout:
+          path: ~/project
+      - install_deps
+      - run:
+          command: make isort-check
+          environment:
+            NO_DOCKER: "1"
+
+  mypy-check:
+    executor: generic
+    steps:
+      - checkout:
+          path: ~/project
+      - restore_mypy_cache
+      - install_deps
+      - run:
+          command: make mypy
+          environment:
+            NO_DOCKER: "1"
+
+      - save_mypy_cache
+
+  pytest:
+    executor: generic_and_pg
+    steps:
+      - checkout:
+          path: ~/project
+      - install_deps
+      - run:
+          name: test using create_all
+          command: make test
+          environment:
+            NO_DOCKER: "1"
+            DB_USE_ALEMBIC: "0"
+      - run:
+          name: test using alembic
+          command: make test
+          environment:
+            NO_DOCKER: "1"
+            DB_USE_ALEMBIC: "1"
+
+  build-and-maybe-deploy:
+    executor: ccc
+    environment:
+      NAME: vuln-mgmt
+      DOCKERFILE_PATH: Dockerfile.prod
+      VALUES_FILE: k8s-values.yml
+    steps:
+      - setup_remote_docker
+      - checkout:
+          path: ~/project
+      - run:
+          name: build, scan, and maybe deploy
+          command: |
+            if [ "$CIRCLE_BRANCH" = "master" ]; then
+              echo On master, deploying
+              export DOCKER_REGISTRY=ecr
+              /publish/bin/publish
+              /deploy/bin/deploy
+            else
+              echo Branch not master, not deploying
+            fi
+
+workflows:
+  version: 2
+  workflow:
+    jobs:
+      - bandit
+      - flake8
+      - black-check
+      - isort-check
+      - mypy-check
+      - pytest
+      - build-and-maybe-deploy:
+          context: org-global
+          requires:
+            - bandit
+            - flake8
+            - black-check
+            - isort-check
+            - mypy-check
+            - pytest

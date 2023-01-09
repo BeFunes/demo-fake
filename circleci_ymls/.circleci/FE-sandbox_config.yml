@@ -1,0 +1,117 @@
+version: 2.1
+
+commands:
+  setup:
+    steps:
+      - checkout
+  login:
+    steps:
+      - run: echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
+
+executors:
+  node:
+    docker:
+      - image: circleci/node:14.17.6
+
+jobs:
+  dependencies:
+    executor: node
+    steps:
+      - setup
+      - run:
+          name: Install Dependencies
+          command: yarn && yarn bootstrap
+      - persist_to_workspace:
+          root: .
+          paths:
+            - node_modules
+            - yarn.lock
+
+  build:
+    executor: node
+    steps:
+      - setup
+      - attach_workspace:
+          at: .
+      - run:
+          name: Build distribution files
+          command: yarn build
+      - persist_to_workspace:
+          root: .
+          paths:
+            - packages
+            - node_modules
+            - yarn.lock
+
+  lint:
+    executor: node
+    steps:
+      - setup
+      - attach_workspace:
+          at: .
+      - run:
+          name: Lint source code
+          command: yarn lint
+
+  chromatic:
+    executor: node
+    steps:
+      - setup
+      - attach_workspace:
+          at: .
+      - run:
+          name: Run Chromatic build
+          command: |
+            if [ "${CIRCLE_BRANCH}" != "main" ];
+            then
+              yarn chromatic
+            else
+              # We know any changes that make it to main *must* have been approved
+              yarn chromatic --auto-accept-changes
+            fi
+
+  publish-release:
+    executor: node
+    steps:
+      - setup
+      - attach_workspace:
+          at: .
+      - login
+      - run:
+          name: Set git user
+          command: |
+            git config --global user.email "$GH_EMAIL"
+            git config --global user.name "$GH_NAME"
+      - run:
+          name: Publish npm Package
+          # Check for the current version in the registry, and if it's not
+          # found, publish it. We know the version is not yet in the registry if
+          # `yarn info` returns no `dist` field. (Also, if `yarn info` returns
+          # an error, it may be because the package has never been published.)
+          command: npx lerna publish --no-verify-access --no-verify-registry --conventional-commits --create-release github --yes --message "New Version [skip ci]"
+
+workflows:
+  test-and-publish:
+    jobs:
+      - dependencies:
+          context: design-system
+      - build:
+          context: design-system
+          requires:
+            - dependencies
+      - lint:
+          context: design-system
+          requires:
+            - dependencies
+      - chromatic:
+          context: design-system
+          requires:
+            - dependencies
+      - publish-release:
+          context: design-system
+          filters:
+            branches:
+              only: main
+          requires:
+            - build
+            - lint

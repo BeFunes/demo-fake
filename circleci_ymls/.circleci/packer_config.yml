@@ -1,0 +1,230 @@
+version: 2.1
+
+orbs:
+  aws-ecr: circleci/aws-ecr@8.1.2
+
+executors:
+  packer:
+    docker:
+      - image: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/ansible:5.7
+        aws_auth:
+          aws_access_key_id: $ECR_AWS_ACCESS_KEY_ID
+          aws_secret_access_key: $ECR_AWS_SECRET_ACCESS_KEY
+    environment:
+      AWS_DEFAULT_REGION: us-east-1
+      GIT_SSH_COMMAND: "ssh -i ~/.ssh/id_rsa_a5dba2428febbd8678d1b982bf677388"
+    working_directory: ~/packer
+  integration:
+    machine:
+      image: ubuntu-2004:current
+      docker_layer_caching: true
+    resource_class: large
+    environment:
+      AWS_ECR_REGISTRY_ID: "183081753049"
+commands:
+  add-galaxy-ssh-keys:
+    steps:
+      - add_ssh_keys:
+          fingerprints:
+            - "a5:db:a2:42:8f:eb:bd:86:78:d1:b9:82:bf:67:73:88"
+jobs:
+  validate-ansible:
+    executor: packer
+    steps:
+      - checkout
+      - add-galaxy-ssh-keys
+      - run:
+          name: Lint Ansible roles
+          working_directory: ~/packer/ansible
+          command: ansible-lint -v
+  validate-packer:
+    executor: packer
+    steps:
+      - checkout
+      - run: 
+          name: Format packer config
+          command: packer fmt -check -diff -recursive .
+      - run:
+          name: Validate packer template
+          command: |
+              packer validate -syntax-only ./cci-amazon-linux-2
+              packer validate -syntax-only ./cci-eks
+              packer validate -syntax-only ./cci-jumphost
+              packer validate -syntax-only ./cci-mongo
+              packer validate ./cci-nomad/nomad.json
+              packer validate ./cci-ubuntu-20.04/ubuntu-20.04.json
+              packer validate -syntax-only ./cci-sre-runner
+  molecule:
+    executor: integration
+    parameters:
+      scenario:
+        type: string
+        default: default
+      role:
+        type: string
+    steps:
+      - checkout
+      - aws-ecr/ecr-login:
+          aws-access-key-id: ECR_AWS_ACCESS_KEY_ID
+          aws-secret-access-key: ECR_AWS_SECRET_ACCESS_KEY
+          region: us-east-1
+      - run:
+          name: Run molecule test
+          environment:
+            ANSIBLE_DOCKER_IMAGE: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/ansible:5.7
+          command: ./scripts/molecule_test.sh "<< parameters.role >>" "<< parameters.scenario >>"
+  build:
+    executor: packer
+    parameters:
+      build_script_path:
+        type: string
+        default: ./scripts/ansible-molecule-build.sh
+      directory:
+        type: string
+      hcl_filename:
+        type: string
+    steps:
+      - checkout
+      - add-galaxy-ssh-keys
+      - attach_workspace:
+          at: ~/packer
+      - run:
+          name: Build << parameters.directory >>
+          command: << parameters.build_script_path >> "<< parameters.directory >>" "<< parameters.hcl_filename >>"
+          no_output_timeout: 30m
+      - store_artifacts:
+          path: manifest-<< parameters.hcl_filename >>.json
+  nomad-build:
+    executor: packer
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/packer
+      - run:
+          name: Build cci-nomad
+          command: ./scripts/secondary-build.sh "cci-nomad" "nomad" "cci-ubuntu-20.04" "ubuntu-20.04"
+      - run:
+          name: AMI Name
+          command: |
+            if [[ ! -f manifest-nomad.json ]]; then
+              echo "manifest-nomad.json does not exist"
+              echo "See previous step output for the AMI id"
+              exit 0
+            fi
+            jq . manifest-nomad.json
+            cat manifest-nomad.json | jq -r '.builds[-1].artifact_id' |  cut -d':' -f2
+      - run:
+          name: AMI identifier for terraform
+          command: |
+            if [[ ! -f manifest-nomad.json ]]; then
+              echo "manifest-nomad.json does not exist"
+              echo "See 'Build cci-nomad' step output for the AMI identifier"
+              exit 0
+            fi
+            echo "cci-nomad-client-${CIRCLE_BUILD_NUM}"
+      - store_artifacts:
+          path: manifest-nomad.json
+  mongo-build:
+    executor: packer
+    parameters:
+      mongodb_version:
+        type: string
+      base_ami_name:
+        type: string
+    steps:
+      - checkout
+      - add-galaxy-ssh-keys
+      - attach_workspace:
+          at: ~/packer
+      - run:
+          name: Build cci-mongo
+          command: ./scripts/mongo-build.sh "<<parameters.base_ami_name>>" "cci-mongo" "mongo" "<<parameters.mongodb_version>>"
+      - store_artifacts:
+          path: manifest-mongo.json
+
+workflows:
+  build-and-deploy:
+    jobs:
+      - validate-ansible:
+          context: org-global
+      - validate-packer:
+          context: org-global
+      - molecule:
+          name: molecule_<< matrix.role >>-<< matrix.scenario >>
+          matrix:
+            parameters:
+              scenario:
+                - lint
+                - default
+                - amazon
+              role:
+                - authorized_keys_puller
+                - cci_runner
+                - cleanup
+                - eks_worker
+                - jumphost
+                - logging
+            exclude:
+              - scenario: amazon
+                role: authorized_keys_puller
+              - scenario: amazon
+                role: cci_runner
+              - scenario: amazon
+                role: eks_worker
+              - scenario: amazon
+                role: jumphost
+          context: org-global
+          requires:
+            - validate-ansible
+            - validate-packer
+      - build:
+          name: amazon-linux-2-build
+          directory: cci-amazon-linux-2
+          hcl_filename: amazon-linux-2
+          context: org-global
+          requires:
+            - molecule
+      - build:
+          name: cci-eks-build
+          directory: cci-eks
+          hcl_filename: cci-eks
+          context: org-global
+          requires:
+            - molecule
+      - build:
+          name: jumphost-build
+          directory: cci-jumphost
+          hcl_filename: jumphost
+          context: org-global
+          requires:
+            - molecule
+      - build:
+          name: ubuntu-20_04-build
+          build_script_path: ./scripts/base-build.sh
+          directory: cci-ubuntu-20.04
+          hcl_filename: ubuntu-20.04
+          context: org-global
+          requires:
+            - validate-packer
+      - nomad-build:
+          context: org-global
+          requires:
+            - ubuntu-20_04-build
+      - mongo-build:
+          context: org-global
+          matrix:
+            parameters:
+              mongodb_version:
+                - "4.0.27"
+                - "4.2.17"
+              base_ami_name:
+                - amzn2-ami-hvm-2.0
+          requires:
+            - molecule
+      - build:
+          name: sre-runner-build
+          directory: cci-sre-runner
+          hcl_filename: cci-sre-runner
+          context: org-global
+          requires:
+            - molecule

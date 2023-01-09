@@ -1,0 +1,101 @@
+version: 2.1
+
+orbs:
+  aws-cli: circleci/aws-cli@2.1.0
+
+workflows:
+  main-workflow:
+    jobs:
+      - lint:
+          context:
+            - dockerhub-readonly
+      - test:
+          context:
+            - dockerhub-readonly
+          requires:
+            - lint
+      - build_and_release:
+          context:
+            - org-global
+            - tugboat-deploys
+            - dockerhub-readonly
+          requires:
+            - test
+          filters:
+            branches:
+              only:
+                - main
+
+executors:
+  default:
+    docker:
+      - image: circleci/go-service:0.1-dev
+        auth:
+          username: $RO_DOCKER_HUB_USERNAME
+          password: $RO_DOCKER_HUB_PASSWORD
+
+jobs:
+  lint:
+    executor: default
+    steps:
+      - setup
+      - run:
+          name: generate
+          command: go generate ./...
+      - run:
+          name: lint
+          command: task lint-ci
+      - store_artifacts:
+          path: test-reports
+
+  test:
+    executor: default
+    steps:
+      - setup
+      - run:
+          name: run tests
+          command: task test-ci
+      - run:
+          name: run helper scripts tests
+          command: task scripts_tests
+      - run:
+          name: run coverage
+          command: task coverage
+      - store_results
+
+  build_and_release:
+    executor: default
+    steps:
+      - setup
+      - run:
+          # aws-cli orb needs unzip which is not present in go-service executor
+          name: Install unzip
+          command: |
+            apt-get update && apt-get install -y unzip
+      - aws-cli/setup:
+          aws-access-key-id: TUGBOAT_AWS_ACCESS_KEY_ID
+          aws-secret-access-key: TUGBOAT_AWS_SECRET_ACCESS_KEY
+          aws-region: TUGBOAT_AWS_DEFAULT_REGION
+      - run:
+          name: release
+          command: task release
+
+commands:
+  setup:
+    steps:
+      - checkout
+      - run: task vendor
+
+  store_results:
+    steps:
+      - run:
+          name: Strip ANSI codes from xunit output
+          when: always
+          command: |
+            # The test output produces ANSI codes, which the XML writer converts into annoying
+            # \0xfffd characters - we'll strip these out to make the XML a bit more readable
+            sed -i 's/�\[[0-9;]*[a-zA-Z]//g' test-reports/*.xml || true
+      - store_artifacts:
+          path: test-reports
+      - store_test_results:
+          path: test-reports

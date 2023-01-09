@@ -1,0 +1,93 @@
+version: 2.1
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+orbs:
+  go: circleci/go@1.7.1
+
+jobs:
+  build:
+    executor:
+      name: go/default
+      tag: "1.18"
+    steps:
+      - checkout
+      - go/mod-download
+      - go/test:
+          covermode: atomic
+          race: true
+      - run:
+          name: Install golangci-lint
+          command: |
+            curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s v1.45.2
+      - run:
+          name: golangci-lint
+          command: ./bin/golangci-lint run
+  dry-run:
+    executor: ccc
+    environment:
+      # NAME is abbreviated for a reason.  Most Circle deployments name their
+      # Helm releases after their charts ('foo-service' -> 'foo-service-v1').
+      # Helm release names are then used to construct Kubernetes resource names.
+      # Kubernetes resource names are limited to 63 characters in length. This
+      # is not ordinarily a problem. In the case of TCS, however, we come very
+      # close to the length limit after expanding all required Kubernetes
+      # CronJobs. See chart/.
+      NAME: tcs
+      IMAGE_NAME: circleci/terraform-certificate-siren
+      NAMESPACE: sre
+      CUSTOM_CHART: chart/terraform-certificate-siren
+      TWISTCLI_DEBUG: true
+      TWISTLOCK_ENFORCE: false
+      DOCKERFILE_PATH: Dockerfile
+    working_directory: /root/terraform-certificate-siren
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /root/terraform-certificate-siren
+      - setup_remote_docker
+      - run: scan
+      - run: /deploy/dry-run
+  publish-and-deploy:
+    executor: ccc
+    environment:
+      # NAME is abbreviated, see comment on dry-run job for details.
+      NAME: tcs
+      IMAGE_NAME: circleci/terraform-certificate-siren
+      NAMESPACE: sre
+      DOCKER_REGISTRY: ecr
+      CUSTOM_CHART: chart/terraform-certificate-siren
+      DOCKERFILE_PATH: Dockerfile
+      TWISTLOCK_ENFORCE: false
+    working_directory: /root/terraform-certificate-siren
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /root/terraform-certificate-siren
+      - setup_remote_docker
+      - run: publish
+      - run: deploy
+
+workflows:
+  version: 2
+  publish-deploy:
+    jobs:
+      - build
+      - dry-run:
+          context: org-global
+          filters:
+            branches:
+              ignore: master
+      - publish-and-deploy:
+          context: org-global
+          requires:
+            - build
+          filters:
+            branches:
+              only: master

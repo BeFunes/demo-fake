@@ -1,0 +1,17 @@
+---
+version: "2.1"
+jobs:
+  build:
+    docker:
+      - image: alpine:3.10
+    steps:
+      - checkout
+      - run: apk add bash maven
+      - run: ./deploy.sh
+
+workflows:
+  version: 2
+  workflow:
+    jobs:
+      - build:
+          context: org-global

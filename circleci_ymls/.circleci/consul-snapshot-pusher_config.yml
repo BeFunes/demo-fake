@@ -1,0 +1,151 @@
+version: 2
+
+jobs:
+
+  build:
+    docker:
+      - image: golang:1.8.3-alpine3.6
+    resource_class: small
+    working_directory: /go/src/github.com/circleci/consul-snapshot-pusher
+
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - v1-glide-vendored-{{ checksum "glide.lock" }}
+
+      - run:
+          name: Install Alpine packages
+          command: |
+            set -x
+
+            retry() {
+              for i in $(seq 5); do
+                set +e
+                $@
+                rc=$?
+                set -e
+                [ "${rc}" -eq 0 ] && return 0
+                sleep 1
+              done
+              return 1
+            }
+
+            retry apk update
+            retry apk add --no-progress \
+              bash \
+              git \
+              glide \
+              make
+
+      - run:
+          name: Install gometalinter
+          command: |
+            go get -u github.com/alecthomas/gometalinter
+            gometalinter --install
+
+      - run:
+          name: Download Go dependencies
+          command: make glide-install
+
+      - run:
+          name: Run linter
+          command: make lint
+
+      - run:
+          name: Run unit tests
+          command: make test
+
+      - run:
+          name: Build consul-snapshot-pusher
+          command: make consul-snapshot-pusher-linux-amd64
+
+      - save_cache:
+          key: v1-glide-vendored-{{ checksum "glide.lock" }}
+          paths:
+            - "vendor"
+
+      - run:
+          name: Pack workspace
+          command: |
+            mkdir -p "workspace"
+            tar cvzf "workspace/build.tar.gz" "build"
+
+      - persist_to_workspace:
+          root: workspace
+          paths:
+            - "build.tar.gz"
+
+  release:
+    docker:
+      - image: alpine:3.6
+    resource_class: small
+    working_directory: /tmp/consul-snapshot-pusher
+
+    steps:
+      - checkout
+
+      - run:
+          name: Install Alpine packages
+          command: |
+            set -x
+
+            retry() {
+              for i in $(seq 5); do
+                set +e
+                $@
+                rc=$?
+                set -e
+                [ "${rc}" -eq 0 ] && return 0
+                sleep 1
+              done
+              return 1
+            }
+
+            retry apk update
+            retry apk add --no-progress \
+              bash \
+              docker \
+              git \
+              make \
+              py2-pip \
+              tar
+
+      - run:
+          name: Install awscli
+          command: pip install awscli
+
+      - attach_workspace:
+          at: "workspace"
+
+      - run:
+          name: Unpack workspace
+          command: |
+            tar xvzf "workspace/build.tar.gz"
+
+      - setup_remote_docker:
+          # alpine 3.6 ships with docker-17.05.0.
+          version: 17.05.0-ce
+
+      - run:
+          name: Build container
+          command: make container
+
+      - run:
+          name: Push container
+          command: scripts/cci-push-ecr
+
+workflows:
+  version: 2
+
+  build_release:
+    jobs:
+      - build
+      - release:
+          context: org-global
+          requires:
+            - build
+          filters:
+            branches:
+              only: master

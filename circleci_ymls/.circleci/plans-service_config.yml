@@ -1,0 +1,495 @@
+version: 2.1
+
+references:
+  ccc_image: &ccc_image
+    circleci/command-convenience:0.1
+
+  clojure_image: &clojure_image
+    circleci/clojure-service:0.6-dev
+
+jobs:
+  # No-op job to provide a dependency which always succeeds
+  no-op:
+    working_directory: /root/plans-service
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: plans-service
+          DOCKERFILE_PATH: server.Dockerfile
+          DOCKER_REGISTRY: none
+    steps:
+      - run: echo "no-op completed"
+
+  build-and-test:
+    resource_class: large
+    docker:
+      - image: *clojure_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+      - image: rabbitmq:3.6-management-alpine
+      - image: postgres:12.5-alpine
+        environment:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: plans_service
+          POSTGRES_HOST_AUTH_METHOD: trust
+    working_directory: /root/plans-service
+    steps:
+      - checkout
+
+      - run:
+          name: Making sure we do not spit PII accidentally
+          command: scripts/piifind -p "billing-detail|account-details" .
+
+      # Checkouts can result in false positives; if you make a change to the
+      # client but don't bump the version number in the server's project.clj
+      # then the CI run will pass, but it will fail in production after the
+      # deploy goes thru. This disables checkouts on all builds.
+      - run:
+          name: Disable checkouts
+          command: rm -rf server/checkouts
+
+      - restore_cache:
+          keys:
+            - v5-plans-svc-jars-{{ checksum "server/project.clj" }}-{{ checksum "client/project.clj" }}
+
+      - attach_workspace:
+          at: /root/plans-service
+
+      - run:
+          name: Wait for Postgres
+          command: dockerize -wait tcp://localhost:5432 -timeout 1m
+
+      - run:
+          name: Run migrations
+          # the sleep seems keeping 'database "plans_service" does not exist' error from happening
+          command: sleep 3 && scripts/run-migrations.sh
+
+      - run:
+          name: Wait for RabbitMQ
+          command: dockerize -wait tcp://localhost:15672 -timeout 1m
+
+      # In case of emergency, uncomment this and comment out the one below
+      # - run:
+      #     name: Emergency deploy bypass
+      #     command: lein uberjar
+
+      - run:
+          name: Run server linting and (non-external) tests, and then create uberjar
+          command: |
+            lein do lint, test --plugin profiling --plugin junit-xml --junit-xml-file target/test-results/results.xml, uberjar
+          working_directory: /root/plans-service/server
+          environment:
+            POSTGRESQL__PLANS_SERVICE__URI: jdbc:postgresql://localhost/plans_service?user=postgres
+            POSTGRESQL__PLANS_SERVICE_RO_0__URI: jdbc:postgresql://localhost/plans_service?user=postgres
+
+      - run:
+          # Do this so we can cleanly persist_to_workspace
+          name: Clean server target and move uberjar
+          command: |
+            mv target/uberjar/plans-service-*-standalone.jar ./plans-service-standalone.jar
+            lein clean
+            mkdir -p target/uberjar
+            mv plans-service-standalone.jar target/uberjar
+          working_directory: /root/plans-service/server
+
+      - persist_to_workspace:
+          root: server/target
+          paths:
+            - uberjar/plans-service-standalone.jar
+
+      - run:
+          name: Run client linting and tests
+          command: lein do lint, test --plugin profiling --plugin junit-xml --junit-xml-file target/test-results/results.xml
+          working_directory: /root/plans-service/client
+
+      - save_cache:
+          key: v5-plans-svc-jars-{{ checksum "server/project.clj" }}-{{ checksum "client/project.clj" }}
+          paths:
+            - /root/.m2
+
+      - store_test_results:
+          path: server/target/test-results
+
+  test-container-build:
+    working_directory: /root/plans-service
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: plans-service
+          DOCKERFILE_PATH: server.Dockerfile
+          DOCKER_REGISTRY: none
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /root/plans-service/server/target
+      - setup_remote_docker
+      - run: publish
+      - store_artifacts:
+          path: ccc-image-scan-results
+
+  check-schema:
+    working_directory: /root/plans-service
+    docker:
+      - image: *clojure_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+      - image: postgres:12.5-alpine
+        environment:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: plans_service
+          POSTGRES_HOST_AUTH_METHOD: trust
+    steps:
+      - checkout
+      - run:
+          name: Add Postgres Debian repository
+          command: |
+            echo "deb http://apt.postgresql.org/pub/repos/apt/ buster-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
+              && curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add -
+      - run:
+          name: Download PostgreSQL 12.5 client
+          command: |
+            apt-get update
+            apt-get install -y postgresql-client-12 make
+      - restore_cache:
+          keys:
+            - v5-plans-svc-jars-{{ checksum "server/project.clj" }}-{{ checksum "client/project.clj" }}
+      - attach_workspace:
+          at: /root/plans-service
+      - run:
+          name: Wait for Postgres
+          command: dockerize -wait tcp://localhost:5432 -timeout 1m
+      - run:
+          name: Run migrations
+          # the sleep seems keeping 'database "plans_service" does not exist' error from happening
+          command: sleep 3 && scripts/run-migrations.sh
+      - run:
+          name: Dump plans-service schema
+          command: |
+            env PG_DUMP_COMMAND="pg_dump --host=localhost" \
+              DATABASE="plans_service" \
+              make schema-after.sql
+      - run:
+          name: Check plans-service schema.sql accounts for migrations
+          command: |
+            # If the `diff` exit code is not zero, the schema.sql file is
+            # out-of date. Read https://github.com/circleci/plans-service/tree/master/migrator#creating-a-migration
+            # for instructions on creating migrations.
+            diff schema.sql schema-after.sql
+
+  deploy-migrator:
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: plans-service-migrator
+          DOCKERFILE_PATH: migrator.Dockerfile
+          DOCKER_REGISTRY: ecr
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/plans-service-migrator
+          VALUES_FILE: migrator/k8s-values.yaml
+          NAMESPACE: monetization
+    working_directory: /root/plans-service
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          command: publish
+      - run:
+          command: deploy
+      - store_artifacts:
+          path: ccc-image-scan-results
+
+  deploy-client:
+    docker:
+      - image: circleci/clojure:lein-2.8.1
+    working_directory: ~/plans-service
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - v2-plans-client-{{ checksum "client/project.clj" }}
+            - v2-plans-client-
+
+      - save_cache:
+          key: v2-plans-client-{{ checksum "client/project.clj" }}
+          paths:
+            - ~/.m2
+
+      - run:
+          name: Deploy plans-client
+          working_directory: ~/plans-service/client
+          command: lein deploy circle-s3
+
+  dry-run-deploy-service:
+    working_directory: /root/plans-service
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: plans-service
+          DOCKERFILE_PATH: server.Dockerfile
+          DOCKER_REGISTRY: ecr
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/plans-service
+          VALUES_FILE: server/k8s-values.yaml
+          RELEASE_VERSION: v2
+          NAMESPACE: monetization
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /root/plans-service/server/target
+      - setup_remote_docker
+      - run: scan
+      - run: /deploy/dry-run
+
+  deploy-service:
+    working_directory: /root/plans-service
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: plans-service
+          DOCKERFILE_PATH: server.Dockerfile
+          DOCKER_REGISTRY: ecr
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/plans-service
+          VALUES_FILE: server/k8s-values.yaml
+          RELEASE_VERSION: v2
+          NAMESPACE: monetization
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /root/plans-service/server/target
+      - setup_remote_docker
+      - run: publish
+      - run: deploy
+      - store_artifacts:
+          path: ccc-image-scan-results
+
+  # Check if a branch is behind the main branch
+  check-outdated:
+    working_directory: /root/plans-service
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: plans-service
+          DOCKERFILE_PATH: server.Dockerfile
+          DOCKER_REGISTRY: none
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /root/plans-service/server/target
+      - run: /deploy/scripts/check-outdated.sh
+
+  # push your feature branch to the "canary" branch to get it deployed to a single pod:
+  # git push origin mybranch:canary
+  # run `helm delete plans-service-v2-canary` on kubectl when you have
+  # confirmed your change is safe (or not) to kill it
+  deploy-canary:
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: plans-service
+          DOCKERFILE_PATH: server.Dockerfile
+          DOCKER_REGISTRY: ecr
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/plans-service
+          VALUES_FILE: server/k8s-canary.yaml
+          RELEASE_VERSION: v2-canary
+          NAMESPACE: monetization
+    working_directory: /root/plans-service
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /root/plans-service/server/target
+      - setup_remote_docker
+      - run:
+          command: publish
+      - run:
+          command: deploy
+      - store_artifacts:
+          path: ccc-image-scan-results
+
+  # push your feature branch to a branch starting with "production-backfill/" to
+  # have it run a single pod which will not get interrupted by deploys and will
+  # not be connected to GRPC or rabbitmq but will have DB access.
+  # run `helm delete plans-service-v2-backfill` on kubectl when the job
+  # has run to completion or you've decided to abort it.
+  deploy-backfill:
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: plans-service
+          DOCKERFILE_PATH: server.Dockerfile
+          DOCKER_REGISTRY: ecr
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/plans-service
+          VALUES_FILE: server/k8s-backfill.yaml
+          RELEASE_VERSION: v2-backfill
+          NAMESPACE: monetization
+    working_directory: /root/plans-service
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /root/plans-service/server/target
+      - setup_remote_docker
+      - run:
+          command: publish
+      - run:
+          command: deploy
+      - store_artifacts:
+          path: ccc-image-scan-results
+
+  deploy-usage-notification-consumer:
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: plans-usage-notification-queue-consumer
+          DOCKERFILE_PATH: server.Dockerfile
+          DOCKER_REGISTRY: ecr
+          IMAGE_NAME: circleci/plans-service
+          VALUES_FILE: server/k8s-usage-notification-consumer.yaml
+          RELEASE_VERSION: v2
+          NAMESPACE: monetization
+    working_directory: /root/plans-service
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /root/plans-service/server/target
+      - setup_remote_docker
+      - when:
+          condition:
+            not: # exclusive rather than inclusive to protect against branches being renamed
+              equal: ["master", << pipeline.git.branch >>]
+          steps:
+            - run:
+                name: Configure canary
+                working_directory: server
+                command: |
+                  # These override default values from CCC and the executor.
+                  echo "export RELEASE_VERSION=canary" >> "${BASH_ENV}"
+                  echo "export ROLLBAR_ENVIRONMENT=canary" >> "${BASH_ENV}"
+                  echo "export VALUES_FILE=server/k8s-usage-notification-consumer-canary.yaml" >> "${BASH_ENV}"
+                  /deploy/merge-values k8s-usage-notification-consumer.yaml k8s-usage-notification-consumer-canary-overrides.yaml > k8s-usage-notification-consumer-canary.yaml
+      - run:
+          command: publish
+      - run:
+          command: deploy
+      - store_artifacts:
+          path: ccc-image-scan-results
+
+workflows:
+  version: 2
+  build-and-deploy:
+    jobs:
+      - no-op:
+          context: org-global
+      - check-outdated:
+          context: org-global
+          filters:
+            branches:
+              only: canary
+      - build-and-test:
+          context: org-global
+          requires:
+            # A no-op dependency is required or build-and-test will run only if check-outdated is
+            - no-op
+            - check-outdated
+      - check-schema:
+          context: org-global
+      - test-container-build:
+          context: org-global
+          requires:
+            - build-and-test
+          filters:
+            branches:
+              ignore:
+                - master
+                - canary
+      - deploy-migrator:
+          name: deploy-migrator
+          context: org-global
+          requires:
+            - build-and-test
+          filters:
+            branches:
+              only: master
+      - deploy-service:
+          context: org-global
+          requires:
+            - deploy-migrator
+          filters:
+            branches:
+              only: master
+      - dry-run-deploy-service:
+          context: org-global
+          requires:
+            - build-and-test
+          filters:
+            branches:
+              ignore: master
+      - deploy-client:
+          context: org-global
+          requires:
+            - build-and-test
+          filters:
+            branches:
+              only: master
+      - deploy-canary:
+          context: org-global
+          requires:
+            - build-and-test
+          filters:
+            branches:
+              only: canary
+      - deploy-backfill:
+          context: org-global
+          requires:
+            - build-and-test
+          filters:
+            branches:
+              only: /production-backfill/.*/
+      - deploy-usage-notification-consumer:
+          context: org-global
+          requires:
+            - deploy-migrator
+          filters:
+            branches:
+              only:
+                - master
+      - deploy-usage-notification-consumer:
+          name: deploy-usage-notification-consumer-canary
+          context: org-global
+          requires:
+            - build-and-test
+          filters:
+            branches:
+              only:
+                - canary-usage-notification-consumer

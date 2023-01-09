@@ -1,0 +1,23 @@
+version: 2.1
+setup: true
+orbs:
+  path-filtering: circleci/path-filtering@0.0.2
+workflows:
+  generate-config:
+    jobs:
+      - path-filtering/filter:
+          base-revision: master
+          config-path: .circleci/continue-config.yml
+          mapping: |
+            py/projects/data_platform_contracts/.* run-contracts-testing-jobs true
+            py/projects/data_warehouse_anonymization_service/.* run-anonymization-service-jobs true
+            py/projects/extract_service/.* run-extract-service-jobs true
+            py/projects/processed_test_results_backfill_service/.* run-processed-test-results-backfill-jobs true
+            py/projects/sli_reporter/.* run-sli-reporter-jobs true
+            py/projects/snowflake_loader/.* run-snowflake-loader-jobs true
+            py/projects/data_platform_slackbot/.* run-data-platform-slackbot-jobs true
+            py/projects/data_deletion_service_request_handler/.* run-dds-request-service-jobs true
+            migrations/.* run-snowflake-migrations true
+            sources/.* run-all-builds true
+            snowplow/.* run-snowplow true
+            py/tools/fivetran_user_management/.* run-fivetran-user-management-jobs true

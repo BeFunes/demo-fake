@@ -1,0 +1,275 @@
+version: 2.1
+
+setup: true
+
+orbs:
+  shellcheck: circleci/shellcheck@3.1.1
+  continuation: circleci/continuation@0.3.0
+
+parameters:
+  is_scheduled:
+    type: boolean
+    default: false
+  partitions:
+    type: string
+    default: ''
+  run_all_partitions:
+    type: boolean
+    default: false
+
+variables: # The scripts/find-changed-partitions.sh uses this variables
+  ci_module_partitions:
+    - modules
+    - cci/modules
+    - ccid/modules
+  ci_partitions: &ci_partitions
+    - cci/base
+    - cci/circleci-dev
+    - cci/data-lifecycle-manager
+    - cci/dns
+    - cci/eks/cluster
+    - cci/eks/cluster-apps
+    - cci/eks/nodes
+    - cci/eks/velero
+    - cci/elasticache
+    - cci/glue
+    - cci/graylog/cerebro
+    - cci/graylog/elasticsearch
+    - cci/graylog/mongodb
+    - cci/graylog/worker
+    - cci/iam
+    - cci/infra
+    - cci/kinesis
+    - cci/moss-bot
+    - cci/s3-tf-state
+    - cci/socks-proxy
+    - cci/sre-runner
+    - cci/ssh
+    - cci/terraform-certificate-siren
+    - cci/vamp
+    - cci/web-ui
+    - ccid/base
+    - cciexec/iam
+    - ccisec/base
+    - ccisec/iam
+    - ccisec/infra
+    - legacy/us-east-1
+    - vamp/base
+    - vamp/dns
+    - vamp/eks/dev/cluster
+    - vamp/eks/dev/velero
+    - vamp/eks/prod/cluster
+    - vamp/eks/prod/velero
+    - vamp/rds/dev
+    - vamp/rds/prod
+
+workflows:
+  find-drift:
+    when: << pipeline.parameters.is_scheduled >>
+    jobs:
+      - find-drift:
+          name: find-drift_<< matrix.partition >>
+          context:
+            - dockerhub-readonly
+            - terraform
+          matrix:
+            parameters:
+              partition: *ci_partitions
+
+      - trigger-fix-drift:
+          requires:
+            - find-drift
+          context:
+            - dockerhub-readonly
+            - terraform
+
+  find-partition:
+    unless: << pipeline.parameters.is_scheduled >>
+    jobs:
+      - shellcheck/check
+      - shfmt
+      - test:
+          context: dockerhub-readonly
+      - tf-validate:
+          context: dockerhub-readonly
+      - find-partition:
+          context:
+            - dockerhub-readonly
+          requires:
+            - shellcheck/check
+            - shfmt
+            - test
+            - tf-validate
+
+executors:
+  terraform:
+    docker:
+      - image: circleci/terraform:1.1.9-circle3
+        auth:
+          username: $RO_DOCKER_HUB_USERNAME
+          password: $RO_DOCKER_HUB_PASSWORD
+    working_directory: ~/src
+    shell: /bin/bash -eo pipefail -o nounset
+    environment:
+      TF_VAR_vault_endpoint: https://cci-prod-vault-a.circleci.com:8200
+
+commands:
+  install-python-packages:
+    steps:
+      - restore_cache:
+          keys:
+            - v3-terraform-cci-pipenv-{{ checksum "terraform/cci/Pipfile.lock" }}
+      - restore_cache:
+          keys:
+            - v1-terraform-cciexec-pipenv-{{ checksum "terraform/cciexec/Pipfile.lock" }}
+      - restore_cache:
+          keys:
+            - v1-terraform-ccisec-pipenv-{{ checksum "terraform/ccisec/Pipfile.lock" }}
+      - restore_cache:
+          keys:
+            - v1-terraform-vamp-pipenv-{{ checksum "terraform/vamp/Pipfile.lock" }}
+
+      - run:
+          name: Install Python dependencies
+          working_directory: ~/src/terraform
+          command: |
+            declare -a partitions=("cci" "cciexec" "ccisec" "vamp")
+            for partition in "${partitions[@]}"; do
+              make -C "$partition" check-deps-pipenv
+            done
+      - save_cache:
+          key: v3-terraform-cci-pipenv-{{ checksum "terraform/cci/Pipfile.lock" }}
+          paths:
+            - "terraform/cci/.venv"
+      - save_cache:
+          key: v1-terraform-cciexec-pipenv-{{ checksum "terraform/cciexec/Pipfile.lock" }}
+          paths:
+            - "terraform/cciexec/.venv"
+      - save_cache:
+          key: v1-terraform-ccisec-pipenv-{{ checksum "terraform/ccisec/Pipfile.lock" }}
+          paths:
+            - "terraform/ccisec/.venv"
+      - save_cache:
+          key: v1-terraform-vamp-pipenv-{{ checksum "terraform/vamp/Pipfile.lock" }}
+          paths:
+            - "terraform/vamp/.venv"
+  login-to-vault:
+    steps:
+      - run:
+          name: Login to Vault
+          command: vault write -address=https://cci-prod-vault-a.circleci.com:8200 -field=token auth/circleci/login role=infrastructure jwt="${CIRCLE_OIDC_TOKEN}" > ~/.vault-token
+
+jobs:
+  test:
+    executor: terraform
+    steps:
+      - checkout
+      - install-python-packages
+      - run:
+          name: pylint
+          command: |
+            set -o nounset
+            cd terraform/cci
+            make scripts-lint
+      - run:
+          name: pytest
+          command: |
+            set -o nounset
+            cd terraform/cci
+            make scripts-test
+      - run:
+          name: Generate fake SSH keys
+          command: |
+            set -o nounset
+            ssh-keygen -N '' -f ~/.ssh/fake-key
+      - run:
+          name: terraform fmt
+          command: |
+            set -o nounset
+            terraform fmt -check -diff -recursive
+      - run:
+          name: validate SSH authorized_keys
+          command: ./scripts/validate-authorized-keys.sh terraform/cci/ssh/files/*
+  tf-validate:
+    executor: terraform
+    parallelism: 10
+    steps:
+      - checkout
+      - run:
+          name: terraform validate
+          command: |
+            set -o nounset
+            terraform_makefiles=$(find terraform -mindepth 3 -name GNUmakefile | circleci tests split)
+            echo $terraform_makefiles
+            for terraform_makefile in $terraform_makefiles; do
+              make -C "$(dirname "${terraform_makefile}")" validate
+            done
+  shfmt:
+    docker:
+      - image: alpine:3.15
+    steps:
+      - checkout
+      - run:
+          name: install shfmt
+          command: |
+            apk add shfmt
+      - run:
+          name: check shell formatting
+          command: |
+            shfmt -l -d .
+  find-drift:
+    resource_class: small
+    circleci_ip_ranges: true
+    parameters:
+      partition:
+        type: string
+    executor: terraform
+    steps:
+      - checkout
+      - install-python-packages
+      - login-to-vault
+      - run:
+          name: Running Terraform Plan
+          environment:
+            TFNOTIFY_LOG: /tmp/tfnotify.log
+            PARTITION: terraform/<< parameters.partition >>
+            TF_PLAN_SCHEDULED: "true"
+            PLAN_FILE: /tmp/terraform/<< parameters.partition >>/terraform_plan
+          command: |
+            mkdir -p /tmp/terraform/<< parameters.partition >>
+            ./scripts/run-terraform.sh
+      - persist_to_workspace:
+          root: /tmp
+          paths:
+            - terraform
+
+  trigger-fix-drift:
+    resource_class: small
+    executor: terraform
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /tmp
+      - run:
+          name: Generate fix-drift configuration
+          working_directory: /tmp
+          command: ~/src/scripts/generate-fix-drift-config.sh
+      - continuation/continue: # Call Continue API to trigger fix-drift workflow
+          configuration_path: /tmp/generated-fix-drift.yml
+
+  find-partition:
+    resource_class: small
+    environment:
+      PARTITIONS: << pipeline.parameters.partitions >>
+      RUN_ALL_PARTITIONS: << pipeline.parameters.run_all_partitions >>
+    executor: terraform
+    steps:
+      - checkout
+      - run: 
+          name: Find changed partitions and generate parameters
+          command: ~/src/scripts/find-changed-partitions.sh
+          environment:
+            PARAMETERS_JSON_PATH: /tmp/pipeline-parameters.json
+      - continuation/continue: # Call Continue API to trigger test-and-deploy workflow
+          configuration_path: /home/terraform/src/.circleci/test-and-deploy.yml
+          parameters: /tmp/pipeline-parameters.json

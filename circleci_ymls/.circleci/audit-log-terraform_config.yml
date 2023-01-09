@@ -1,0 +1,47 @@
+version: 2.1
+orbs:
+  terraform: circleci/terraform@3.0.0
+  slack: circleci/slack@4.5.3
+
+jobs:
+  apply:
+    executor: terraform/default
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Install slack orb dependencies
+          command: apk --no-cache add curl jq
+      - terraform/apply
+      - slack/notify:
+          event: fail
+          channel: C01UK1XTNUF # admin-tooling-alerts
+          mentions: '@admin-tooling-engineering'
+          template: basic_fail_1
+
+workflows:
+  test-and-deploy:
+    jobs:
+      - terraform/fmt:
+          checkout: true
+          recursive: true
+      - terraform/validate:
+          checkout: true
+          context: audit-log-terraform
+          requires:
+            - terraform/fmt
+      - terraform/plan:
+          checkout: true
+          persist-workspace: true
+          context: audit-log-terraform
+          requires:
+            - terraform/validate
+      - apply:
+          context:
+            - audit-log-terraform
+            - admin-tooling-slack-notifications
+          filters:
+            branches:
+              only: main
+          requires:
+            - terraform/plan

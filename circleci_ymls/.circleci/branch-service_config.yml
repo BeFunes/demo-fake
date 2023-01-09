@@ -1,0 +1,305 @@
+version: 2.1
+
+orbs:
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+
+parameters:
+  # Sent from Vamp when an automated rollback is requested.
+  rollback_version:
+    type: string
+    default: ""
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+  tests:
+    docker:
+      - image: circleci/clojure-service:java11-0.7-dev
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+      - image: rabbitmq:3.7.11-management-alpine
+      - image: redis:4.0.2-alpine
+      - image: postgres:11.8
+        environment:
+          POSTGRES_USER: branches
+          POSTGRES_DB: branches
+          POSTGRES_HOST_AUTH_METHOD: trust
+
+commands:
+  with_cache:
+    parameters:
+      steps: { type: steps }
+    steps:
+      - run:
+          name: Generate Cache Checksum
+          command: find . -name 'project.clj' | sort | xargs cat > /tmp/cache_seed
+      - restore_cache:
+          keys:
+            - maven-{{ checksum ".circleci/config.yml" }}-{{ checksum "/tmp/cache_seed" }}
+            - maven-{{ checksum ".circleci/config.yml" }}-
+            - maven-
+      - steps: << parameters.steps >>
+      - save_cache:
+          key: maven-{{ checksum ".circleci/config.yml" }}-{{ checksum "/tmp/cache_seed" }}
+          paths: ["~/.m2"]
+
+  run_migrations:
+    steps:
+      - run:
+          name: Run Migrations
+          command: |
+            flyway -n -X -url=jdbc:postgresql://localhost:5432/branches?user=branches -connectRetries=60 -locations=filesystem:flyway migrate
+
+jobs:
+  uberjar:
+    docker:
+      - image: circleci/clojure-service:java11-0.7-dev
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    steps:
+      - checkout
+      - with_cache:
+          steps:
+            - run:
+                name: Build Uberjar
+                command: |
+                  lein uberjar
+                  cp -v target/branch-service-*-standalone.jar target/branch-service-standalone.jar
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target/branch-service-standalone.jar
+  check_schema:
+    docker:
+      - image: circleci/clojure-service:java11-0.7-dev
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+      - image: postgres:11.8
+        environment:
+          POSTGRES_USER: branches
+          POSTGRES_DB: branches
+          POSTGRES_HOST_AUTH_METHOD: trust
+    steps:
+      - checkout
+      - run_migrations
+      - run:
+          name: Generate schema.sql
+          environment:
+            PG_DUMP_COMMAND: pg_dump -h localhost
+            DATABASE: branches
+            PGUSER: branches
+          command: |
+            apt-get update && apt-get install -y postgresql-client
+            flyway/dump_schema.sh
+      - store_artifacts:
+          path: flyway/schema.sql
+      - run:
+          name: Make sure schema.sql is up to date
+          command: |
+            CHANGED="$(git diff HEAD -- flyway/schema.sql)"
+            if [ -n "$CHANGED" ]; then
+              echo "schema.sql is out of date!"
+              echo "Either:"
+              echo "- run flyway/dump_schema.sh, or"
+              echo "- download the schema.sql artifact"
+              exit 1;
+            fi
+
+  test:
+    executor: tests
+    steps:
+      - checkout
+      - run_migrations
+      - with_cache:
+          steps:
+            - run: ./bin/kaocha
+      - store_test_results:
+          path: build
+
+  coverage:
+    executor: tests
+    steps:
+      - checkout
+      - run_migrations
+      - with_cache:
+          steps:
+            - run: ./bin/kaocha --plugin cloverage
+      - store_artifacts:
+          path: target/coverage
+
+  publish-migrator:
+    executor:
+      name: ccc
+    environment:
+      NAME: branch-service-migrator
+      DOCKER_REGISTRY: all
+      MIGRATIONS_SQL_PATH: flyway/sql
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: publish
+      - run: mv docker_image.tag docker_image.migrator.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.migrator.tag
+
+  deploy-migrator:
+    executor:
+      name: ccc
+    environment:
+      NAME: branch-service-migrator
+      VALUES_FILE: deploy/migrator_values.yml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: mv docker_image.migrator.tag docker_image.tag
+      - run: deploy
+
+  publish:
+    executor:
+      name: ccc
+    environment:
+      NAME: branch-service
+      DOCKER_REGISTRY: all
+      DEPLOY_CLOJURE_JARFILE: target/branch-service-standalone.jar
+      DEPLOY_CLOJURE_JARFILE_JAVA_VERSION: 11
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run: publish
+      - run: mv docker_image.tag docker_image.service.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.service.tag
+
+  deploy:
+    executor:
+      name: ccc
+    environment:
+      NAME: branch-service
+      VALUES_FILE: deploy/service_values.yml
+      PIPELINE_ID: << pipeline.id >>
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run: mv docker_image.service.tag docker_image.tag
+      - run: deploy
+
+  canary:
+    executor:
+      name: ccc
+    environment:
+      NAME: branch-service
+      DOCKER_REGISTRY: all
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/branch-service
+      DEPLOY_TYPE: helm
+      DEPLOY_CLOJURE_JARFILE: target/branch-service-standalone.jar
+      DEPLOY_CLOJURE_JARFILE_JAVA_VERSION: 11
+      RELEASE_VERSION: v1-canary
+      VALUES_FILE: deploy/canary.yml
+      PIPELINE_ID: << pipeline.id >>
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run: /deploy/merge-values deploy/service_values.yml deploy/canary_override.yml > deploy/canary.yml
+      - run: publish
+      - run: deploy
+
+  rollback_job:
+    executor:
+      name: ccc
+    steps:
+      - checkout
+      - run: ./deploy/rollback.sh << pipeline.parameters.rollback_version >>
+
+
+
+
+workflows:
+  rollback:
+    when: << pipeline.parameters.rollback_version >>
+    jobs:
+      - rollback_job:
+          context: org-global
+
+  deploy:
+    when:
+      not: << pipeline.parameters.rollback_version >>
+    jobs:
+      - test:
+          context: org-global
+      - coverage:
+          context: org-global
+      - uberjar:
+          context: org-global
+      - check_schema:
+          context: org-global
+      - canary:
+          context: org-global
+          requires:
+            - test
+            - uberjar
+            - check_schema
+          filters:
+            branches:
+              only: canary
+      - publish:
+          context: org-global
+          requires:
+            - test
+            - uberjar
+            - check_schema
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-\d\..+/
+      - deploy:
+          context: org-global
+          requires:
+            - publish
+          filters:
+            branches:
+              only: master
+      - publish-migrator:
+          context: org-global
+          requires:
+            - test
+            - uberjar
+            - check_schema
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-\d\..+/
+      - deploy-migrator:
+          context: org-global
+          requires:
+            - publish-migrator
+          filters:
+            branches:
+              only: master
+      - scotty-orb/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          promotion_component_list: "circleci/branch-service circleci/branch-service-migrator"
+          requires:
+            - publish
+            - publish-migrator

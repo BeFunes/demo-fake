@@ -1,0 +1,739 @@
+version: 2.1
+setup: << pipeline.parameters.setup >>
+
+references:
+  twistlock-enforce: &twistlock-enforce
+    TWISTLOCK_ENFORCE: "false"
+  clojure-image: &clojure-image
+    circleci/clojure-service:0.8-dev
+  ccc-image: &ccc-image
+    circleci/command-convenience:0.1
+
+  hub-auth: &hub-auth
+    auth:
+      username: $DOCKER_HUB_USER
+      password: $DOCKER_HUB_PASSWORD
+
+  project: &project
+    description: Name of the project
+    type: enum
+    enum:
+      - dispatcher
+      - schedulerer
+      - output-processor
+
+  image-name: &image-name
+    description: Docker image name
+    type: enum
+    enum:
+      - picard-dispatcher
+      - schedulerer
+      - output-processing
+
+parameters:
+  setup:
+    type: boolean
+    default: true
+  dispatcher:
+    type: boolean
+    default: false
+  output-processor:
+    type: boolean
+    default: false
+  schedulerer:
+    type: boolean
+    default: false
+
+commands:
+  notify_failing_master:
+    steps:
+      - slack/notify:
+          channel: execution-alerts
+          branch_pattern: master
+          event: fail
+          template: basic_fail_1
+
+  checkout-and-deps:
+    parameters:
+      project: *project
+    steps:
+      - checkout:
+          path: ~/picard-services
+      - with_cache:
+          project: <<parameters.project>>
+          steps:
+            - run:
+                name: Download dependencies
+                command: lein deps
+
+  checkout-and-attach:
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/picard-services
+
+  test-and-store-results:
+    steps:
+      - run:
+          name: Run tests
+          command: lein test
+      - store_test_results:
+          path: target/test-results
+      - store_artifacts:
+          path: target/test-results
+  lint:
+    steps:
+      - run:
+          name: Check code formatting
+          command: lein cljfmt check
+      - run:
+          name: Lint
+          command: lein clj-kondo --lint . --parallel
+
+  with_cache:
+    description: wrap the supplied steps in a project-specific cache
+    parameters:
+      project: *project
+      steps:
+        type: steps
+    steps:
+      - restore_cache:
+          key: v4-jars-<<parameters.project>>-{{ checksum "~/picard-services/<<parameters.project>>/project.clj" }}
+      - steps: << parameters.steps >>
+      - save_cache:
+          key: v4-jars-<<parameters.project>>-{{ checksum "~/picard-services/<<parameters.project>>/project.clj" }}
+          paths:
+            - ~/.m2
+
+  merge-helm-package:
+    parameters:
+      project: *project
+      image-name: *image-name
+      from:
+        type: string
+        default: branch
+      sub-release:
+        description: Name of the type of sub release and the values file to merge in
+        type: enum
+        enum:
+          - canary
+          - alternate
+    steps:
+      - run: mkdir -p artifacts
+      - run:
+          name: Create <<parameters.sub-release>> helm package from <<parameters.from>>
+          environment:
+            NAME: <<parameters.project>>
+            IMAGE_NAME: "circleci/<<parameters.image-name>>"
+            CUSTOM_CHART: charts/<<parameters.project>>
+            RELEASE_VERSION: <<parameters.sub-release>>
+          command: |
+            /deploy/merge-values charts/<<parameters.project>>/values.yaml charts/<<parameters.project>>/<<parameters.sub-release>>.yaml > merged.yaml
+            mv merged.yaml charts/<<parameters.project>>/values.yaml
+            /deploy/dry-run | tee artifacts/<<parameters.from>>-<<parameters.sub-release>>-helm-package.txt
+
+orbs:
+  codecov: codecov/codecov@1.0.5
+  path-filtering: circleci/path-filtering@0.0.2
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+  slack: circleci/slack@4.4.4
+
+executors:
+  ccc:
+    docker:
+      - image: *ccc-image
+        <<: *hub-auth
+    working_directory: ~/picard-services
+
+jobs:
+  test-schedulerer:
+    docker:
+      - image: *clojure-image
+        <<: *hub-auth
+      - image: circleci/nomad:1.2.0-88-857e447
+        command: [start, agent, -dev]
+    working_directory: ~/picard-services/schedulerer
+    steps:
+      - checkout-and-deps:
+          project: schedulerer
+      - lint
+      - test-and-store-results
+      - run:
+          name: Install shellcheck
+          command: sudo apt-get update && sudo apt-get install -y shellcheck
+          when: always
+      - run:
+          name: shellcheck
+          command: shellcheck resources/nomad-job-command.sh
+          when: always
+      - notify_failing_master
+
+  testing-dispatcher:
+    parameters:
+      pg-version:
+        type: string
+        default: "12.4"
+    docker:
+      - image: *clojure-image
+        <<: *hub-auth
+      - image: circleci/mongo:4.2
+        name: mongodb
+        environment:
+          MONGO_INITDB_ROOT_USERNAME: testmongouser
+          MONGO_INITDB_ROOT_PASSWORD: opensesame
+          MONGO_INITDB_DATABASE: admin
+      - image: circleci/postgres:<< parameters.pg-version >>-ram
+        name: postgres
+        environment:
+          POSTGRES_USER: circle
+          POSTGRES_DB: circle_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+    working_directory: ~/picard-services/dispatcher
+    environment:
+      CIRCLE_CONTEXTS_SERVICE_GRPC_HOST: "willnotresolve"
+      CIRCLE_CONTEXTS_SERVICE_GRPC_PORT: "12345"
+      CIRCLE_ENV: "development"
+      REDIS__CACHE__URI: "redis://redis:6379/11"
+    steps:
+      - checkout-and-deps:
+          project: dispatcher
+      - run:
+          name: Link Secrets
+          command: ln -s ~/picard-services/dev-resources ~/picard-services/dispatcher/dev-resources
+      - lint
+      - test-and-store-results
+      - notify_failing_master
+
+  testing-output-processor:
+    parameters:
+      pg-version:
+        type: string
+        default: "12.4"
+    resource_class: xlarge
+    docker:
+      - image: *clojure-image
+        <<: *hub-auth
+      - image: circleci/mongo:4.2
+        environment:
+          MONGO_INITDB_ROOT_USERNAME: testmongouser
+          MONGO_INITDB_ROOT_PASSWORD: opensesame
+          MONGO_INITDB_DATABASE: admin
+      - image: circleci/postgres:<< parameters.pg-version >>-ram
+        environment:
+          POSTGRES_USER: root
+          POSTGRES_HOST_AUTH_METHOD: trust
+      - image: circleci/redis:5.0.0-alpine
+      - image: rabbitmq:3.8.2-alpine
+      - image: circleci/fileserverd:0.2.36-793dbf2
+        command: fileserverd
+        environment:
+          FILESERVER_USERNAME: test
+          FILESERVER_PASSWORD: password
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+    working_directory: ~/picard-services/output-processor
+    steps:
+      - checkout-and-deps:
+          project: output-processor
+      - run:
+          name: Test set-up for output-processor
+          command: |
+            set -x
+
+            sudo apt-get update
+            sudo mkdir -p /usr/share/man/man{1,2,3,4,5,6,7,8,9}
+            sudo apt-get install -y openssh-server postgresql-client
+
+            echo 127.0.0.1 circlehost | sudo tee -a /etc/hosts
+            echo 127.0.0.1 circlehost-artifacts | sudo tee -a /etc/hosts
+            echo 127.0.0.1 postgres redis mongodb rabbitmq fileserver | sudo tee -a /etc/hosts
+
+            sudo -u root createuser -h localhost --superuser ubuntu
+            sudo -u root createuser -h localhost --superuser circle
+            sudo createdb -h localhost circle
+
+            mkdir -p ~/.ssh
+            ssh-keygen -y -f ~/.ssh/id_rsa > ~/.ssh/id_rsa.pub
+            cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+            cat ~/.ssh/id_rsa.pub
+
+            sudo service ssh start
+            ssh-keyscan localhost >> ~/.ssh/known_hosts
+            ssh localhost echo hi
+
+            java -version
+      - lint
+      - test-and-store-results
+      - notify_failing_master
+
+  uberjar:
+    parameters:
+      project: *project
+    docker:
+      - image: *clojure-image
+        <<: *hub-auth
+    working_directory: ~/picard-services/<<parameters.project>>
+    steps:
+      - checkout:
+          path: ~/picard-services
+      - with_cache:
+          project: <<parameters.project>>
+          steps:
+            - run:
+                name: Build uberjar
+                command: ~/picard-services/scripts/build-uberjar ~/picard-services/<<parameters.project>>
+      - persist_to_workspace:
+          root: target
+          paths:
+            - <<parameters.project>>-standalone.jar
+      - store_artifacts:
+          path: target/<<parameters.project>>-standalone.jar
+      - notify_failing_master
+
+  helm-package-dry-run:
+    parameters:
+      image-name: *image-name
+      project: *project
+      render-alternate:
+        description: True if the project has an alternate values file for chart rendering
+        type: boolean
+        default: false
+      helm_release:
+        type: string
+        default: "canary"
+    environment:
+      RELEASE_VERSION: <<parameters.helm_release>>
+      NAME: <<parameters.project>>
+      IMAGE_NAME: "circleci/<<parameters.image-name>>"
+      CUSTOM_CHART: charts/<<parameters.project>>
+    executor: ccc
+    steps:
+      - checkout
+      - run: mkdir -p artifacts
+      - run:
+          name: Create helm package
+          command: |
+            /deploy/dry-run | tee artifacts/helm-package.txt
+      - merge-helm-package:
+          project: <<parameters.project>>
+          from: branch
+          sub-release: canary
+          image-name: <<parameters.image-name>>
+      - when:
+          condition: <<parameters.render-alternate>>
+          steps:
+            - merge-helm-package:
+                project: <<parameters.project>>
+                from: branch
+                sub-release: alternate
+                image-name: <<parameters.image-name>>
+      - run:
+          name: Checkout master
+          command: |
+            git reset --hard
+            git checkout origin/master
+
+      - run:
+          name: Create helm package from master
+          command: |
+            /deploy/dry-run | tee artifacts/master-helm-package.txt
+      - merge-helm-package:
+          project: <<parameters.project>>
+          from: master
+          sub-release: canary
+          image-name: <<parameters.image-name>>
+      - run:
+          name: Diff production chart against master
+          command: set +eo pipefail; git diff --no-index artifacts/master-helm-package.txt artifacts/helm-package.txt | grep -v 'Successfully packaged chart' | tee artifacts/helm-package-diff.txt
+      - run:
+          name: Diff canary chart against master
+          command: set +eo pipefail; git diff --no-index artifacts/master-canary-helm-package.txt artifacts/branch-canary-helm-package.txt | grep -v 'Successfully packaged chart' | tee artifacts/canary-helm-package-diff.txt
+      - when:
+          condition: <<parameters.render-alternate>>
+          steps:
+            - merge-helm-package:
+                project: <<parameters.project>>
+                from: master
+                sub-release: alternate
+                image-name: <<parameters.image-name>>
+            - run:
+                name: Diff alternate chart against master
+                command: set +eo pipefail; git diff --no-index artifacts/master-alternate-helm-package.txt artifacts/branch-alternate-helm-package.txt | grep -v 'Successfully packaged chart' | tee artifacts/alternate-helm-package-diff.txt
+      - store_artifacts:
+          path: artifacts
+
+  docker-image:
+    parameters:
+      project: *project
+      dockerfile:
+        description: Path to custom Dockerfile
+        type: string
+        default: ''
+      image-name: *image-name
+      clojure-main-class:
+        type: string
+        default: ''
+    executor: ccc
+    working_directory: ~/picard-services/<<parameters.project>>
+    environment:
+      <<: *twistlock-enforce
+      NAME: <<parameters.image-name>>
+      IMAGE_NAME: "circleci/<<parameters.image-name>>"
+      DOCKERFILE_PATH: <<parameters.dockerfile>>
+      # Only one of these should be used
+      CLOJURE_MAIN_CLASS: <<parameters.clojure-main-class>>
+      DEPLOY_CLOJURE_JARFILE: <<^ parameters.dockerfile >> target/<<parameters.project>>-standalone.jar <</ parameters.dockerfile >>
+    steps:
+      - checkout:
+          path: ~/picard-services/
+      - attach_workspace:
+          at: ~/picard-services/<<parameters.project>>/target
+      - setup_remote_docker
+      - run:
+          name: Build, scan and maybe publish image
+          command: |
+            set -x
+            if [[ "$CIRCLE_BRANCH" = "master" || "$CIRCLE_BRANCH" =~ ^canary\/.* || "$CIRCLE_BRANCH" = "alternate" || "$CIRCLE_BRANCH" =~ ^server-.* ]]; then
+              export DOCKER_REGISTRY=all
+            else
+              # this is how we tell CCC not to actually publish
+              export DOCKER_REGISTRY=none
+            fi
+
+            publish
+      - store_artifacts:
+          path: ccc-image-scan-results
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.tag
+      - notify_failing_master
+
+  deploy:
+    parameters:
+      project: *project
+      image-name: *image-name
+      helm_release:
+        type: string
+        default: "canary"
+      rollbar-environment:
+        type: enum
+        default: "canary"
+        enum:
+          - production
+          - canary
+          - alternate
+      rollbar-access-token:
+        type: env_var_name
+    description: Deploy <<parameters.project>>
+    executor: ccc
+    environment:
+      CUSTOM_CHART: charts/<<parameters.project>>
+      IMAGE_NAME: circleci/<<parameters.image-name>>
+      NAME: <<parameters.project>>
+      RELEASE_VERSION: <<parameters.helm_release>>
+      ROLLBAR_ENVIRONMENT: <<parameters.rollbar-environment>>
+
+      # `deploy` will automatically create a server-manifest unstable
+      # test run. It uses the value of CIRCLE_PROJECT_REPONAME to tell
+      # server-manifest which containers have changed.
+      # In the picard-services case, CIRCLE_PROJECT_REPONAME as set by
+      # CircleCI does not identify the service so must be overridden.
+      CIRCLE_PROJECT_REPONAME: picard-services-<<parameters.project>>
+    steps:
+      - checkout-and-attach
+      - when:
+          condition:
+            equal: [canary, <<parameters.helm_release>>]
+          steps:
+            merge-helm-package:
+              project: <<parameters.project>>
+              sub-release: canary # it would be good to pass in <<parameters.helm_release>> but validate fails (it would ignore the or conditions)
+              image-name: <<parameters.image-name>>
+      - when:
+          condition:
+            equal: [alternate, <<parameters.helm_release>>]
+          steps:
+            merge-helm-package:
+              project: <<parameters.project>>
+              sub-release: alternate
+              image-name: <<parameters.image-name>>
+      - run:
+          name: Helm Deploy
+          command: |
+            ROLLBAR_ACCESS_TOKEN="${<<parameters.rollbar-access-token>>}" deploy
+      - notify_failing_master
+
+  canary-teardown:
+    parameters:
+      project: *project
+    executor: ccc
+    steps:
+      - checkout
+      - run: scripts/teardown-canary.sh "<<parameters.project>>-canary"
+
+workflows:
+  version: 2
+  build_and_test_schedulerer:
+    when: << pipeline.parameters.schedulerer >>
+    jobs:
+      - test-schedulerer:
+          context: org-global
+      - uberjar:
+          name: uberjar-schedulerer
+          project: schedulerer
+          context: org-global
+          requires:
+            - test-schedulerer
+      - helm-package-dry-run:
+          context: org-global
+          project: schedulerer
+          image-name: schedulerer
+          name: helm-package-dry-run-schedulerer
+          helm_release: v1
+      - docker-image:
+          name: docker-image-schedulerer
+          image-name: schedulerer
+          project: schedulerer
+          context: org-global
+          requires:
+            - uberjar-schedulerer
+      - deploy:
+          name: deploy-schedulerer
+          project: schedulerer
+          image-name: schedulerer
+          helm_release: v1
+          rollbar-environment: production
+          rollbar-access-token: SCHEDULERER_ROLLBAR_ACCESS_TOKEN
+          context: org-global
+          requires:
+            - docker-image-schedulerer
+            - helm-package-dry-run-schedulerer
+          filters:
+            branches:
+              only: master
+
+      - scotty-orb/promote-to-server:
+          name: promote-to-server-schedulerer
+          context: org-global
+          promotion_component_list: "circleci/schedulerer"
+          requires:
+            - docker-image-schedulerer
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-\d\..+/
+
+      - deploy:
+          name: deploy-schedulerer-canary
+          project: schedulerer
+          image-name: schedulerer
+          rollbar-access-token: SCHEDULERER_ROLLBAR_ACCESS_TOKEN
+          context: org-global
+          requires:
+            - docker-image-schedulerer
+            - helm-package-dry-run-schedulerer
+          filters:
+            branches:
+              only: canary/schedulerer
+      - approve-canary-teardown:
+          type: approval
+          requires:
+            - deploy-schedulerer-canary
+      - canary-teardown:
+          name: canary-teardown-schedulerer
+          context: org-global
+          project: schedulerer
+          requires:
+            - approve-canary-teardown
+
+  build_and_test_dispatcher:
+    when: << pipeline.parameters.dispatcher >>
+    jobs:
+      - testing-dispatcher:
+          name: test-dispatcher
+          context: org-global
+      - uberjar:
+          name: uberjar-dispatcher
+          project: dispatcher
+          context: org-global
+          requires:
+            - test-dispatcher
+      - helm-package-dry-run:
+          context: org-global
+          project: dispatcher
+          image-name: picard-dispatcher
+          name: helm-package-dry-run-dispatcher
+          helm_release: v1.5
+      - docker-image:
+          name: docker-image-dispatcher
+          project: dispatcher
+          image-name: picard-dispatcher
+          clojure-main-class: picard-dispatcher.init
+          context: org-global
+          requires:
+            -  uberjar-dispatcher
+      - deploy:
+          name: deploy-dispatcher
+          project: dispatcher
+          image-name: picard-dispatcher
+          helm_release: v1.5
+          rollbar-environment: production
+          rollbar-access-token: DISPATCHER_ROLLBAR_ACCESS_TOKEN
+          context: org-global
+          requires:
+            - docker-image-dispatcher
+            - helm-package-dry-run-dispatcher
+          filters:
+            branches:
+              only: master
+      - scotty-orb/promote-to-server:
+          name: promote-to-server-dispatcher
+          context: org-global
+          promotion_component_list: "circleci/picard-dispatcher"
+          requires:
+            - docker-image-dispatcher
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-\d\..+/
+
+      - deploy:
+          name: deploy-dispatcher-canary
+          project: dispatcher
+          image-name: picard-dispatcher
+          rollbar-access-token: DISPATCHER_ROLLBAR_ACCESS_TOKEN
+          context: org-global
+          requires:
+            - docker-image-dispatcher
+            - helm-package-dry-run-dispatcher
+          filters:
+            branches:
+              only: canary/dispatcher
+      - approve-canary-teardown:
+          type: approval
+          requires:
+            - deploy-dispatcher-canary
+      - canary-teardown:
+          name: canary-teardown-dispatcher
+          context: org-global
+          project: dispatcher
+          requires:
+            - approve-canary-teardown
+
+  build_and_test_output_processor:
+    when: << pipeline.parameters.output-processor >>
+    jobs:
+      - testing-output-processor:
+          name: test-output-processor
+          context: org-global
+      - uberjar:
+          name: uberjar-output-processor
+          project: output-processor
+          context: org-global
+          requires:
+            - test-output-processor
+      - helm-package-dry-run:
+          context: org-global
+          project: output-processor
+          image-name: output-processing
+          name: helm-package-dry-run-output-processor
+          render-alternate: true
+          helm_release: v1.4
+      - docker-image:
+          name: docker-image-output-processor
+          project: output-processor
+          context: org-global
+          image-name: output-processing
+          dockerfile: Dockerfile
+          requires:
+            - uberjar-output-processor
+      - deploy:
+          name: deploy-output-processor
+          project: output-processor
+          image-name: output-processing
+          helm_release: v1.4
+          rollbar-environment: production
+          rollbar-access-token: OUTPUT_PROCESSOR_ROLLBAR_ACCESS_TOKEN
+          context: org-global
+          requires:
+            - docker-image-output-processor
+            - helm-package-dry-run-output-processor
+          filters:
+            branches:
+              only: master
+
+      - scotty-orb/promote-to-server:
+          name: promote-to-server-output-processing
+          context: org-global
+          promotion_component_list: "circleci/output-processing"
+          requires:
+            - docker-image-output-processor
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-\d\..+/
+
+      - deploy:
+          name: deploy-output-processor-alternate
+          project: output-processor
+          image-name: output-processing
+          helm_release: alternate
+          rollbar-environment: alternate
+          rollbar-access-token: OUTPUT_PROCESSOR_ROLLBAR_ACCESS_TOKEN
+          context: org-global
+          requires:
+            - docker-image-output-processor
+            - helm-package-dry-run-output-processor
+          filters:
+            branches:
+              only: alternate
+      - deploy:
+          name: deploy-output-processor-canary
+          project: output-processor
+          image-name: output-processing
+          rollbar-access-token: OUTPUT_PROCESSOR_ROLLBAR_ACCESS_TOKEN
+          context: org-global
+          requires:
+            - docker-image-output-processor
+          filters:
+            branches:
+              only: canary/output-processor
+      - approve-canary-teardown:
+          type: approval
+          requires:
+            - deploy-output-processor-canary
+      - canary-teardown:
+          name: canary-teardown-output-processor
+          context: org-global
+          project: output-processor
+          requires:
+            - approve-canary-teardown
+  setup:
+    when: << pipeline.parameters.setup >>
+    jobs:
+      # the path-filtering/filter job determines which pipeline
+      # parameters to update.
+      - path-filtering/filter:
+          # 3-column, whitespace-delimited mapping. One mapping per
+          # line:
+          # <regex path-to-test> <parameter-to-set> <value-of-pipeline-parameter>
+          mapping: |
+            .* setup false
+            (charts/)?output-processor/.* output-processor true
+            (charts/)?dispatcher/.* dispatcher true
+            (charts/)?schedulerer/.* schedulerer true
+            .circleci/.* output-processor true
+            .circleci/.* dispatcher true
+            .circleci/.* schedulerer true
+          base-revision: master
+          # this is the path of the configuration we should trigger once
+          # path filtering and pipeline parameter value updates are
+          # complete. In this case, we are using the parent dynamic
+          # configuration itself.
+          config-path: .circleci/config.yml

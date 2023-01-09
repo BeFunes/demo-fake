@@ -1,0 +1,147 @@
+version: 2.1
+
+orbs:
+  codecov: codecov/codecov@1.1.3
+
+workflows:
+  version: 2
+  build-and-deploy:
+    jobs:
+      - build_cache
+      - test:
+          requires:
+            - build_cache
+      - codecov:
+          requires:
+            - build_cache
+      - deploy:
+          context: org-global
+          requires:
+            - test
+          filters:
+            branches:
+              only: main
+
+# Docker dependencies for test jobs
+docker__test: &docker__test
+  docker:
+    - image: clojure:lein-2.8.1-alpine
+    - image: postgres:9.6
+      environment:
+        POSTGRES_USER: test
+        POSTGRES_PASSWORD: test
+        POSTGRES_DB: test_db
+    - image: mannimal/dsig-cci
+    - image: mannimal/elk-cci
+
+wait_for_postgres: &wait_for_postgres
+  run:
+    name: Wait for postgres
+    command: /root/service-utils-bin/dockerize -wait tcp://localhost:5432 -timeout 1m
+
+# Environment expected by test jobs for things like `lein test`
+environment__test: &environment__test
+  environment:
+    DATABASE_URL: postgresql://localhost/test_db?user=test&pass=test
+    STATSD__HOST: localhost
+    STATSD__PORT: 8125
+    TIMBRE__LEVEL: :warn
+    TIMBRE__LOGSTASH__HOST: localhost
+    TIMBRE__LOGSTASH__PORT: 5044
+    TIMBRE__ANSI_ENABLED: 'true'
+    HEALTH_CHECK_PORT: 3141
+    PROJECT__GROUP: service-utils
+    PROJECT__ARTIFACT: service-utils
+    POSTGRES_JDBC_URL: postgres://test:test@localhost:5432/test_db
+    ROLLBAR__TOKEN: f22728670d0a4b5fa9d5a8a87f418cce
+    K8S_POD_NAME: somepod
+    K8S_POD_NAMESPACE: default
+    ROLLBAR__ENVIRONMENT: testing
+    NREPL_PORT: 3142
+
+# The step to restore the dependencies from the cache.
+restore_deps: &restore_deps
+  restore_cache:
+    keys:
+      - deps-v0.0.0.1-{{ checksum "project.clj" }}
+      - deps-v0.0.0.1-
+
+jobs:
+  build_cache:
+    docker:
+      - image: clojure:alpine
+    working_directory: /root/service-utils
+    steps:
+      - checkout
+      - *restore_deps
+
+      - run:
+          name: Download dependencies
+          command: lein deps
+
+      - run:
+          name: Install dockerize
+          working_directory: /root/service-utils-bin
+          command: |
+            mkdir -p /root/service-utils-bin
+            rm -vf /root/service-utils-bin/*
+            wget https://github.com/jwilder/dockerize/releases/download/$DOCKERIZE_VERSION/dockerize-linux-amd64-$DOCKERIZE_VERSION.tar.gz
+            tar -xzvf dockerize-linux-amd64-$DOCKERIZE_VERSION.tar.gz
+          environment:
+            DOCKERIZE_VERSION: v0.3.0
+
+      - save_cache:
+          key: deps-v0.0.0.1-{{ checksum "project.clj" }}
+          paths:
+            - /root/.m2
+            - /root/service-utils-bin
+
+  test:
+    working_directory: /root/service-utils
+    steps:
+      - checkout
+      - *restore_deps
+      - *wait_for_postgres
+
+      - run:
+          name: Run Tests
+          command: lein cci-test
+          <<: *environment__test
+
+      - store_test_results:
+          path: target/test-results
+
+      - store_artifacts:
+          path: target/test-results
+          destination: raw-test-output
+    <<: *docker__test
+
+  codecov:
+    working_directory: /root/service-utils
+    steps:
+      - checkout
+      - *restore_deps
+      - *wait_for_postgres
+
+      - run:
+          name: Run code coverage
+          command: lein cloverage --ns-exclude-regex dev --ns-exclude-regex user --codecov
+          <<: *environment__test
+
+      - store_artifacts:
+          path: target/coverage
+
+      - codecov/upload
+
+    <<: *docker__test
+
+  deploy:
+    docker:
+      - image: clojure:alpine
+    working_directory: /root/service-utils
+    steps:
+      - checkout
+      - *restore_deps
+      - run:
+          name: Deploy service-utils
+          command: lein deploy circle-s3

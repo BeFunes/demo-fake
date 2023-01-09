@@ -1,0 +1,23 @@
+version: 2
+
+jobs:
+  deploy:
+    machine:
+      enabled: true
+
+    steps:
+      - checkout
+      - run:
+          name: create and deploy helm package
+          command: ./deploy-helm.sh
+
+workflows:
+  version: 2
+
+  deploy-on-change-to-master:
+    jobs:
+      - deploy:
+          context: org-global
+          filters:
+            branches:
+              only: master

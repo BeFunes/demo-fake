@@ -1,0 +1,86 @@
+version: 2.1
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+jobs:
+  build:
+    working_directory: ~/repo
+    docker:
+      - image: cimg/node:17.5
+    steps:
+      - checkout
+      - restore_cache:
+          key: dependency-cache-{{ checksum "yarn.lock" }}
+      - run:
+          name: Install Dependencies
+          command: yarn install
+      - save_cache:
+          key: dependency-cache-{{ checksum "yarn.lock" }}
+          paths:
+            - ./node_modules
+      - run:
+          name: Run tests
+          command: yarn test
+      - run:
+          name: Build
+          command: yarn build
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .next
+            - node_modules
+  scan:
+    executor:
+      name: ccc
+    environment:
+      NAME: production-readiness-review-ui
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: ecr
+      VALUES_FILE: k8s-values.yaml
+      NAMESPACE: sre
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: scan
+
+  publish-deploy:
+    executor:
+      name: ccc
+    environment:
+      NAME: production-readiness-review-ui
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: ecr
+      VALUES_FILE: k8s-values.yaml
+      NAMESPACE: sre
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: publish
+      - run: deploy
+workflows:
+  build-publish-deploy:
+    jobs:
+      - build
+      - scan:
+          context: org-global
+          requires:
+            - build
+          filters:
+            branches:
+              ignore: main
+      - publish-deploy:
+          context: org-global
+          requires:
+            - build
+          filters:
+            branches:
+              only:
+                - main

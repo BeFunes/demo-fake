@@ -1,0 +1,421 @@
+version: 2.1
+
+orbs:
+  docker: circleci/docker@1.7.0
+  slack: circleci/slack@4.6.2
+  terraform: circleci/terraform@3.0.0
+
+executors:
+  integration:
+    machine:
+      image: ubuntu-2004:current
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $RO_DOCKER_HUB_USERNAME
+          password: $RO_DOCKER_HUB_PASSWORD
+  ccc-publish:
+    environment:
+      NAME: api-gateway
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: dockerhub
+      MAJOR_VERSION: 0.1
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+  authn-circle:
+    docker:
+      - image: circleci/node:17.0.1-bullseye-browsers
+  golangci-lint:
+    docker:
+      - image: golangci/golangci-lint:v1.43.0
+
+commands:
+  install-tools:
+    steps:
+      - run:
+          name: Install Helm
+          command: |
+            # Install Helm
+            curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3
+            chmod 700 get_helm.sh
+            ./get_helm.sh
+      - run:
+          name: Install Minikube
+          command: |
+            curl -fLO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+            sudo install minikube-linux-amd64 /usr/local/bin/minikube
+  install-cluster:
+    steps:
+      - run:
+          # TODO: Temporary diagnostic for possible machine-provisioner issue:
+          # https://circleci.slack.com/archives/CKCV4LZ8V/p1649086620666179
+          name: Wait for Docker (temporary)
+          command: timeout 2m bash -c 'until docker stats --no-stream; do sleep 1; done'
+      - run:
+          name: Start Minikube cluster, Kong, and Kong plugins
+          command: |
+            ./start-local-dev.sh
+  run-tests:
+    steps:
+      - run:
+          name: Run Tests
+          command: |
+            source ./start-tunnel.sh
+            cd tests
+            go test
+  slack-notify-on-fail:
+    steps:
+      - slack/notify:
+          branch_pattern: main
+          channel: api-infra-alerts
+          event: fail
+          template: basic_fail_1
+
+jobs:
+  terraform-lint:
+    executor:
+      name: terraform/default
+      tag: '1.0.11'
+    steps:
+      - checkout
+      - terraform/fmt:
+          path: ./alerts
+      - terraform/validate:
+          path: ./alerts
+  terraform-plan:
+    executor:
+      name: terraform/default
+      tag: '1.0.11'
+    steps:
+      - checkout
+      - terraform/plan:
+          path: ./alerts
+  terraform-apply:
+    executor:
+      name: terraform/default
+      tag: '1.0.11'
+    steps:
+      - checkout
+      - terraform/apply:
+          path: ./alerts
+      - slack-notify-on-fail
+  golang-lint:
+    executor: golangci-lint
+    steps:
+      - checkout
+      - run:
+          name: Run golangci-lint
+          command: |
+            cd tests
+            golangci-lint run -v --concurrency 2 --enable gofmt
+      - run:
+          name: Lint hostnames for trailing period
+          command: |
+            ./helpers/scripts/fqdn-lint.sh
+  test-install-fresh:
+    executor: integration
+    steps:
+      - checkout
+      - install-tools
+      - install-cluster
+      - run-tests
+      - slack-notify-on-fail
+  # This could be temporarily disabled if the tests are failing on `origin/main`
+  # and we need to fix it with a release to production.
+  test-upgrade-previous:
+    executor: integration
+    steps:
+      - checkout
+      - install-tools
+      - run:
+          name: Checkout parent commit
+          command: |
+            if [ "<< pipeline.git.branch >>" = "main" ]; then
+              git checkout --detach origin/main~1
+            else
+              git checkout --detach origin/main
+            fi
+      - install-cluster
+      - run:
+          name: Checkout latest commit
+          command: git checkout << pipeline.git.revision >>
+      - install-cluster
+      - run-tests
+      - slack-notify-on-fail
+  test-custom-plugins:
+    executor: integration
+    steps:
+      - checkout
+      - run:
+          name: Install kong-pongo
+          command: |
+            git clone https://github.com/Kong/kong-pongo.git
+            mkdir -p ~/.local/bin
+            ln -s $(realpath kong-pongo/pongo.sh) ~/.local/bin/pongo
+      - run:
+          name: Run kong-pongo
+          command: |
+            # add previously linked pongo to path
+            PATH=$PATH:~/.local/bin
+            cd custom-plugins
+            ./run-tests.sh
+      - slack-notify-on-fail
+  test-chart-templates:
+    executor: ccc
+    steps:
+      - checkout
+      - run: helm plugin install https://github.com/quintush/helm-unittest --version 0.2.8
+      - run: helm unittest --helm3 api-gateway-helm
+      - slack-notify-on-fail
+  test-chart-deps:
+    executor: ccc
+    steps:
+      - checkout
+      - run:
+          name: Helm add Kong repo
+          command: |
+            helm repo add kong https://charts.konghq.com
+            helm repo update
+      - run:
+          name: Check that deps in Chart.yaml, Chart.lock, and charts/ all match
+          working_directory: api-gateway-helm
+          command: |
+            helm dependency build
+            git diff --exit-code
+      - slack-notify-on-fail
+  prepare-chart:
+    executor: ccc
+    steps:
+      - checkout
+      - run:
+          name: Template CCC specifics in Chart.yaml
+          command: |
+            sed --in-place 's/^name: .*/name: "\<\<chart_name\>\>"/' api-gateway-helm/Chart.yaml
+            sed --in-place 's/^version: .*/version: "\<\<chart_version\>\>"/' api-gateway-helm/Chart.yaml
+      - run:
+          name: Merge values.yaml files
+          working_directory: api-gateway-helm
+          command: |
+            mv values.yaml values-base.yaml
+            /deploy/merge-values values-base.yaml values-prod.yaml <(../checksum-plugins.sh) > values.yaml
+      - persist_to_workspace:
+          root: .
+          paths:
+            - api-gateway-helm
+      - slack-notify-on-fail
+  deploy-dry-run:
+    executor: ccc
+    environment:
+      NAME: api-gateway
+      NAMESPACE: kong
+      CUSTOM_CHART: api-gateway-helm
+    steps:
+      - checkout
+      - run:
+          name: Upgrade CRDs (dry-run)
+          command: |
+            export AWS_ACCESS_KEY_ID="${EKS_AWS_ACCESS_KEY_ID}"
+            export AWS_SECRET_ACCESS_KEY="${EKS_AWS_SECRET_ACCESS_KEY}"
+            ./deploy-crds.sh --dry-run=server
+      - attach_workspace:
+          at: .
+      - run: /deploy/dry-run
+  deploy:
+    executor: ccc
+    environment:
+      NAME: api-gateway
+      NAMESPACE: kong
+      CUSTOM_CHART: api-gateway-helm
+      # can be set to an arbitrary value, but must be a string
+      ENABLE_WAIT_FOR_DEPLOY: 'true'
+    steps:
+      - checkout
+      - run:
+          name: Upgrade CRDs
+          # Sets the variables to be used to later run steps as well
+          command: |
+            echo 'export AWS_ACCESS_KEY_ID="${EKS_AWS_ACCESS_KEY_ID}"' >> $BASH_ENV
+            echo 'export AWS_SECRET_ACCESS_KEY="${EKS_AWS_SECRET_ACCESS_KEY}"' >> $BASH_ENV
+            ./deploy-crds.sh
+      - attach_workspace:
+          at: .
+      - run:
+          name: Create honeycomb.io marker
+          environment:
+            # HONEYCOMB_API_TOKEN set in api-infra-deploy context
+            HONEYCOMB_DATASET: distributed-traces
+          # this script won't fail as a non-marker != failed deploy
+          command: ./helpers/honeycomb_marker.sh
+      - run:
+          name: Deploy with CONTAINER_VERSION
+          command: |
+            export CONTAINER_VERSION="${MAJOR_VERSION:-0.1}.${CIRCLE_BUILD_NUM}-$(git rev-parse --short HEAD)"
+            deploy
+      - run:
+          name: Install yq
+          command: |
+            wget https://github.com/mikefarah/yq/releases/download/v4.23.1/yq_linux_amd64 -O /usr/bin/yq && chmod +x /usr/bin/yq
+      - run:
+          name: Confirm old pods are removed before proceeding
+          command: ./helpers/scripts/prod-test-guard.sh
+      - slack-notify-on-fail
+  generate-session-auth-cookie:
+    executor:
+      name: authn-circle
+    steps:
+      - checkout
+      - run:
+          name: Generate session auth cookie
+          command: |
+            cd helpers/session-auth-cookie
+            npm install
+            # generate session cookie; this will be persisted so saved in project root
+            node generate-session-auth-cookie.js > ../../kong_session_auth_cookie.txt
+      - persist_to_workspace:
+          root: .
+          paths:
+            - kong_session_auth_cookie.txt
+      - slack-notify-on-fail
+  test-against-prod:
+    executor:
+      name: integration
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Run tests against production
+          command: |
+            # set prod vars for testing against prod
+            # KONG_CIRCLE_TOKEN variable is set via the api-infra-circle-account context
+            export KONG_HOST=gateway-test.circleci.com
+            export KONG_HOST_BFF=bff.circleci.com
+            export KONG_CLIENT_IP=$(curl --silent --ipv4 icanhazip.com)
+            export KONG_INSECURE=false
+            export KONG_SESSION_AUTH_COOKIE=$(cat kong_session_auth_cookie.txt)
+            export KONG_CSRF_TOKEN=$(curl https://circleci.com/api/v2/csrf -H "Cookie:$KONG_SESSION_AUTH_COOKIE" | jq ."csrf_token" -re)
+            cd tests
+            go test
+      - slack-notify-on-fail
+  publish-server-plugins:
+    executor:
+      name: ccc-publish
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: publish
+      - slack-notify-on-fail
+
+workflows:
+  version: 2
+  test-and-deploy:
+    jobs:
+      - terraform-lint:
+          context:
+            - api-infra-alerts
+      - terraform-plan:
+          context:
+            - api-infra-alerts
+          requires:
+            - terraform-lint
+          filters:
+            branches:
+              ignore: main
+      - terraform-apply:
+          context:
+            - api-infra-alerts
+            - slack-notifications
+          requires:
+            - terraform-lint
+          filters:
+            branches:
+              only: main
+      - golang-lint
+      - test-install-fresh:
+          context:
+            - slack-notifications
+          requires:
+            - golang-lint
+      - test-upgrade-previous:
+          context:
+            - slack-notifications
+          requires:
+            - golang-lint
+      - test-custom-plugins:
+          context:
+            - slack-notifications
+      - test-chart-templates:
+          context:
+            - dockerhub-readonly
+            - slack-notifications
+      - test-chart-deps:
+          context:
+            - dockerhub-readonly
+            - slack-notifications
+      - prepare-chart:
+          context:
+            - dockerhub-readonly
+            - slack-notifications
+      - deploy-dry-run:
+          context:
+            # Privileged user for managing and using CRDS
+            - api-infra-deploy
+            - dockerhub-readonly
+            - slack-notifications
+          requires:
+            - prepare-chart
+            - test-chart-templates
+            - test-chart-deps
+          filters:
+            branches:
+              ignore: main
+      - deploy:
+          context:
+            # Privileged user for managing and using CRDS
+            - api-infra-deploy
+            - dockerhub-readonly
+            - slack-notifications
+          requires:
+            - prepare-chart
+            - test-chart-templates
+            - test-chart-deps
+            - test-custom-plugins
+            - test-install-fresh
+            - test-upgrade-previous
+          filters:
+            branches:
+              only: main
+      - generate-session-auth-cookie:
+          context:
+            # contexts needed for session auth generation
+            - api-infra-circle-account
+            - slack-notifications
+          requires:
+            - deploy
+          filters:
+            branches:
+              only: main
+      - test-against-prod:
+          context:
+             # contexts needed for circle-token
+            - api-infra-circle-account
+            - slack-notifications
+          requires:
+            - generate-session-auth-cookie
+          filters:
+            branches:
+              only: main
+      - publish-server-plugins:
+          context:
+            # Privileged user for deploying Dockerhub image
+            - org-global
+            - slack-notifications
+          requires:
+            - test-against-prod
+          filters:
+            branches:
+              only: main

@@ -1,0 +1,102 @@
+version: 2.1
+
+run-install-alpine-dev-pkgs: &run-install-alpine-dev-pkgs
+  name: Install dev packages
+  command: |
+    set -x
+    retry() {
+      for i in $(seq 5); do
+        set +e; "$@"; rc=$?; set -e
+        [ "${rc}" -eq 0 ] && return 0
+        sleep 1
+      done
+      return 1
+    }
+    retry apk -v --no-progress --no-cache add \
+      bash \
+      docker \
+      git \
+      make \
+      openssh-client \
+      py2-pip \
+      tar
+
+jobs:
+  build-container:
+    docker:
+      - image: alpine:3.7
+    working_directory: ~/project
+    environment:
+      VERSION_CACHE: dist/VERSION
+    steps:
+      - run:
+          << : *run-install-alpine-dev-pkgs
+      - checkout
+      - setup_remote_docker:
+          # alpine 3.7 ships with docker-17.12.
+          version: 17.11.0-ce
+      - run: make container
+      - run: ./scripts/docker-save-image dist/container.tar.gz
+      - persist_to_workspace:
+          root: .
+          paths:
+            - dist
+
+  push-container:
+    docker:
+      - image: alpine:3.7
+    working_directory: ~/project
+    environment:
+      VERSION_CACHE: dist/VERSION
+    resource_class: small
+    steps:
+      - run:
+          << : *run-install-alpine-dev-pkgs
+      - run: pip install awscli
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker:
+          # alpine 3.7 ships with docker-17.12.
+          version: 17.11.0-ce
+      - run: ./scripts/docker-load-image dist/container.tar.gz
+      - run: ./scripts/docker-push-image
+
+  scan-container:
+      docker:
+        - image: circleci/command-convenience:0.1
+          auth:
+            username: $DOCKER_HUB_USER
+            password: $DOCKER_HUB_PASSWORD
+          environment:
+            NAME: test
+            DOCKERFILE_PATH: Dockerfile
+            DOCKER_REGISTRY: none
+      steps:
+        - checkout
+        - setup_remote_docker
+        - run: publish
+
+workflows:
+  version: 2
+  world:
+    jobs:
+      - scan-container:
+          context: org-global
+      - build-container:
+          # All releases must be tagged.  There are no tests in this project so
+          # there is no point in running CI over the master head.  CI is run
+          # over non-master heads to provide experimental container images.
+          filters:
+            branches:
+              ignore: /master/
+            tags:
+              only: /.*/
+      - push-container:
+          context: org-global
+          requires:
+            - build-container
+            - scan-container
+          filters:
+            tags:
+              only: /.*/

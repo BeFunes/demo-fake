@@ -1,0 +1,81 @@
+version: 2.1
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    environment:
+      NAME: lifecycle-manager
+      DOCKERFILE_PATH: Dockerfile
+      DEPLOY_TYPE: helm
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/lifecycle-manager
+      DOCKER_REGISTRY: ecr
+      CUSTOM_CHART: lifecycle-manager/
+      NAMESPACE: sre
+      # Disable Twistlock temporarily to allow enabling Renovate to bump dependencies
+      TWISTLOCK_ENFORCE: "false"
+
+jobs:
+  test-twistlock:
+    executor: ccc
+    parameters:
+      upstream_image_version:
+        description: the upstream version tag of the base image
+        type: string
+    environment:
+      DOCKER_REGISTRY: none
+      EXTRA_DOCKER_BUILD_ARGS: --build-arg UPSTREAM_IMAGE_VERSION=<< parameters.upstream_image_version >>
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          command: |
+            CONTAINER_VERSION="<< parameters.upstream_image_version >>-${CIRCLE_BUILD_NUM}-$(git rev-parse --short HEAD)" publish
+
+  lint-helm-chart:
+    executor: ccc
+    steps:
+      - checkout
+      - run:
+          name: create helm package
+          command: |
+            /deploy/scripts/dry-run.sh
+
+  publish-and-deploy-service:
+    executor: ccc
+    parameters:
+      upstream_image_version:
+        description: the upstream version tag of the base image
+        type: string
+    environment:
+      EXTRA_DOCKER_BUILD_ARGS: --build-arg UPSTREAM_IMAGE_VERSION=<< parameters.upstream_image_version >>
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          command: |
+            CONTAINER_VERSION="<< parameters.upstream_image_version >>-${CIRCLE_BUILD_NUM}-$(git rev-parse --short HEAD)" publish
+      - run: deploy
+
+workflows:
+  test-publish-deploy:
+    jobs:
+      - test-twistlock:
+          upstream_image_version: 0.4.3
+          context: org-global
+          filters:
+            branches:
+              ignore: main
+      - lint-helm-chart:
+          context: org-global
+      - publish-and-deploy-service:
+          upstream_image_version: 0.4.3
+          requires:
+            - lint-helm-chart
+          context: org-global
+          filters:
+            branches:
+              only: main

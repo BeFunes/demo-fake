@@ -1,0 +1,48 @@
+version: 2.1
+
+jobs:
+  test:
+    docker:
+      - image: circleci/python:3.9-buster
+    steps:
+      - checkout
+      - run:
+          name: Setup environment
+          command: sudo pip install tox
+      - run:
+          name: Lint and test
+          command: make test
+      - run:
+          name: Check config
+          command: |
+              pipenv install .
+              pipenv run bin/ask-from-pagerduty --check-config --config=ask-from-pagerduty.json
+
+  update-groups:
+    docker:
+      - image: circleci/python:3.9-buster
+    steps:
+      - checkout
+      - run:
+          name: Update groups from config
+          command: |
+              pipenv install .
+              pipenv run bin/ask-from-pagerduty --config=ask-from-pagerduty.json
+
+workflows:
+  test:
+    jobs:
+      - test
+
+  hourly:
+    triggers:
+      - schedule:
+          cron: "15 * * * *"
+          filters:
+            branches:
+              only:
+                - main
+    jobs:
+      - update-groups:
+          context:
+            - ask-bot

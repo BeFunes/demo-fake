@@ -1,0 +1,363 @@
+version: 2.1
+
+java-versions: &java-versions
+  - 8
+  - 11
+
+orbs:
+  slack: circleci/slack@3.4.2
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: clojure-service
+          MAJOR_VERSION_NUMERICAL: "0.8"
+  shellcheck:
+    docker:
+      - image: koalaman/shellcheck-alpine:stable
+
+commands:
+  restore-setup:
+    description: "Common setup required after running the setup job"
+    parameters:
+      java-version:
+        type: integer
+    steps:
+      - setup_remote_docker:
+          version: 20.10.7
+      - checkout
+      - attach_workspace:
+          at: workspace
+      - run:
+          name: Restore the run-migrations-script
+          command: |
+            cp workspace/shared/run-migrations .
+      - run:
+          name: Select Dockerfile
+          command: echo "export DOCKERFILE_PATH=Dockerfile.java<< parameters.java-version >>" >> "${BASH_ENV}"
+      - run:
+          name: Write the java-prefixed container version into the Dockerfile
+          command: |
+            prefixed_version="java<< parameters.java-version >>-$(cat workspace/shared/unprefixed-full-version)"
+            sed -i.orig -e "s/^ENV CLOJURE_SERVICE_IMAGE_VERSION.*/ENV CLOJURE_SERVICE_IMAGE_VERSION ${prefixed_version}/" "${DOCKERFILE_PATH}"
+
+jobs:
+  record-previous-release:
+    parameters:
+      java-version:
+        type: integer
+    executor: ccc
+    steps:
+      - setup_remote_docker
+      - checkout
+      - run: mkdir -p workspace/java<< parameters.java-version >>/previous-release
+      - run:
+          name: Locate most recent current version for this java version
+          command:
+            echo "export PREVIOUS_VERSION=circleci/${NAME}:java<< parameters.java-version >>-${MAJOR_VERSION_NUMERICAL}" >> "${BASH_ENV}"
+      - run:
+          name: Log in to Docker Hub
+          command: docker login -u ${DOCKER_HUB_USER} -p ${DOCKER_HUB_PASSWORD}
+      - run:
+          name: Get the most recent build for the major version
+          command: docker pull ${PREVIOUS_VERSION}
+      - run:
+          name: Record the previously installed packages
+          command: |
+            docker run ${PREVIOUS_VERSION} apt list --installed > workspace/java<< parameters.java-version >>/previous-release/package-list.txt
+      - store_artifacts:
+          path: workspace/java<< parameters.java-version >>/previous-release/package-list.txt
+      - persist_to_workspace:
+           root: workspace
+           paths:
+             - java<< parameters.java-version >>/previous-release/package-list.txt
+
+  setup:
+    executor: ccc
+    steps:
+      - setup_remote_docker
+      - checkout
+      - run: mkdir -p workspace/shared
+      - run:
+          name: Log in to Docker Hub
+          command: docker login -u ${DOCKER_HUB_USER} -p ${DOCKER_HUB_PASSWORD}
+      - run:
+          name: Fetch the run-migrations script from the flyway image
+          command: |
+            docker create --name flyway-tmp circleci/flyway:0.1
+            docker cp flyway-tmp:/usr/local/bin/run-migrations workspace/shared/
+            docker rm flyway-tmp
+      - run:
+          name: Calculate version and save it
+          command: |
+            if [[ "$CIRCLE_BRANCH" == "main" ]]; then
+              export MAJOR_VERSION="${MAJOR_VERSION_NUMERICAL}"
+            else
+              branch="$(echo "$CIRCLE_BRANCH" | tr '/A-Z' '-a-z' | tr -dc 'a-z-')"
+              export MAJOR_VERSION="${branch:-experimental}"
+            fi
+
+            unprefixed_full_version="$(/publish/scripts/generate-container-version.sh)"
+
+            echo $MAJOR_VERSION | tee workspace/shared/unprefixed-major-version
+            echo $unprefixed_full_version | tee workspace/shared/unprefixed-full-version
+      - persist_to_workspace:
+          root: workspace
+          paths:
+            - shared/run-migrations
+            - shared/unprefixed-major-version
+            - shared/unprefixed-full-version
+
+  shellcheck:
+    executor: shellcheck
+    steps:
+      - checkout
+      - run: shellcheck bin/circleci-service-run
+
+  build-test:
+    parameters:
+      java-version:
+        type: integer
+    executor: ccc
+    steps:
+      - restore-setup:
+          java-version: << parameters.java-version >>
+      - run:
+          name: Set version for tests
+          command: |
+            echo "export CONTAINER_VERSION=java<< parameters.java-version >>-$(cat workspace/shared/unprefixed-full-version)" >> "${BASH_ENV}"
+      - run:
+          name: Build the production container
+          command: publish
+          environment:
+            DOCKER_REGISTRY: none
+            DOCKERFILE_TARGET: production
+            TWISTLOCK_ENFORCE: "false"
+            ENFORCE_SCAN: BYPASS
+      - run:
+          name: Build the dev container
+          command: publish
+          environment:
+            DOCKER_REGISTRY: none
+            DOCKERFILE_TARGET: dev
+            TWISTLOCK_ENFORCE: "false"
+            ENFORCE_SCAN: BYPASS
+      - run:
+          name: Build test app
+          command: |
+            set -o errexit
+            apk --no-cache add coreutils nss openjdk8-jre-base
+            curl -Lo /usr/local/bin/lein https://raw.githubusercontent.com/technomancy/leiningen/2.9.2/bin/lein \
+              && echo "70fd87d56de54061c24b8dd7510593b591c899a9  /usr/local/bin/lein" | sha1sum -c - \
+              && chmod 755 /usr/local/bin/lein \
+              && /usr/local/bin/lein version \
+              && echo "523ea9b0d57a44d3da47184d54727b5d531963cf  /root/.lein/self-installs/leiningen-2.9.2-standalone.jar" | sha1sum -c -
+            lein uberjar
+            mv target/test-app*-standalone.jar ../test-app.jar
+          pwd: tests/test-app
+      - run:
+          name: Run the tests
+          command: |
+            set -o errexit
+            export TEST_JAVA_VERSION=<< parameters.java-version >>
+            tests/001-simple-build/test.sh
+            tests/002-can-pass-arguments/test.sh
+            tests/003-env-args/test.sh
+            tests/004-leiningen/test.sh
+            tests/005-flyway/test.sh
+            tests/006-dockerize/test.sh
+            tests/007-git/test.sh
+            tests/008-ssh/test.sh
+            tests/009-javac/test.sh
+            tests/010-run-migrations/test.sh
+            tests/011-sudo/test.sh
+            tests/012-openjdk/test.sh
+            tests/013-version-file/test.sh
+            tests/014-bouncycastle/test.sh
+            tests/015-stderr-error-reporting/test.sh
+            tests/016-debian-version/test.sh
+      - run:
+          name: Save the list of installed packages
+          command: |
+            mkdir -p workspace/java<< parameters.java-version >>/current-release
+            docker run circleci/${NAME}:${CONTAINER_VERSION} apt list --installed > workspace/java<< parameters.java-version >>/current-release/package-list.txt
+      - store_artifacts:
+          path: workspace/java<< parameters.java-version >>/current-release/package-list.txt
+      - persist_to_workspace:
+           root: workspace
+           paths:
+             - java<< parameters.java-version >>/current-release/package-list.txt
+
+  scan:
+    parameters:
+      java-version:
+        type: integer
+    executor: ccc
+    steps:
+      - restore-setup:
+          java-version: << parameters.java-version >>
+      - run:
+          name: Scan the production container
+          command: scan
+          environment:
+            DOCKERFILE_TARGET: production
+      - run:
+          name: Scan the dev container
+          command: scan
+          environment:
+            DOCKERFILE_TARGET: dev
+
+  publish:
+    parameters:
+      java-version:
+        type: integer
+    executor: ccc
+    steps:
+      - restore-setup:
+          java-version: << parameters.java-version >>
+      - attach_workspace:
+          at: workspace
+      - run:
+          name: Check if the version should be pushed
+          command: |
+            if [ ! -f workspace/java<< parameters.java-version >>/previous-release/package-list.txt ] ; then
+              echo "Not running under cron job; proceeding to publish step"
+            elif diff -u workspace/java<< parameters.java-version >>/previous-release/package-list.txt workspace/java<< parameters.java-version >>/current-release/package-list.txt;
+            then
+              echo "Detected cron job and no diff in packages; not publishing a new version"
+              circleci-agent step halt
+            else
+              echo "Diff detected; proceeding to publish step"
+            fi
+      - run:
+          name: Publish the java version prefixed production container
+          command: |
+            export MAJOR_VERSION="java<< parameters.java-version >>-$(cat workspace/shared/unprefixed-major-version)"
+            export CONTAINER_VERSION="java<< parameters.java-version >>-$(cat workspace/shared/unprefixed-full-version)"
+            publish
+          environment:
+            DOCKERFILE_TARGET: production
+            DOCKER_REGISTRY: all
+      - run:
+          name: Publish the java version prefixed development container
+          command: |
+            export MAJOR_VERSION="java<< parameters.java-version >>-$(cat workspace/shared/unprefixed-major-version)"
+            export CONTAINER_VERSION="java<< parameters.java-version >>-$(cat workspace/shared/unprefixed-full-version)"
+            publish
+          environment:
+            DOCKERFILE_TARGET: dev
+            DOCKER_REGISTRY: all
+      - when:
+          condition:
+            equal: [ 8 , << parameters.java-version >> ]
+          steps:
+            - run:
+                name: Publish the production container
+                command: |
+                  export MAJOR_VERSION="$(cat workspace/shared/unprefixed-major-version)"
+                  export CONTAINER_VERSION="$(cat workspace/shared/unprefixed-full-version)"
+                  publish
+                environment:
+                  DOCKERFILE_TARGET: production
+                  DOCKER_REGISTRY: all
+            - run:
+                name: Publish the development container
+                command: |
+                  export MAJOR_VERSION="$(cat workspace/shared/unprefixed-major-version)"
+                  export CONTAINER_VERSION="$(cat workspace/shared/unprefixed-full-version)"
+                  publish
+                environment:
+                  DOCKERFILE_TARGET: dev
+                  DOCKER_REGISTRY: all
+
+      - slack/status:
+          fail_only: true
+          failure_message: "Failed to publish an image for ${CIRCLE_PROJECT_REPONAME}"
+          only_for_branches: main
+          include_project_field: false
+          include_job_number_field: false
+      - run:
+          name: Create a Jira ticket for failed builds
+          when: on_fail
+          command: |
+            if [ "${CIRCLE_BRANCH}" = "main" ]; then
+              bin/ensure-build-failure-issue
+            fi
+
+workflows:
+  version: 2
+  build-test-publish:
+    jobs:
+      - setup:
+          context: org-global
+      - shellcheck
+      - build-test:
+          context: org-global
+          matrix:
+            parameters:
+              java-version: *java-versions
+          requires:
+            - setup
+      - scan:
+          context: org-global
+          matrix:
+            parameters:
+              java-version: *java-versions
+          requires:
+            - setup
+          filters:
+            branches:
+              ignore:
+                - main
+                - /experimental/.*/
+      - publish:
+          context: org-global
+          matrix:
+            parameters:
+              java-version: *java-versions
+          requires:
+            - build-test
+            - shellcheck
+          filters:
+            branches:
+              only:
+                - main
+                - /experimental/.*/
+  build-test-publish-cron:
+    jobs:
+      - setup:
+          context: org-global
+      - shellcheck
+      - record-previous-release:
+          matrix:
+            parameters:
+              java-version: *java-versions
+          context: org-global
+      - build-test:
+          context: org-global
+          matrix:
+            parameters:
+              java-version: *java-versions
+          requires:
+            - setup
+            - record-previous-release
+      - publish:
+          context: org-global
+          matrix:
+            parameters:
+              java-version: *java-versions
+          requires:
+            - build-test
+            - shellcheck
+    triggers:
+      - schedule:
+          cron: "0 0 * * *"
+          filters:
+            branches:
+              only:
+                - main

@@ -1,0 +1,45 @@
+version: 2.1
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+jobs:
+  prepare-jenkins-home:
+    machine:
+      image: ubuntu-2004:202107-02
+    steps:
+      - checkout
+      - run:
+          name: Create new Jenkins home
+          command: bash setup-jenkins.sh
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+
+  build-docker-image:
+    executor: ccc
+    environment:
+      NAME: jfc-jenkins
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: ecr
+      TWISTLOCK_ENFORCE: "false"
+    steps:
+      - attach_workspace:
+          at: ./
+      - setup_remote_docker
+      - run: publish
+
+workflows:
+  build:
+    jobs:
+      - prepare-jenkins-home
+      - build-docker-image:
+          requires:
+            - prepare-jenkins-home
+          context: org-global

@@ -1,0 +1,249 @@
+version: 2.1
+
+orbs:
+  slack: circleci/slack@2.6.0
+  web-ui-orb: sandbox/web-ui-orb@3.12.0
+
+executors:
+  node:
+    docker:
+      - image: circleci/node:14
+    working_directory: /home/circleci/web-ui
+
+references:
+  version_js: &version_js 3
+  version_cypress: &version_cypress 1
+
+workflows:
+  version: 2
+
+  build-test-and-deploy:
+    jobs:
+      - web-ui-orb/dependencies:
+          name: dependencies
+          context: web-ui-admin-dashboard
+          cache_version_js_dependencies: *version_js
+          cache_version_cypress_dependencies: *version_cypress
+      - storybook-build:
+          name: storybook-build
+          cache_version_js_dependencies: *version_js
+          context: web-ui-admin-dashboard
+          build_storybook_command: NODE_ENV=test yarn build-storybook -s ./src
+          requires:
+            - dependencies
+      - web-ui-orb/test:
+          name: test
+          cache_version_js_dependencies: *version_js
+          context: web-ui-admin-dashboard
+          requires:
+            - dependencies
+      - web-ui-orb/chromatic-snapshot:
+          name: chromatic-snapshot
+          cache_version_js_dependencies: *version_js
+          context: web-ui-admin-dashboard
+          requires:
+            - storybook-build
+      - web-ui-orb/build-static:
+          name: build-static
+          cache_version_js_dependencies: *version_js
+          context: web-ui-admin-dashboard
+          requires:
+            - dependencies
+      - test-production-docker-image:
+          name: test-production-docker-image
+          image_name: web-ui-admin-dashboard
+          requires:
+            - dependencies
+            - build-static
+          context: web-ui-admin-dashboard
+      - web-ui-orb/build-and-publish-container:
+          name: publish
+          image_name: web-ui-admin-dashboard
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          docker_registry: ecr
+          context: org-global
+          filters:
+            branches:
+              only: main
+          requires:
+            - test
+            - build-static
+            - test-production-docker-image
+
+      - web-ui-orb/build-and-publish-container:
+          name: publish-canary
+          image_name: web-ui-admin-dashboard
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          docker_registry: ecr
+          context: org-global
+          filters:
+            branches:
+              only: canary
+          requires:
+            - test
+            - build-static
+            - test-production-docker-image
+
+      - web-ui-orb/deploy-container:
+          name: deploy
+          image_name: web-ui-admin-dashboard
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: org-global
+          filters:
+            branches:
+              only: main
+          requires:
+            - publish
+
+      - web-ui-orb/deploy-container:
+          name: deploy-canary
+          image_name: web-ui-admin-dashboard
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: org-global
+          release_version: canary
+          values_file: k8s-canary-values.yml
+          filters:
+            branches:
+              only: canary
+          requires:
+            - publish-canary
+
+commands:
+  restore-js-deps:
+    description: >
+      Retrieve and restore javascript dependencies from cache.
+    parameters:
+      cache_version:
+        description:
+          The version number of the cached js dependencies to retrieve.
+        type: integer
+        default: 1
+    steps:
+      - restore_cache:
+          keys:
+            - v<< parameters.cache_version >>-dependency-js-deps-{{ checksum
+              "yarn.lock" }}
+  slack-notify-on-failure:
+    steps:
+      - slack/status:
+          fail_only: true
+          only_for_branch: 'main'
+
+jobs:
+  storybook-build:
+    description: Build storybook static site.
+    parameters:
+      cache_version_js_dependencies:
+        description:
+          The version number of the cached dependencies to retrieve and save for
+          app js dependencies.
+        type: integer
+        default: 1
+      prebuild_run_command:
+        description:
+          A command to run prior to running storybook build such as build i18n
+          assets used in a storybook instance.
+        type: string
+        default: ''
+      build_storybook_command:
+        description:
+          The command we run to build Storybook assets and get them ready to
+          visual regression testing.
+        type: string
+        default:
+          'NODE_ENV=test yarn build-storybook -s ./public,./src,./src/public'
+
+    executor: node
+    resource_class: large
+    environment:
+      # Disable Rollbar for storybook
+      EXCEPTION_LOGGER_CLIENT_TOKEN: disabled
+      EXCEPTION_LOGGER_SERVER_TOKEN: disabled
+    steps:
+      - checkout
+      - restore-js-deps:
+          cache_version: << parameters.cache_version_js_dependencies >>
+      - when:
+          condition: <<parameters.prebuild_run_command>>
+          steps:
+            - run: <<parameters.prebuild_run_command>>
+      - run: <<parameters.build_storybook_command>>
+      - run: NODE_OPTIONS=--max_old_space_size=4096
+      - persist_to_workspace:
+          root: .
+          paths:
+            - storybook-static
+      - slack-notify-on-failure
+  test-production-docker-image:
+    description: Build production image and run e2e tests against it
+    parameters:
+      image_name:
+        description: The name of the image you are building.
+        type: string
+    machine:
+      image: ubuntu-2004:202107-02
+      docker_layer_caching: true
+    environment:
+      NAME: << parameters.image_name >>
+    steps:
+      - run:
+          name: Validate parameters and Environment Variables
+          command: |
+            if [ -z "<< parameters.image_name >>" ]; then
+              echo "Error: The parameter image_name is empty. Please ensure the parameter image_name has been added."
+              exit 1
+            fi
+            if [ -z "$NPM_TOKEN" ]; then
+              echo "Error: The environment variable NPM_TOKEN is empty. Please ensure the environment variable NPM_TOKEN has been added."
+              exit 1
+            fi
+      - checkout
+      - attach_workspace:
+          at: .
+      - web-ui-orb/restore-js-deps:
+          cache_version: *version_js
+      - run:
+          name: Build production docker image
+          command: |
+            docker build --build-arg NPM_TOKEN=$NPM_TOKEN --tag << parameters.image_name >> .
+      - run:
+          name: Build e2e docker image
+          command: |
+            docker build --file Dockerfile.e2e --tag << parameters.image_name >>:e2e .
+      - run:
+          name: Create docker network
+          command: |
+            docker network inspect test-environment || docker network create test-environment
+      - run:
+          name: Run production docker image
+          background: true
+          command: |
+            docker run --rm --tty --name << parameters.image_name >> \
+              --network test-environment --hostname << parameters.image_name >> \
+              --env NPM_TOKEN=$NPM_TOKEN \
+              --env PORT=3042 \
+              --publish 3042:3042 \
+              << parameters.image_name >> \
+              /bin/sh -c "echo '//registry.npmjs.org/:_authToken=$NPM_TOKEN' > .npmrc && yarn add express-http-proxy --dev && rm -f .npmrc && yarn start-production"
+      - run:
+          name:
+            Short sleep to allow web-ui image to start and make Docker network
+            available
+          command: sleep 120
+      - run:
+          name: Run e2e docker image
+          command: |
+            docker create -v /tmp/cypress/videos --name videos << parameters.image_name >>:e2e /bin/true
+            docker run --tty --network container:<< parameters.image_name >> --env-file <( env | grep CYPRESS | cut -f1 -d= ) --volumes-from videos << parameters.image_name >>:e2e
+      - run:
+          name: Copy artifacts from e2e docker image
+          when: always
+          command: |
+            docker cp videos:/tmp/cypress/videos cypress/videos
+      - store_artifacts:
+          path: cypress/videos
+      - web-ui-orb/slack-notify-on-failure

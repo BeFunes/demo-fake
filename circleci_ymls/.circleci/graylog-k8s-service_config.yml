@@ -1,0 +1,131 @@
+---
+version: 2.1
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+  test-machine:
+    machine:
+      image: ubuntu-2204:current
+    resource_class: large
+    environment:
+      TERM: dumb
+
+commands:
+  install-dependenies:
+    steps:
+      - run:
+          name: Install go
+          command: >-
+            sudo rm -rf /usr/local/go &&
+            curl -L 'https://dl.google.com/go/go1.18.3.linux-amd64.tar.gz' -o - | sudo tar -C /usr/local -xz &&
+            echo "export PPATH=$PATH:/usr/local/go/bin" >> $BASH_ENV &&
+            source $BASH_ENV
+      - run:
+          name: Install kubectl
+          command: >-
+            curl -LO https://storage.googleapis.com/kubernetes-release/release/v1.22.10/bin/linux/amd64/kubectl &&
+            sudo mv kubectl /usr/local/bin/ &&
+            sudo chmod a+x /usr/local/bin/kubectl
+      - run:
+          name: Prepare kind cluster
+          command: >-
+            sudo curl -Lo /usr/local/bin/kind 'https://github.com/kubernetes-sigs/kind/releases/download/v0.14.0/kind-linux-amd64' &&
+            sudo chmod a+x /usr/local/bin/kind &&
+            make create-kind-cluster
+      - run:
+          name: Setup kernel configs
+          # for elasticsearch, https://github.com/bitnami/bitnami-docker-elasticsearch/issues/61
+          command: >-
+            sudo sysctl -w vm.max_map_count=262144
+      - run:
+          name: Prepare helm
+          command: >-
+            curl -Lo - 'https://get.helm.sh/helm-v3.9.0-linux-amd64.tar.gz' |
+            sudo tar -xvz -C /usr/local/bin --strip-components=1
+
+  initialize:
+    description: Initial CI setup before CCC runs
+    parameters:
+      values_file:
+        type: string
+    steps:
+      - checkout
+      - setup_remote_docker
+      # Download the Helm dependencies
+      - run: helm dependency update charts/graylog
+      # Override some chart values with template that CCC expects
+      - run: cp charts/graylog/Chart.yaml /tmp/Chart.yaml
+      - run: /deploy/merge-values /tmp/Chart.yaml chart-CI-overrides.yml > charts/graylog/Chart.yaml
+      # Apply values now because CCC does not allow using custom values file with custom chart
+      - run: cp charts/graylog/values.yaml /tmp/values.yaml
+      - run: /deploy/merge-values /tmp/values.yaml << parameters.values_file >> > charts/graylog/values.yaml
+
+jobs:
+  run-tests:
+    executor: test-machine
+    steps:
+      - checkout
+      - install-dependenies
+      - run:
+          name: Run lint test
+          command: make lint
+      - run:
+          name: Run unit test
+          command: make unit-test
+      - run:
+          name: Run integration test
+          command: make integration-test
+
+  deploy-prod:
+    executor: ccc
+    environment: &ccc-environment
+      NAME: cci-prod-graylog
+      RELEASE_VERSION: "c"
+      # This should reflect the Graylog version in Dockerfile:
+      MAJOR_VERSION: 4.1
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: ecr
+      IMAGE_NAME: circleci/graylog
+      CUSTOM_CHART: charts/graylog
+      NAMESPACE: sre
+      CONFIGURE_ECR_REPO: true
+      ECR_OWNER_TEAM: InfraEng
+      TWISTLOCK_ENFORCE: false   # TODO: Enforce Twistlock
+    steps:
+      - initialize:
+          values_file: "values/values-graylog-prod-c.yaml"
+      - run: publish
+      - run: deploy
+
+  dry-run:
+    executor: ccc
+    environment:
+      <<: *ccc-environment
+    steps:
+      - initialize:
+          values_file: "values/values-graylog-prod-c.yaml"
+      - run: scan
+      - run: /deploy/dry-run
+workflows:
+  version: 2
+  install-graylog:
+    jobs:
+      - run-tests
+      - dry-run:
+          context: org-global
+          filters:
+            branches:
+              ignore: main
+      - deploy-prod:
+          context: org-global
+          requires:
+            - run-tests
+          filters:
+            branches:
+              only: main

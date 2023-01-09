@@ -1,0 +1,243 @@
+# this is a circleci pipeline for a nodejs service
+version: 2.1
+
+## aliases
+fast-checkout: &fast-checkout
+  attach_workspace:
+    at: /home/circleci
+
+rc: &restore_cache
+  restore_cache:
+    keys:
+      - yarn-packages-{{ checksum "yarn.lock" }}
+
+sc: &save_cache
+  save_cache:
+    key: yarn-packages-{{ checksum "yarn.lock" }}
+    paths:
+      - ~/.cache/yarn
+
+save-fast-checkout: &save-fast-checkout
+  persist_to_workspace:
+    root: /home/circleci
+    paths:
+      - project
+
+## filters
+filter-feature: &filter-feature
+  branches:
+    ignore:
+      - /main/
+      - /devel/
+filter-staging: &filter-staging
+  branches:
+    only: /master/
+    ignore:
+      - /.*/
+
+
+orbs:
+  aws-cli: circleci/aws-cli@2.0.3
+  aws-ecr: circleci/aws-ecr@7.0.0
+  eks: tiendanube/eks@1.7.1
+  precheck: tiendanube/precheck@0.1.0
+
+executors:
+  node:
+    docker:
+      - image: cimg/node:16.17.1
+    resource_class: large
+
+  python:
+    docker:
+      - image: circleci/python:3-stretch
+    resource_class: large
+
+  eks:
+    docker:
+      - image: tiendanube/circleci-eks:v1.1.12
+
+commands:
+  substitute-values:
+    parameters:
+      template_file:
+        type: string
+    steps:
+      - run:
+          name: "Install envsubst"
+          command: sudo apt-get update && sudo apt-get install -y gettext-base
+      - run:
+          name: "Environment variables substitution"
+          command: export SHA=$(echo $CIRCLE_SHA1 | cut -c 1-7) && envsubst < <<parameters.template_file>> > .argo/argoapp_temp.yml
+
+jobs:
+  variable-validate:
+    executor: python
+    steps:
+      - precheck/naming_validation_cmd:
+          name_to_validate: << pipeline.git.branch >>
+
+  values-substitution:
+    executor: python
+    parameters:
+      template_file:
+        type: string
+    steps:
+      - checkout
+      - substitute-values:
+          template_file: <<parameters.template_file>>
+      - <<: *save-fast-checkout
+
+  build:
+    executor: node
+    steps:
+      - checkout
+      - run: yarn install --frozen-lockfile
+      - run: yarn tsc
+      - run: yarn build
+      - persist_to_workspace:
+          root: /home/circleci
+          paths:
+            - project
+            - project/node_modules
+
+  build-push-image-ecr:
+    executor: python
+    parameters:
+      aws_ecr_account_url:
+        type: string
+      aws_region:
+        type: string
+      dockerfile:
+        default: Dockerfile
+        type: string
+      tag_prefix:
+        default: ""
+        type: string
+    steps:
+      - <<: *fast-checkout
+      - setup_remote_docker:
+          version: 19.03.13
+          docker_layer_caching: true
+      - aws-ecr/build-and-push-image:
+          repo: ${CIRCLE_PROJECT_REPONAME}
+          tag: <<parameters.tag_prefix>>${CIRCLE_SHA1:0:7}
+          account-url: << parameters.aws_ecr_account_url >>
+          region: << parameters.aws_region >>
+          dockerfile: << parameters.dockerfile >>
+          checkout: false
+          create-repo: true
+
+workflows:
+  feature-test-and-deploy:
+    jobs:
+      - variable-validate:
+          context: microservices
+          filters:
+            <<: *filter-feature
+      - build:
+          context: microservices
+          requires:
+            - variable-validate
+          filters:
+            <<: *filter-feature
+      - build-push-image-ecr:
+          name: feat-build-push-docker-image
+          aws_region: AWS_REGION_STAGING
+          aws_ecr_account_url: AWS_ECR_ACCOUNT_URL_STAGING
+          tag_prefix: feat-
+          dockerfile: packages/backend/Dockerfile
+          context: microservices
+          requires:
+            - build
+          filters:
+            <<: *filter-feature
+      - values-substitution:
+          context: microservices
+          template_file: .argo/argoapp.yml
+          requires:
+            - feat-build-push-docker-image
+          filters:
+            <<: *filter-feature
+      - authorize-deployment:
+          type: approval
+          requires:
+            - feat-build-push-docker-image
+            - values-substitution
+          filters:
+            <<: *filter-feature
+      - eks/deploy:
+          name: feat-eks-deployment
+          context: microservices
+          cluster-name: staging
+          region: us-west-2
+          requires:
+            - authorize-deployment
+          pre-steps:
+            - <<: *fast-checkout
+            - aws-cli/setup:
+                aws-region: AWS_REGION_STAGING
+                aws-access-key-id: AWS_ACCESS_KEY_ID
+                aws-secret-access-key: AWS_SECRET_ACCESS_KEY
+          steps:
+            - run:
+                command: |
+                  kubectl apply -f .argo/argoapp_temp.yml -n argocd
+                  kubectl apply -f .argo/argoproject.yml -n argocd
+  staging-test-and-deploy:
+    jobs:
+      - variable-validate:
+          context: microservices
+          filters:
+            <<: *filter-staging
+      - build:
+          context: microservices
+          requires:
+            - variable-validate
+          filters:
+            <<: *filter-staging
+      - build-push-image-ecr:
+          name: stg-build-push-docker-image
+          aws_region: AWS_REGION_STAGING
+          aws_ecr_account_url: AWS_ECR_ACCOUNT_URL_STAGING
+          tag_prefix: stg-
+          dockerfile: packages/backend/Dockerfile
+          context: microservices
+          requires:
+            - build
+          filters:
+            <<: *filter-staging
+      - values-substitution:
+          context: microservices
+          template_file: .argo/argoapp.yml
+          requires:
+            - stg-build-push-docker-image
+          filters:
+            <<: *filter-staging
+      - authorize-deployment:
+          type: approval
+          requires:
+            - stg-build-push-docker-image
+            - values-substitution
+          filters:
+            <<: *filter-staging
+      - eks/deploy:
+          name: stg-eks-deployment
+          context: microservices
+          cluster-name: staging
+          region: us-west-2
+          requires:
+            - authorize-deployment
+          pre-steps:
+            - <<: *fast-checkout
+            - aws-cli/setup:
+                aws-region: AWS_REGION_STAGING
+                aws-access-key-id: AWS_ACCESS_KEY_ID
+                aws-secret-access-key: AWS_SECRET_ACCESS_KEY
+          steps:
+            - run:
+                command: |
+                  kubectl apply -f .argo/argoapp_temp.yml -n argocd
+                  kubectl apply -f .argo/argoproject.yml -n argocd
+
+# VS Code Extension Version: 1.1.1

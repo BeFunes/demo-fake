@@ -1,0 +1,59 @@
+version: 2.1
+
+executors:
+  default:
+    docker:
+      - image: "183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/helm-deployerer:0.1"
+        aws_auth:
+          aws_access_key_id: $ECR_AWS_ACCESS_KEY_ID
+          aws_secret_access_key: $ECR_AWS_SECRET_ACCESS_KEY
+    environment:
+      HELM_CHART: "./migration-test"
+
+commands:
+  deploy-monitor:
+    parameters:
+      release_name:
+        type: string
+      monitor_url:
+        type: string
+    steps:
+      - run:
+          name: deploy
+          command: >-
+            RELEASE_NAME="<< parameters.release_name >>"
+            HELM_ARGS='{"monitorUrl":"<< parameters.monitor_url >>"}'
+            deploy
+
+jobs:
+  deploy-us-east-1-b:
+    executor: default
+    steps:
+      - checkout
+      - deploy-monitor:
+          release_name: "migration-test-us-east-1-b"
+          monitor_url: "http://migration-test-cci-prod-a.migration.infra.circleci.com/telegraf"
+
+  deploy-cci-prod-a:
+    executor: default
+    steps:
+      - checkout
+      - deploy-monitor:
+          release_name: "migration-test-cci-prod-a"
+          monitor_url: "http://migration-test-us-east-1-b.migration.infra.circleci.com/telegraf"
+
+workflows:
+  version: 2
+  deploy-migration-monitoring:
+    jobs:
+      - deploy-us-east-1-b:
+          context: org-global
+          filters:
+            branches:
+              only: master
+
+      - deploy-cci-prod-a:
+          context: org-global
+          filters:
+            branches:
+              only: master

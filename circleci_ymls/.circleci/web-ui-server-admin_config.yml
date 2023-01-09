@@ -1,0 +1,308 @@
+version: 2.1
+
+orbs:
+  slack: circleci/slack@2.6.0
+  web-ui-orb: sandbox/web-ui-orb@3.1.0
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+
+executors:
+  node:
+    docker:
+      - image: circleci/node:14
+    working_directory: /home/circleci/web-ui
+
+references:
+  version_js: &version_js 1
+  version_cypress: &version_cypress 1
+  image_name: &image_name 'web-ui-server-admin'
+  hostname: &hostname app.circleci.com
+
+commands:
+  restore-js-deps:
+    description: >
+      Retrieve and restore javascript dependencies from cache.
+    parameters:
+      cache_version:
+        description:
+          The version number of the cached js dependencies to retrieve.
+        type: integer
+        default: 1
+    steps:
+      - restore_cache:
+          keys:
+            - v<< parameters.cache_version >>-dependency-js-deps-{{ checksum
+              "yarn.lock" }}
+  slack-notify-on-failure:
+    steps:
+      - slack/status:
+          fail_only: true
+          only_for_branch: 'main'
+
+jobs:
+  storybook-build:
+    description: Build storybook static site.
+    parameters:
+      cache_version_js_dependencies:
+        description:
+          The version number of the cached dependencies to retrieve and save for
+          app js dependencies.
+        type: integer
+        default: 1
+      prebuild_run_command:
+        description:
+          A command to run prior to running storybook build such as build i18n
+          assets used in a storybook instance.
+        type: string
+        default: ''
+    executor: node
+    steps:
+      - checkout
+      - restore-js-deps:
+          cache_version: << parameters.cache_version_js_dependencies >>
+      - when:
+          condition: <<parameters.prebuild_run_command>>
+          steps:
+            - run: <<parameters.prebuild_run_command>>
+      - run: NODE_ENV=test yarn build-storybook -s ./public,./src
+      - run: NODE_OPTIONS=--max_old_space_size=4096
+      - persist_to_workspace:
+          root: .
+          paths:
+            - storybook-static
+      - slack-notify-on-failure
+  build-static:
+    description: Build static nextJS app
+    parameters:
+      build_dir:
+        default: './src/.next'
+        description: The path to the NextJS build directory
+        type: string
+      cache_version_js_dependencies:
+        default: 1
+        description:
+          The version number of the cached dependencies to retrieve and save for
+          app js dependencies.
+        type: integer
+    executor: node
+    steps:
+      - checkout
+      - restore-js-deps:
+          cache_version: << parameters.cache_version_js_dependencies >>
+      - run: BUILD_ID="$CIRCLE_SHA1" yarn build
+      - persist_to_workspace:
+          paths:
+            - src/.next
+            - .next
+          root: .
+      - slack-notify-on-failure
+
+  build-and-publish-container:
+    description: |-
+      Builds and publishes a production build to docker registry.  This is here
+      because react-hook-form has busted types in node 14.
+    parameters:
+      image_name:
+        description: The name of the image you are publishing and deploying.
+        type: string
+      username:
+        description: The username who is publishing the image.
+        type: string
+      password:
+        description: The password used to publish the image.
+        type: string
+      twistlock_enforce:
+        default: true
+        description: Pass false to disable Twistlock from running
+        type: boolean
+      docker_registry:
+        default: all
+        type: string
+        description: Possible values are [all, dockerhub, ecr]
+    executor: node
+    docker:
+      - image: &ccc_image circleci/command-convenience:0.1
+        auth:
+          username: << parameters.username >>
+          password: << parameters.password >>
+        environment:
+          NAME: << parameters.image_name >>
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: << parameters.docker_registry >>
+    steps:
+      - run:
+          name: Validate parameters and Environment Variables
+          command: |
+            if [ -z "<< parameters.image_name >>" ]; then
+              echo "Error: The parameter image_name is empty. Please ensure the parameter image_name has been added."
+              exit 1
+            fi
+            if [ -z "<< parameters.username >>" ]; then
+              echo "Error: The parameter username is empty. Please ensure the parameter username has been added."
+              exit 1
+            fi
+            if [ -z "<< parameters.password >>" ]; then
+              echo "Error: The parameter password is empty. Please ensure the parameter password has been added."
+              exit 1
+            fi
+            if [ -z "$NPM_TOKEN" ]; then
+              echo "Error: The environment variable NPM_TOKEN is empty. Please ensure the environment variable NPM_TOKEN has been added."
+              exit 1
+            fi
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+          version: 19.03.13
+      - attach_workspace:
+          at: .
+      - run:
+          name: Replace `docker build` in create-image.sh with build-arg passing
+          command:
+            sed 's:docker build:docker build --build-arg NPM_TOKEN=$NPM_TOKEN:'
+            -i /publish/scripts/create-image.sh
+      - run:
+          name:
+            Set Twistlock debug flag for verbose logging. (diagnose Twistlock
+            flakiness)
+          command:
+            sed 's:twistcli images scan:twistcli --debug images scan:' -i
+            /publish/scripts/scan-image.sh
+      - run:
+          environment:
+            TWISTLOCK_ENFORCE: <<parameters.twistlock_enforce>>
+          command: publish
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.tag
+      - slack-notify-on-failure
+
+  deploy-container:
+    description: |-
+      Deploys to production.
+    parameters:
+      username:
+        description: The username used to deploy the image.
+        type: string
+      password:
+        description: The password used to deploy the image.
+        type: string
+      should_deploy:
+        description: Dictates if container should be deployed to kubernetes.
+        type: boolean
+        default: false
+      release_version:
+        default: v1
+        type: string
+        description: Suffix of helm chart release name, like web-ui-v1
+      values_file:
+        default: k8s-values.yml
+        type: string
+        description: Location of the Kubernetes value file
+      docker_registry:
+        default: all
+        type: string
+        description: Possible values are [all, dockerhub, ecr]
+    executor: node
+    docker:
+      - image: &ccc_image circleci/command-convenience:0.1
+        auth:
+          username: << parameters.username >>
+          password: << parameters.password >>
+        environment:
+          DOCKER_REGISTRY: << parameters.docker_registry >>
+          VALUES_FILE: << parameters.values_file >>
+          RELEASE_VERSION: << parameters.release_version >>
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+          version: 19.03.13
+      - attach_workspace:
+          at: .
+      - run:
+          name: Deploy when should_deploy is true
+          command: |
+            if [ "<<parameters.should_deploy>>" = "true" ]; then
+              echo "Deploying"
+              deploy
+            fi
+      - slack-notify-on-failure
+
+workflows:
+  version: 2
+
+  build-test-and-deploy:
+    jobs:
+      - web-ui-orb/dependencies:
+          name: dependencies
+          context: web-ui-npm
+          cache_version_js_dependencies: *version_js
+          cache_version_cypress_dependencies: *version_cypress
+      - storybook-build:
+          name: storybook-build
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+      - web-ui-orb/test:
+          name: test
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+      - web-ui-orb/chromatic-snapshot:
+          name: chromatic-snapshot
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+            - storybook-build
+      - web-ui-orb/test-production-docker-image:
+          name: test-production-docker-image
+          image_name: *image_name
+          hostname: app.circleci.com
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+          context: web-ui-npm
+      - build-static:
+          cache_version_js_dependencies: *version_js
+          name: build-static
+          filters:
+            branches:
+              only:
+                - main
+                - /^server-\d\..+/
+          requires:
+            - dependencies
+      - build-and-publish-container:
+          name: publish
+          image_name: *image_name
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          docker_registry: dockerhub
+          context: [org-global, web-ui-npm]
+          filters:
+            branches:
+              only: 
+                - main
+                - /^server-\d\..+/
+          requires:
+            - test
+            - test-production-docker-image
+            - build-static
+      - deploy-container:
+          name: deploy
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          should_deploy: false
+          docker_registry: dockerhub
+          context: [org-global, web-ui-npm]
+          filters:
+            branches:
+              only: main
+          requires:
+            - publish
+      - scotty-orb/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          promotion_component_list: "circleci/web-ui-server-admin"
+          requires:
+            - publish

@@ -1,0 +1,20 @@
+version: 2.1
+
+setup: true
+
+orbs:
+  path-filtering: circleci/path-filtering@0.0.1
+
+workflows:
+  generate-config:
+    jobs:
+      - path-filtering/filter:
+          name: check-updated-services
+          base-revision: main
+          config-path: .circleci/libraries-config.yml
+          mapping: |
+            rabbitmq/.* update-rabbitmq true
+            retry/.* update-retry true
+            worker/.* update-worker true
+            [^/]+ update-all-libraries true
+            .circleci/.* update-all-libraries true

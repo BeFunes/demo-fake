@@ -1,0 +1,118 @@
+version: 2.1
+
+executors:
+  golang-ci:
+    docker:
+      - image: golang:1.16-alpine3.13
+  python-ci:
+    docker:
+      - image: circleci/python:3.7
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+commands:
+  setup:
+    steps:
+      - run: apk add make git openssh
+      - checkout
+      - run: make ci-setup
+
+jobs:
+  lint:
+    executor:
+      name: golang-ci
+    steps:
+      - setup
+      - run: make lint
+  test:
+    executor:
+      name: golang-ci
+    steps:
+      - setup
+      - run: make test
+  check-memory:
+    executor:
+      name: golang-ci
+    steps:
+      - setup
+      - run: go run ./cmd/memory-usage/ ./config/production.yaml ./k8s-values.yml
+  honeycomb-update:
+    executor:
+      name: python-ci
+    steps:
+      - checkout
+      - run: (cd honeycomb; pipenv install)
+      - run: |-
+          if git diff --quiet HEAD HEAD^ -- honeycomb/; then
+            echo "no change"
+          else
+            cd honeycomb
+            pipenv run ./update-derived-columns
+            pipenv run ./update-boards --update
+            pipenv run ./update-columns
+            pipenv run ./update-triggers
+            cd ..
+          fi
+  build:
+    executor:
+      name: golang-ci
+    steps:
+      - setup
+      - run: make
+      - persist_to_workspace:
+          root: .
+          paths: ./bin/cci-synthetics
+
+  publish-deploy:
+    executor:
+      name: ccc
+    environment:
+      NAME: cci-synthetics
+      DOCKERFILE_PATH: Dockerfile
+      DEPLOY_TYPE: helm
+      DOCKER_REGISTRY: ecr
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/cci-synthetics
+      VALUES_FILE: k8s-values.yml
+      NAMESPACE: jail
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: publish
+      - run: deploy
+
+  publish-canary:
+    executor:
+      name: ccc
+    environment:
+      NAME: cci-synthetics-canary
+      IMAGE_NAME: circleci/cci-synthetics
+      DOCKERFILE_PATH: Dockerfile
+      DEPLOY_TYPE: helm
+      DOCKER_REGISTRY: ecr
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/cci-synthetics
+      VALUES_FILE: values.yml
+      NAMESPACE: jail
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: /deploy/merge-values k8s-values.yml canary-overrides.yml > values.yml
+      - run: publish
+      - run: deploy
+
+workflows:
+  build-publish-deploy:
+    jobs:
+      - lint
+      - test
+      - build:
+          requires:
+            - lint
+      - check-memory

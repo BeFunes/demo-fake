@@ -1,0 +1,139 @@
+version: 2.1
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $RO_DOCKER_HUB_USERNAME
+          password: $RO_DOCKER_HUB_PASSWORD
+
+commands:
+  initialise:
+    description: Initial CI setup before CCC runs
+    parameters:
+      custom-values-file:
+        description: The custom values file to use
+        type: string
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: 20.10.11
+      - run:
+          name: Override chart values with template that CCC expects
+          command: |
+            cp node-local-dns-cache/Chart.yaml /tmp/Chart.yaml
+            /deploy/merge-values /tmp/Chart.yaml chart-CI-overrides.yaml > node-local-dns-cache/Chart.yaml
+      - run:
+          name: Apply values now because CCC does not allow using custom values file with custom chart
+          command: |
+            cp node-local-dns-cache/values.yaml /tmp/values.yaml
+            /deploy/merge-values /tmp/values.yaml << parameters.custom-values-file >> > node-local-dns-cache/values.yaml
+
+jobs:
+  deploy:
+    parameters:
+      release-suffix:
+        description: "Suffix for the release name"
+        type: string
+      custom-values-file:
+        description: The custom values file to use
+        type: string
+    executor: ccc
+    environment: &ccc-environment
+      NAME: node-local-dns-cache-<< parameters.release-suffix >>
+      NAMESPACE: kube-system
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: ecr
+      IMAGE_NAME: circleci/node-local-dns-cache
+      CUSTOM_CHART: node-local-dns-cache
+      CONFIGURE_ECR_REPO: "true"
+      ECR_OWNER_TEAM: InfraEng
+      # TODO: Remove when https://github.com/kubernetes/dns/pull/500 is fixed
+      TWISTLOCK_ENFORCE: "false"
+    steps:
+      - initialise:
+          custom-values-file: << parameters.custom-values-file >>
+      - run: publish
+      - run: deploy
+
+  deploy-dry-run:
+    parameters:
+      release-suffix:
+        description: "Suffix for the release name"
+        type: string
+      custom-values-file:
+        description: The custom values file to use
+        type: string
+    executor: ccc
+    environment: *ccc-environment
+    steps:
+      - initialise:
+          custom-values-file: << parameters.custom-values-file >>
+      - run: scan
+      - run: /deploy/dry-run
+
+workflows:
+  version: 2
+  main:
+    jobs:
+      - deploy-dry-run:
+          name: deploy-dry-run-canary
+          release-suffix: canary
+          custom-values-file: custom-values-canary.yaml
+          context:
+            - org-global
+            - dockerhub-readonly
+          filters:
+            branches:
+              ignore: main
+      - deploy-dry-run:
+          name: deploy-dry-run-vault
+          release-suffix: vault
+          custom-values-file: custom-values-vault.yaml
+          context:
+            - org-global
+            - dockerhub-readonly
+          filters:
+            branches:
+              ignore: main
+      - deploy-dry-run:
+          name: deploy-dry-run-prod
+          release-suffix: prod
+          custom-values-file: custom-values-prod.yaml
+          context:
+            - org-global
+            - dockerhub-readonly
+          filters:
+            branches:
+              ignore: main
+      - deploy:
+          name: deploy-vault
+          release-suffix: vault
+          custom-values-file: custom-values-vault.yaml
+          context:
+            - org-global
+            - dockerhub-readonly
+          filters:
+            branches:
+              only: main
+      - deploy:
+          name: deploy-canary
+          release-suffix: canary
+          custom-values-file: custom-values-canary.yaml
+          context:
+            - org-global
+            - dockerhub-readonly
+          filters:
+            branches:
+              only: main
+      - deploy:
+          name: deploy-prod
+          release-suffix: prod
+          custom-values-file: custom-values-prod.yaml
+          context:
+            - org-global
+            - dockerhub-readonly
+          filters:
+            branches:
+              only: main

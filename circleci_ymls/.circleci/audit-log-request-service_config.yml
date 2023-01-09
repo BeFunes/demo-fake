@@ -1,0 +1,233 @@
+version: 2.1
+
+orbs:
+  codecov: codecov/codecov@1.2.2
+
+executors:
+  # Base Docker image for Clojure services
+  # https://github.com/circleci/clojure-service-image
+  clj:
+    docker:
+      - image: circleci/clojure-service:0.8-dev
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+      - image: cimg/postgres:13.5
+        environment:
+          PGPORT: 5501
+          PGUSER: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: auditlogrequestservice
+      - image: rabbitmq:3.10.5-management
+        environment:
+          RABBITMQ_NODE_PORT: 5502
+  # Docker image for container-related shorthands
+  # https://github.com/circleci/command-convenience-containers
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+commands:
+  restore-deps:
+    description: "Restore maven deps from cache and run lein deps"
+    steps:
+      - restore_cache:
+          keys:
+            - maven-{{ checksum "project.clj" }}
+            - maven
+      - run:
+          name: Fetch dependencies
+          command: lein with-profile dev deps
+  save-deps:
+    description: "Save maven deps to cache"
+    steps:
+      - save_cache:
+          key: maven-{{ checksum "project.clj" }}
+          paths:
+            - ~/.m2
+
+jobs:
+  # Initialize the environment by pulling maven dependencies into ~/.m2 and caching them for future
+  # steps and future builds.
+  init-service:
+    executor:
+      name: clj
+    steps:
+      - checkout
+      - restore-deps
+      - save-deps
+
+  # Build the uberjar (the standalone JAR file that ends up deployed in production)
+  build-service-uberjar:
+    executor:
+      name: clj
+    steps:
+      - checkout
+      - restore-deps
+      - run:
+          name: Build uberjar
+          command: |
+            lein uberjar
+            cp -v target/audit-log-request-service-*-standalone.jar target/audit-log-request-service-standalone.jar
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target/audit-log-request-service-standalone.jar
+
+  # Runs linters on the Clojure code
+  lint-service:
+    executor:
+      name: clj
+    steps:
+      - checkout
+      - restore-deps
+      - run: lein clj-kondo
+      - run: lein eastwood
+      - run: lein cljfmt check
+
+  # Runs all the Clojure tests
+  test-service:
+    executor:
+      name: clj
+    steps:
+      - checkout
+      - restore-deps
+      # See the project.clj file for the differences between test and test-ci:
+      # Usually this means `test` plus coverage and junit output plugins
+      - run: lein test-ci
+      - store_test_results:
+          path: target/test-results
+      - codecov/upload
+
+  # Outputs the helm diff compared to helm's production charts
+  dry-run-service:
+    executor:
+      name: ccc
+    environment:
+      # These need to match the variables in your deployment job to get a meaningful diff
+      NAME: audit-log-request-service
+      VALUES_FILE: values.yml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: /deploy/dry-run
+
+  # Runs a Twistlock/Prisma scan on feature branches
+  # See https://github.com/circleci/engineering/blob/master/howto/prisma-scan-for-vulns.md
+  scan-service:
+    executor:
+      name: ccc
+    environment:
+      NAME: audit-log-request-service
+      DEPLOY_CLOJURE_JARFILE: target/audit-log-request-service-standalone.jar
+      TWISTCLI_DEBUG: true
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: scan
+      - store_artifacts:
+          path: ccc-image-scan-results
+          destination: audit-log-request-service/ccc-image-scan-results
+
+  # Publishes to ECR/Docker Hub and deploys the service on main branch
+  publish-deploy-service:
+    executor:
+      name: ccc
+    environment: &ccc-environment
+      NAME: audit-log-request-service
+      DEPLOY_CLOJURE_JARFILE: target/audit-log-request-service-standalone.jar
+      CONFIGURE_ECR_REPO: true
+      ECR_OWNER_TEAM: AdminTooling
+      DOCKER_REGISTRY: ecr
+      VALUES_FILE: values.yml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: publish
+      - run: deploy
+
+  # Publishes to ECR/Docker Hub and deploys the service on canary branch
+  publish-deploy-service-canary:
+    executor:
+      name: ccc
+    environment:
+      <<: *ccc-environment
+      RELEASE_VERSION: canary
+      DEPLOY_ENVIRONMENT: canary
+      VALUES_FILE: canary.yml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: publish
+      - run: /deploy/merge-values values.yml canary-overrides.yml > canary.yml
+      - run: deploy
+
+workflows:
+  build-test-deploy:
+    jobs:
+      - init-service:
+          context: org-global
+      - build-service-uberjar:
+          context: org-global
+          requires:
+            - init-service
+      - lint-service:
+          context: org-global
+          requires:
+            - init-service
+      - test-service:
+          context: org-global
+          requires:
+            - init-service
+      - dry-run-service:
+          context: org-global
+          requires:
+            - init-service
+          filters:
+            branches:
+              # diffs are included automatically by actual deploys
+              ignore:
+                - main
+                - canary
+      - scan-service:
+          context: org-global
+          requires:
+            - build-service-uberjar
+          filters:
+            branches:
+              # fret not, scans are run on main as part of the real publish
+              ignore:
+                - main
+                - canary
+      - publish-deploy-service:
+          context:
+            - org-global
+          requires:
+            - build-service-uberjar
+            - lint-service
+            - test-service
+          filters:
+            branches:
+              only:
+                - main
+      - publish-deploy-service-canary:
+          context:
+            - org-global
+          requires:
+            - build-service-uberjar
+            - lint-service
+            - test-service
+          filters:
+            branches:
+              only:
+                - canary

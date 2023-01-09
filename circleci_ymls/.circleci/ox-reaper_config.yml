@@ -1,0 +1,50 @@
+version: 2.1
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    environment:
+      NAME: ox-reaper
+      DOCKERFILE_PATH: Dockerfile
+
+jobs:
+  test-container-build:
+    executor: ccc
+    environment:
+      DOCKER_REGISTRY: none
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: publish
+  deploy:
+    executor: ccc
+    environment:
+      DOCKER_REGISTRY: ecr
+      DEPLOY_TYPE: helm
+      VALUES_FILE: kubernetes.yaml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: publish
+      - run: deploy
+
+workflows:
+  version: 2
+  test:
+    jobs:
+      - test-container-build:
+          context: org-global
+          filters:
+            branches:
+              ignore: master
+  deploy:
+    jobs:
+      - deploy:
+          context: org-global
+          filters:
+            branches:
+              only: master

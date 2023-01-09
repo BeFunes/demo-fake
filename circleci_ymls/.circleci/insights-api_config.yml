@@ -1,0 +1,26 @@
+version: 2.1
+
+setup: true
+
+orbs:
+  path-filtering: circleci/path-filtering@0.0.1
+
+workflows:
+  generate-config:
+    jobs:
+      - path-filtering/filter:
+          name: check-updated-services
+          base-revision: main
+          config-path: .circleci/services-config.yml
+          mapping: |
+            services/insights-api/.* update-insights-api true
+            services/resource-usage-worker/.* update-resource-usage-worker true
+            services/workflows-events-subscriber/.* update-workflows-events-subscriber true
+            services/job-events-subscriber/.* update-job-events-subscriber true
+            services/usage-recorded-subscriber/.* update-usage-recorded-subscriber true
+            services/hierarchy-lookup-subscriber/.* update-hierarchy-lookup-subscriber true
+            services/test-splitting-impact/.* update-test-splitting-impact true
+            common/.* update-common true
+            migrations/.* update-all-services true
+            [^/]+ update-all-services true
+            .circleci/.* update-all-services true

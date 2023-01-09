@@ -1,0 +1,65 @@
+version: 2.1
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+commands:
+  initialize:
+    description: Initial CI setup before CCC runs
+    steps:
+      - checkout
+      - setup_remote_docker
+      # Override some chart values with template that CCC expects
+      - run: cp firehydrant-k8s/Chart.yaml /tmp/Chart.yaml
+      - run: /deploy/merge-values /tmp/Chart.yaml chart-CI-overrides.yml > firehydrant-k8s/Chart.yaml
+      # Apply values now because CCC does not allow using custom values file with custom chart
+      - run: cp firehydrant-k8s/values.yaml /tmp/values.yaml
+      - run: /deploy/merge-values /tmp/values.yaml custom-values.yaml > firehydrant-k8s/values.yaml
+
+jobs:
+  deploy:
+    executor: ccc
+    environment: &ccc-environment
+      NAME: firehydrant
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: ecr
+      IMAGE_NAME: circleci/firehydrant
+      CUSTOM_CHART: firehydrant-k8s
+      NAMESPACE: sre
+      CONFIGURE_ECR_REPO: true
+      ECR_OWNER_TEAM: InfraEng
+      TWISTLOCK_ENFORCE: true
+    steps:
+      - initialize
+      - run: publish
+      - run: deploy
+
+  dry-run:
+    executor: ccc
+    environment: *ccc-environment
+    steps:
+      - initialize
+      - run: scan
+      - run: /deploy/dry-run
+
+workflows:
+  version: 2
+  main:
+    jobs:
+      - dry-run:
+          context:
+            - org-global
+          filters:
+            branches:
+              ignore: main
+      - deploy:
+          context:
+            - org-global
+          filters:
+            branches:
+              only: main

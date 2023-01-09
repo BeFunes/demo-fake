@@ -1,0 +1,76 @@
+version: 2.1
+
+orbs:
+  codecov: codecov/codecov@1.2.2
+
+jobs:
+  deps:
+    docker:
+      - image: clojure:lein-2.7.1
+    working_directory: /root/statsd
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-jars-{{ checksum "project.clj" }}
+            - v1-jars
+      - run: lein deps
+      - save_cache:
+          key: v1-jars-{{ checksum "project.clj" }}
+          paths:
+            - /root/.m2
+  build:
+    docker:
+      - image: clojure:lein-2.7.1
+    working_directory: /root/statsd
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-jars-{{ checksum "project.clj" }}
+            - v1-jars
+      - run: lein test
+  coverage:
+    docker:
+      - image: clojure:lein-2.7.1
+    working_directory: /root/statsd
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-jars-{{ checksum "project.clj" }}
+            - v1-jars
+      - run: lein cloverage --codecov
+      - codecov/upload
+  deploy:
+    docker:
+      - image: clojure:lein-2.7.1
+    working_directory: /root/statsd
+    steps:
+      - checkout
+
+      - run:
+          name: Push to Clojars
+          command: |
+            sed -i'' -e "s/^\((defproject.*\)\.0-SNAPSHOT/\1.${CIRCLE_BUILD_NUM}/" project.clj
+            lein deploy
+
+workflows:
+  version: 2
+  build-and-deploy:
+    jobs:
+      - deps
+      - build:
+          requires:
+            - deps
+      - coverage:
+          requires:
+            - deps
+      - deploy:
+          context: clojars-publish
+          requires:
+            - build
+            - coverage
+          filters:
+            branches:
+              only: main

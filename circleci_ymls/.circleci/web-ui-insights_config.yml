@@ -1,0 +1,497 @@
+version: 2.1
+
+orbs:
+  web-ui-orb: sandbox/web-ui-orb@3.11.0
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+  cypress: cypress-io/cypress@1.29.0
+  codecov: codecov/codecov@3.2.2
+
+references:
+  image_name: &image_name 'web-ui-insights'
+  optimizely_sdk_key: &optimizely_sdk_key GfYszBpMkefBSwiiEkH3b3
+  hostname: &hostname app.circleci.com
+
+parameters:
+  cypress_parallelism:
+    type: integer
+    default: 3 # should be equal to the number of cypress test files
+
+commands:
+  inject-npm-token:
+    steps:
+      - run:
+          name: Inject NPM Token into build script
+          command: 
+            sed 's:docker build:docker build --build-arg NPM_TOKEN=$NPM_TOKEN:'
+            -i /publish/scripts/create-image.sh
+  verify-npm-token:
+    steps:
+      - run:
+          name: Check for NPM_TOKEN
+          command: |
+            if [ -z "$NPM_TOKEN" ]; then
+              echo "Error: The environment variable NPM_TOKEN is empty. Please ensure the environment variable NPM_TOKEN has been added (you likely need the web-ui-npm context)"
+              exit 1
+            fi
+  save-coverage-directory:
+    steps:
+      - run:
+          name: Update $COVERAGE_DIRECTORY
+          command: echo 'export JEST_JUNIT_OUTPUT_NAME=test-results/results-$CIRCLE_NODE_INDEX.xml' >> $BASH_ENV
+
+  restore-yarn-cache:
+    description: "Restore node_modules cache"
+    steps:
+      - restore_cache:
+          keys: 
+            - insights-v3-{{arch}}-{{checksum "yarn.lock"}}
+
+  restore-cypress-cache:
+    description: "Restore Cypress binary cache"
+    steps:
+      - restore_cache:
+          keys: 
+            - cypress-{{arch}}-{{checksum "yarn.lock"}}
+  
+  restore-next-cache:
+    description: "Restore NextJS build cache"
+    steps: 
+      - restore_cache:
+          keys: 
+            - next-{{arch}}-{{checksum "yarn.lock"}}
+
+executors:
+  cypress:
+    docker:
+      - image: cypress/base:14
+    working_directory: /mnt/ramdisk
+    resource_class: medium+
+
+  ci-node:
+    docker:
+       - image: cimg/node:14.18.2
+    resource_class: medium+
+    working_directory: /mnt/ramdisk
+  
+  docker-executor: # for use with CCC. need a different image than the others to prevent errors
+    docker:
+       - image: circleci/node:14
+    working_directory: /mnt/ramdisk
+    resource_class: medium+
+
+jobs:
+  audit:
+    executor: ci-node 
+    steps:
+      - checkout 
+      - run: 
+          name: 'yarn audit'
+          command: yarn audit
+
+  dependencies:
+    executor: ci-node
+    steps:
+      - verify-npm-token
+      - checkout
+      - restore-yarn-cache
+      - run:
+          name: 'Login to npm'
+          command: echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
+      - run:
+          name: Install yarn deps 
+          command: yarn install --frozen-lockfile 
+      - save_cache:
+          paths:
+            - node_modules 
+          key: insights-v3-{{arch}}-{{checksum "yarn.lock"}}
+
+  typecheck:
+    executor: ci-node 
+    steps:
+      - checkout 
+      - restore-yarn-cache
+      - run:
+          name: Typecheck
+          command: yarn typecheck
+
+  lint:
+    executor: ci-node
+    steps:
+      - checkout
+      - restore-yarn-cache
+      - run: 
+          name: Lint
+          command: yarn lint
+      
+  run-jest-tests:
+    executor: ci-node
+    parallelism: 10
+    steps:
+      - checkout
+      - restore-yarn-cache
+      - save-coverage-directory
+      - run:
+          name: Split tests
+          command: 'circleci tests glob "src/**/*.test.{ts,tsx}" | circleci tests split >
+          /tmp/jest-tests.txt'
+      - run: 
+          name: Run jest tests 
+          command: yarn test:ci --coverage-directory=test-results/coverage $(cat /tmp/jest-tests.txt)
+      - run:
+          name: Rename coverage file for codecov
+          command: mv test-results/coverage/coverage-final.json test-results/coverage/coverage-${CIRCLE_NODE_INDEX}.json
+      - persist_to_workspace:
+          root: .
+          paths: test-results/coverage/*
+      - store_artifacts:
+          path: test-results
+      - store_test_results:
+          path: test-results
+
+  upload-coverage:
+    # We can't run this in parallel, so it runs after all the tests have completed
+    # Merges all of the coverage reports into one, uploads to codecov
+    executor: ci-node
+    steps: 
+      - checkout
+      - restore-yarn-cache
+      - attach_workspace:
+          at: .
+      - run:
+          name: Merge coverage reports with nyc
+          command: yarn nyc merge --cwd $(pwd) test-results/coverage tmp/final-coverage.json
+      - codecov/upload:
+          file: tmp/final-coverage.json
+
+  chromatic:
+    executor: ci-node
+    steps:
+      - checkout 
+      - restore-yarn-cache 
+      - run:
+          name: "Generate snapshots and upload to chromatic"
+          command: |
+            export CHANGED=$(git diff --name-only origin/main... | grep -E "src\/.*\.(ts|tsx)$")
+            main() {
+              if [ -z "$CHANGED" ] && [ "$CIRCLE_BRANCH" != "main" ]; then
+                # On main, we still upload so that chromatic has the latest commit to compare to
+                echo "No components changed; skipping chromatic"
+                yarn chromatic --skip
+                exit 0
+              fi
+              if [ "$CIRCLE_BRANCH" == "main" ]; then
+                # We know any changes that make it to main *must* have been approved
+                yarn chromatic --auto-accept-changes
+                exit $?
+              fi
+              yarn chromatic --exit-once-uploaded
+            }
+            main "$@"
+
+  build-next-app:
+    executor: ci-node
+    steps:
+      - checkout
+      - restore-yarn-cache
+      - restore-next-cache
+      - run:
+          name: Build nextjs app
+          command: BUILD_ID="$CIRCLE_SHA1" yarn build
+      - save_cache:
+          paths: 
+            - src/.next
+            - .next 
+          key: next-{{arch}}-{{checksum "yarn.lock"}}
+      - persist_to_workspace:
+          paths:
+            - src/.next
+            - .next
+          root: . 
+
+  deploy-static:
+    executor: ci-node 
+    parameters:
+      bucket_name:
+        description: The name of the s3 bucket where static assets are stored.
+        type: string
+      build_dir:
+        default: "./.next"
+        description: The path to the NextJS build directory
+        type: string
+      cdn_url:
+        description: The url of the CDN where we host assets for this app.
+        type: string
+      cdn_url_build_dir:
+        default: "_next"
+        description: The path to the NextJS build directory on the CDN
+        type: string
+      cache_control_ttl:
+        default: 31536000
+        description: |
+          The number of seconds the browser should cache JS, CSS, and image assets. Default is 365 days.
+          Deploys will create new hash file names which will break the cache.
+        type: integer
+    steps:
+      - checkout 
+      - restore-yarn-cache 
+      - restore-next-cache 
+      - attach_workspace: # assumes NextJs build exists here
+          at: .
+      - run: 
+          name: Install AWS CLI for S3 Uploads 
+          command: |
+            sudo apt update
+            sudo apt-get install awscli
+      - run:
+          name: Upload build static files to S3
+          command: |
+            AWS_S3_BUCKET=<< parameters.bucket_name >>
+            BUILD_DIRECTORY=<< parameters.build_dir >>
+            BUILD_ID="$(cat $BUILD_DIRECTORY/BUILD_ID)"
+            CACHE_TTL=<< parameters.cache_control_ttl >>
+
+            if [[ -d "$BUILD_DIRECTORY/static" ]] ; then
+              aws s3 cp "$BUILD_DIRECTORY/static" "s3://$AWS_S3_BUCKET/_next/static" \
+                --recursive --exclude="*.js.map" --cache-control max-age=$CACHE_TTL
+            fi
+            if [[ -d "$BUILD_DIRECTORY/server/static/$BUILD_ID/pages" ]] ; then
+              aws s3 cp "$BUILD_DIRECTORY/server/static/$BUILD_ID/pages" "s3://$AWS_S3_BUCKET/_next/server/static/$BUILD_ID/pages" \
+                --recursive --exclude="*.js.map" --cache-control max-age=$CACHE_TTL
+            fi
+      - run:
+          name: Upload sourcemaps to Rollbar
+          command: | 
+            BUILD_DIRECTORY=<< parameters.build_dir >>
+            BUILD_ID="$(cat $BUILD_DIRECTORY/BUILD_ID)"
+
+            find $BUILD_DIRECTORY/server $BUILD_DIRECTORY/static -name '*.js' -type f -print0 |
+            while IFS= read -r -d '' line; do
+              if [[ $line =~ ^[.] ]]; # if the glob starts with a period, remove it
+              then
+                name=${line/./}
+              else
+                name=${line}
+              fi
+              url="<< parameters.cdn_url>>${name/./_}"
+              map="$line.map"
+
+            if [[ -f "$map" ]];
+            then
+              echo "Uploading source map: ${map}"
+              curl https://api.rollbar.com/api/1/sourcemap \
+                -F access_token="$EXCEPTION_LOGGER_SERVER_TOKEN" \
+                -F version="$BUILD_ID" \
+                -F minified_url="$url"\
+                -F "source_map=@$map"
+            fi
+            done
+      - run:
+          name: Upload sourcemaps to Datadog RUM
+          command: |
+            BUILD_DIRECTORY=<< parameters.build_dir >>
+            BUILD_ID="$(cat $BUILD_DIRECTORY/BUILD_ID)"
+            
+            if [ -z "$DATADOG_API_KEY" ]; then
+            echo "Warning: The environment variable DATADOG_API_KEY is empty. If you want to send source maps to Datadog RUM, please ensure the web-ui-datadog context has been added to your config."
+            else
+              url="<< parameters.cdn_url>>/<< parameters.cdn_url_build_dir>>/"
+              echo "Uploading source maps to DDR"
+                yarn datadog-ci sourcemaps upload ./.next \
+                  --service=circleci \
+                  --release-version="$BUILD_ID" \
+                  --minified-path-prefix="$url"
+            fi
+  
+  build-and-scan-twistlock:
+    # builds the docker image and runs twistlock scan without publishing
+    executor: docker-executor
+    docker: 
+      - image: &ccc_image circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: web-ui-insights # image name
+          DOCKERFILE_PATH: Dockerfile
+    steps:
+      - checkout
+      - verify-npm-token
+      - restore-next-cache
+      - setup_remote_docker:
+          docker_layer_caching: true
+          version: 20.10.11
+      - inject-npm-token
+      - run: scan # https://github.com/circleci/command-convenience-containers/blob/main/publish/bin/scan
+      - store_artifacts:
+          path: /tmp/_lw-scanner_scan_result.json
+          destination: lacework_scan_result.json
+  
+  build-scan-and-publish:
+    # builds the docker image, scans with twistlock, and publishes 
+    executor: docker-executor
+    docker: 
+      - image: &ccc_image circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: web-ui-insights # image name
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: all
+    steps:
+      - checkout 
+      - verify-npm-token
+      - restore-next-cache 
+      - attach_workspace:
+          at: . # for nextjs build
+      - setup_remote_docker:
+          docker_layer_caching: true 
+          version: 20.10.11
+      - inject-npm-token
+      - run: publish # https://github.com/circleci/command-convenience-containers/blob/main/publish/bin/publish
+      - persist_to_workspace:
+          root: .
+          paths: 
+            - docker_image.tag
+
+
+workflows:
+  version: 2
+
+  build-test-and-deploy:
+    jobs:
+      - dependencies:
+          context: web-ui-npm
+      - audit
+      - typecheck:
+          requires:
+            - dependencies
+      - lint:
+          requires:
+            - dependencies
+      - run-jest-tests:
+          name: test
+          requires:
+            - dependencies
+      - upload-coverage:
+          name: Upload to codecov
+          requires: 
+            - test
+          filters:
+            branches:
+              ignore:
+                - canary
+      - chromatic:
+          requires:
+            - dependencies
+      - cypress/run:
+          name: cypress
+          executor: cypress
+          parallel: true
+          parallelism: <<pipeline.parameters.cypress_parallelism>>
+          requires:
+            - dependencies
+          pre-steps:
+            - checkout
+            - restore-yarn-cache
+            - restore-cypress-cache
+            - run:
+                name: Split tests
+                command: 'circleci tests glob "cypress/e2e/*" | circleci tests split >
+                /tmp/tests.txt'
+            - run:
+                name: Install cypress binary 
+                command: yarn cypress install
+          post-steps:
+            - save_cache:
+                paths:
+                  - ~/.cache/Cypress/
+                key: cypress-{{arch}}-{{checksum "yarn.lock"}}
+            - store_test_results:
+                path: 'test-results/cypress.xml' # cypress.json
+            - store_artifacts:
+                path: cypress/artifacts # this is in cypress.json
+          no-workspace: true
+          yarn: true
+          start: yarn start
+          wait-on:
+            '-c .circleci/wait-on-config.json
+            http://localhost:3000/insights/healthcheck'
+          command: yarn cypress run --spec $(cat /tmp/tests.txt) --config-file cypress.json 
+      - build-next-app:
+          requires:
+            - audit
+            - dependencies
+      - deploy-static:
+          bucket_name: 'circleci-web-ui-insights-assets/insights'
+          build_dir: ./.next
+          cdn_url: 'http://assets-insights.circleci.com/insights'
+          context: [web-ui-insights-assets, web-ui-npm, web-ui-datadog]
+          filters:
+            branches:
+              only: 
+                - main
+                - canary
+          requires:
+            - build-next-app
+      - build-and-scan-twistlock:
+          context: [web-ui-npm, org-global]
+          requires: 
+            - build-next-app
+          filters:
+            branches:
+              ignore:
+                - main
+                - canary
+                - /^server-\d\..+/
+      - build-scan-and-publish:
+          context: [web-ui-npm, org-global]
+          requires: 
+            - deploy-static 
+            - test 
+            - cypress 
+            - lint 
+            - typecheck
+            - chromatic
+          filters:
+            branches:
+              only:
+                - main
+                - /^server-\d\..+/
+                - canary
+      - web-ui-orb/deploy-container:
+          name: deploy-canary
+          image_name: *image_name
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [web-ui-npm, org-global]
+          values_file: k8s-canary-values.yml
+          release_version: canary
+          filters:
+            branches:
+              only: 
+                - canary
+          requires:
+            - build-scan-and-publish
+      - web-ui-orb/deploy-container:
+          name: deploy-production
+          image_name: *image_name
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [web-ui-npm, org-global]
+          filters:
+            branches:
+              only: 
+                - main
+          requires:
+            - build-scan-and-publish
+      - scotty-orb/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          promotion_component_list: 'circleci/web-ui-insights'
+          requires:
+            - build-scan-and-publish
+          filters:
+            branches:
+              only:
+                - main

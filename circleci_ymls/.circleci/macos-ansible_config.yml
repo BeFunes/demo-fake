@@ -1,0 +1,464 @@
+version: 2.1
+parameters:
+  run-nightly:
+    type: boolean
+    default: false
+  run-invalid-vm-cleanup-schedule:
+    type: boolean
+    default: false
+orbs:
+  slack: circleci/slack@4.4.2
+commands:
+  setup-container:
+    steps:
+      - checkout
+      - run:
+          name: setup ssh config
+          command: mv .circleci/ssh_config ~/.ssh/config
+      - run: git submodule sync
+      - run: git submodule update --init
+      - restore_cache:
+          key: "ansible-pipenv-{{ checksum \"ansible/Pipfile.lock\" }}"
+      - run:
+          name: install pip requirements
+          command: |
+            cd ansible
+            pipenv install
+      - save_cache:
+          key: "ansible-pipenv-{{ checksum \"ansible/Pipfile.lock\" }}"
+          paths:
+            - "/home/circleci/.local/share/virtualenvs"
+
+  skip_if_cache_exists:
+    description: |
+      a command to exit the job for selected branch
+    parameters:
+      job:
+        description: name of job to skip
+        type: string
+      changed:
+        description: what needs to change to not skip
+        type: string
+    steps:
+      - restore_cache:
+          key: skipcheck-<<parameters.job>>-<<parameters.changed>>
+      - run:
+          name: skip if cache exists
+          command: |
+            FILE=~/.cci-cache/job.<<parameters.job>>.flag
+            if test -f "$FILE"; then
+                echo "$FILE exists"
+                circleci step halt
+            else
+                echo "$FILE doesnt exist"
+            fi
+            echo "Skipping skip_if_cache exists ..."
+
+  save_cache_flag:
+    description: |
+      a command that will create the cache
+    parameters:
+      job:
+        description: name of job to skip
+        type: string
+      changed:
+        description: what needs to change to not skip
+        type: string
+    steps:
+      - run:
+          name: create cache flag file
+          command: mkdir -p ~/.cci-cache/ && touch ~/.cci-cache/job.<<parameters.job>>.flag
+      - save_cache:
+          key: skipcheck-<<parameters.job>>-<<parameters.changed>>
+          paths:
+            - ~/.cci-cache/job.<<parameters.job>>.flag
+
+  generate-dynamic-inventory-yaml:
+    description: |
+      generate a dynamic inventory YAML file
+    steps:
+      - run:
+          name: generate dynamic inventory yaml
+          command: |
+            cd ansible
+            mkdir -p /tmp/inventory
+            pipenv run ansible-inventory \
+              --inventory /tmp/artifacts/host-list-responsive_hosts.ini \
+              --inventory /tmp/artifacts/host-list-unreachable_hosts.ini \
+              --inventory /tmp/artifacts/host-list-unpatched_hosts.ini \
+              --list \
+              --yaml \
+              >/tmp/inventory/inventory.yml
+
+  ansible-lint:
+    parameters:
+      playbook:
+        type: string
+    steps:
+      - run:
+          name: run ansible-lint
+          command: |
+            cd ansible
+            pipenv run ansible-lint \
+              ./<<parameters.playbook>> \
+              --exclude=./ansible-roles -x204 2>&1 \
+              | tee ./.ansible-lint.tmp && test ! -s ./.ansible-lint.tmp
+            rm ./.ansible-lint.tmp
+
+  ansible-playbook:
+    parameters:
+      inventory:
+        type: string
+      playbook:
+        type: string
+      playbook-tag:
+        type: string
+        default: all
+      limit:
+        type: string
+        default: all
+      check:
+        type: boolean
+        default: true
+    steps:
+      - run:
+          name: create ansible-vault password file
+          command: |
+            cd ansible
+            echo ${ANSIBLE_VAULT_PASSWORD} > ${ANSIBLE_VAULT_FILE}
+      - run:
+          name: run ansible-playbook
+          command: |
+            cd ansible
+            pipenv run ansible-playbook \
+              --inventory <<parameters.inventory>> \
+              --inventory /tmp/inventory/inventory.yml \
+              --vault-password-file ${ANSIBLE_VAULT_FILE} \
+              <<parameters.playbook>> \
+              --tags <<parameters.playbook-tag>> \
+              --limit <<parameters.limit>> \
+              <<# parameters.check >>--check<</ parameters.check >>
+
+jobs:
+  legacy-ansible-lint-and-dry-run-mke-linux:
+    parameters:
+      region:
+        type: string
+    docker:
+      - image: circleci/python:3.9.2
+    steps:
+      - setup-container
+      - run:
+          name: install rsync
+          command: sudo apt install rsync
+      - ansible-lint:
+          playbook: "<<parameters.region>>/mke-linux.yml"
+      - ansible-playbook:
+          inventory: "<<parameters.region>>/inventory"
+          playbook: "<<parameters.region>>/mke-linux.yml"
+          check: true
+
+  legacy-ansible-deploy-mke-linux:
+    parameters:
+      region:
+        type: string
+    docker:
+      - image: circleci/python:3.9.2
+    steps:
+      - setup-container
+      - run:
+          name: install rsync
+          command: sudo apt install rsync
+      - ansible-playbook:
+          inventory: "<<parameters.region>>/inventory"
+          playbook: "<<parameters.region>>/mke-linux.yml"
+          check: false
+
+  build-python-projects:
+    docker:
+      - image: circleci/python:3.9.2
+    steps:
+      - setup-container
+      - skip_if_cache_exists:
+          job: "build-python-projects"
+          changed: "{{ checksum \"ansible/esxi-healthcheck/esxi_healthcheck/__init__.py\" }}"
+      - ansible-playbook:
+          inventory: "localhost,"
+          playbook: "python_build.yml"
+          check: false
+      - save_cache:
+          key: "esxi-healthcheck-dist-{{ checksum \"ansible/esxi-healthcheck/esxi_healthcheck/__init__.py\" }}"
+          paths:
+            - 'ansible/esxi-healthcheck/dist'
+      - save_cache_flag:
+          job: "build-python-projects"
+          changed: "{{ checksum \"ansible/esxi-healthcheck/esxi_healthcheck/__init__.py\" }}"
+      - slack/notify:
+                channel: macos-alerts
+                event: fail
+                template: basic_fail_1
+
+  lint-ansible-playbooks:
+    parameters:
+      playbook:
+        type: string
+    docker:
+      - image: circleci/python:3.9.2
+    steps:
+      - setup-container
+      - ansible-lint:
+          playbook: <<parameters.playbook>>
+
+  run-ansible:
+    parameters:
+      playbook:
+        type: string
+      inventory:
+        type: string
+        default: inventory.yml
+      playbook-tag:
+        type: string
+        default: all
+      region:
+        type: string
+        default: all
+      dry-run:
+        type: boolean
+        default: true
+      check:
+        type: boolean
+        default: true
+    docker:
+      - image: circleci/python:3.9.2
+    steps:
+      - setup-container
+      - restore_cache:
+          key: "esxi-healthcheck-dist-{{ checksum \"ansible/esxi-healthcheck/esxi_healthcheck/__init__.py\" }}"
+      - when:
+          condition: <<parameters.dry-run>>
+          steps:
+            - run:
+                name: limit dry-run inventory
+                command: sed -E 's/\[2\:[[:digit:]]+\]/[2:4]/' ansible/inventory.yml > ansible/inventory.check.yml
+      - ansible-playbook:
+          inventory: <<parameters.inventory>>
+          playbook: <<parameters.playbook>>
+          playbook-tag: <<parameters.playbook-tag>>
+          limit: <<parameters.region>>
+          check: <<parameters.check>>
+      - slack/notify:
+                channel: macos-alerts
+                event: fail
+                template: basic_fail_1
+
+  run-macos-image-manager:
+    docker:
+      - image: circleci/python:3.9.2
+    steps:           
+      - run:
+          name: trigger macos-image-manager
+          command: |
+            curl -X POST https://circleci.com/api/v1.1/project/gh/circleci/macos-image-manager/build -H "Circle-Token: $MACOS_IMAGE_MANAGER_TOKEN"
+
+workflows:
+  legacy-test-and-deploy-all:
+    when:
+      and:
+        - << pipeline.parameters.run-nightly >>
+        - not: <<pipeline.parameters.run-invalid-vm-cleanup-schedule>>
+        - equal: [ 'main', <<pipeline.git.branch>> ]
+    jobs:
+      - legacy-ansible-lint-and-dry-run-mke-linux:
+          matrix:
+            parameters:
+              region: ["us-mke-1a", "us-mke-1b", "us-mke-1c"]
+      - legacy-ansible-deploy-mke-linux:
+          requires:
+            - legacy-ansible-lint-and-dry-run-mke-linux
+          matrix:
+            parameters:
+              region: ["us-mke-1a", "us-mke-1b", "us-mke-1c"]
+          filters:
+            branches:
+              only:
+                - main
+
+  test:
+    when:
+      and:
+        - not: <<pipeline.parameters.run-nightly>>
+        - not: <<pipeline.parameters.run-invalid-vm-cleanup-schedule>>
+        - not:
+            equal: [ 'main', <<pipeline.git.branch>> ]
+        - not: 
+            equal: [ 'unlocker', <<pipeline.git.branch>> ]
+    jobs:
+      - build-python-projects
+      - lint-ansible-playbooks:
+          matrix:
+            parameters:
+              playbook: ["check-hosts.yml", "site.yml"]
+      - run-ansible:
+          name: dry-run-ansible-hosts
+          requires:
+            - lint-ansible-playbooks
+          playbook: 'check-hosts.yml'
+          inventory: 'inventory.check.yml'
+          post-steps:
+            - generate-dynamic-inventory-yaml
+            - save_cache:
+                key: "ansible-cache-{{ .Environment.CIRCLE_WORKFLOW_ID }}"
+                paths:
+                  - /tmp/facts_cache
+                  - /tmp/inventory
+      - run-ansible:
+          requires:
+            - build-python-projects
+            - dry-run-ansible-hosts
+          playbook: 'site.yml'
+          matrix:
+            parameters:
+              playbook-tag: ["access", "config", "images_cleanup", "invalid_vm_cleanup"]
+              region: ["us_mke_1a", "us_mke_1b", "us_mke_1c"]
+          pre-steps:
+            - restore_cache:
+                key: "ansible-cache-{{ .Environment.CIRCLE_WORKFLOW_ID }}"
+
+  deploy:
+    when:
+      and:
+        - not: <<pipeline.parameters.run-nightly>>
+        - not: <<pipeline.parameters.run-invalid-vm-cleanup-schedule>>
+        - equal: [ 'main', <<pipeline.git.branch>> ]
+    jobs:
+      - build-python-projects
+      - run-ansible:
+          name: run-ansible-hosts
+          playbook: 'check-hosts.yml'
+          dry-run: false
+          pre-steps:
+            - run:
+                name: set hosts cache retention to daily
+                command: date +%F >/tmp/cache-ansible-hosts
+            - skip_if_cache_exists:
+                job: "run-ansible-hosts"
+                changed: "{{ checksum \"/tmp/cache-ansible-hosts\" }}"
+          post-steps:
+            - store_artifacts:
+                path: /tmp/artifacts
+            - generate-dynamic-inventory-yaml
+            - save_cache:
+                key: "ansible-cache-{{ checksum \"/tmp/cache-ansible-hosts\" }}"
+                paths:
+                  - /tmp/facts_cache
+                  - /tmp/inventory
+            - save_cache_flag:
+                job: "run-ansible-hosts"
+                changed: "{{ checksum \"/tmp/cache-ansible-hosts\" }}"
+      - run-ansible:
+          requires:
+            - build-python-projects
+            - run-ansible-hosts
+          playbook: 'site.yml'
+          dry-run: false
+          check: false
+          matrix:
+            parameters:
+              playbook-tag: ["access", "config", "images_cleanup", "invalid_vm_cleanup"]
+              region: ["us_mke_1a", "us_mke_1b", "us_mke_1c"]
+          pre-steps:
+            - run:
+                name: set hosts cache retention to daily
+                command: date +%F >/tmp/cache-ansible-hosts
+            - restore_cache:
+               key: "ansible-cache-{{ checksum \"/tmp/cache-ansible-hosts\" }}"
+      #- run-macos-image-manager:
+      #   requires:
+      #     - run-ansible
+
+  nightly:
+    when: << pipeline.parameters.run-nightly >>
+    jobs:
+      - build-python-projects
+      - run-ansible:
+          name: run-ansible-hosts
+          playbook: 'check-hosts.yml'
+          dry-run: false
+          pre-steps:
+            - run:
+                name: set hosts cache retention to daily
+                command: date +%F >/tmp/cache-ansible-hosts
+            - skip_if_cache_exists:
+                job: "run-ansible-hosts"
+                changed: "{{ checksum \"/tmp/cache-ansible-hosts\" }}"
+          post-steps:
+            - store_artifacts:
+                path: /tmp/artifacts
+            - generate-dynamic-inventory-yaml
+            - save_cache:
+                key: "ansible-cache-{{ checksum \"/tmp/cache-ansible-hosts\" }}"
+                paths:
+                  - /tmp/facts_cache
+                  - /tmp/inventory
+            - save_cache_flag:
+                job: "run-ansible-hosts"
+                changed: "{{ checksum \"/tmp/cache-ansible-hosts\" }}"
+      - run-ansible:
+          requires:
+            - build-python-projects
+            - run-ansible-hosts
+          playbook: 'site.yml'
+          dry-run: false
+          check: false
+          matrix:
+            parameters:
+              playbook-tag: ["access", "config", "images_cleanup", "invalid_vm_cleanup", "kernel_modules"]
+              region: ["us_mke_1a", "us_mke_1b", "us_mke_1c"]
+          pre-steps:
+            - run:
+                name: set hosts cache retention to daily
+                command: date +%F >/tmp/cache-ansible-hosts
+            - restore_cache:
+                key: "ansible-cache-{{ checksum \"/tmp/cache-ansible-hosts\" }}"
+      - run-macos-image-manager:
+         requires:
+           - run-ansible
+  
+  hourly-invalid-vm-cleanup:
+    when: <<pipeline.parameters.run-invalid-vm-cleanup-schedule>>
+    jobs:
+      - run-ansible:
+          playbook: 'site.yml'
+          dry-run: false
+          check: false
+          matrix:
+            parameters:
+              playbook-tag: ["invalid_vm_cleanup"]
+              region: ["us_mke_1a", "us_mke_1b", "us_mke_1c"]
+          pre-steps:
+            - run:
+                name: set hosts cache retention to daily
+                command: date +%F >/tmp/cache-ansible-hosts
+            - restore_cache:
+                key: "ansible-cache-{{ checksum \"/tmp/cache-ansible-hosts\" }}"
+  
+  esxi-unlocker:
+    when:
+      equal: [ 'unlocker', <<pipeline.git.branch>> ]
+    jobs:
+      - run-ansible:
+          name: 'esxi-unlocker_check'
+          playbook: 'unlocker_esxi.yml'
+          inventory: 'inventory.unlocker_esxi.yml'
+          dry-run: false
+          check: true
+          region: "us_mke_1c"
+      - run-ansible:
+          name: 'esxi-unlocker'
+          playbook: 'unlocker_esxi.yml'
+          inventory: 'inventory.unlocker_esxi.yml'
+          dry-run: false
+          check: false
+          region: "us_mke_1c"
+          requires:
+            - esxi-unlocker_check

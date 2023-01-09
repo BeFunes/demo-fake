@@ -1,0 +1,42 @@
+version: 2.1
+jobs:
+  step-job:
+    docker:
+      - image: cimg/base:stable
+    parallelism: 3
+    steps:
+      - run:
+          name: "Say hello"
+          command: "echo Hello, World!"
+      - run:
+          name: "Write random data"
+          command: openssl rand -hex 4 > rand_${CIRCLE_NODE_INDEX}.txt
+      - run:
+          name: "Emulate doing things"
+          command: |
+            if [[ "$CIRCLE_NODE_INDEX" != "0" ]]; then
+              sleep 30
+            fi
+      - persist_to_workspace:
+          root: .
+          paths:
+          - rand_*
+  deploy-job:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          command: |
+            echo "this is a deploy step which needs data from the rand"
+            cat rand_*.txt
+
+workflows:
+  deploy-job-workflow:
+    jobs:
+      - step-job
+      - deploy-job:
+          requires:
+            - step-job
+

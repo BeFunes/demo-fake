@@ -1,0 +1,66 @@
+---
+version: 2.1
+
+jobs:
+  build:
+    docker:
+      - image: circleci/clojure-service:0.7-dev
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    parameters:
+      clojure_version:
+        description: "The version of Clojure to test with"
+        default: "1.10"
+        type: "string"
+    working_directory: /root/circle-specs
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - specs-jars-<< parameters.clojure_version >>-{{ checksum "project.clj" }}
+      - run: lein deps
+      - save_cache:
+          key: specs-jars-<< parameters.clojure_version >>-{{ checksum "project.clj" }}
+          paths:
+            - /root/.m2
+      - run:
+          name: Run tests
+          command: lein with-profile dev,<< parameters.clojure_version >> test
+
+  deploy:
+    docker:
+      - image: circleci/clojure-service:0.7-dev
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    working_directory: /root/circle-specs
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - specs-jars-1.10-{{ checksum "project.clj" }}
+      - run:
+          name: deploy
+          command: lein deploy circle-s3
+
+workflows:
+  version: 2
+  build-and-publish:
+    jobs:
+      - build:
+          clojure_version: "1.9"
+          name: build-1.9
+          context: org-global
+      - build:
+          clojure_version: "1.10"
+          name: build-1.10
+          context: org-global
+      - deploy:
+          context: org-global
+          requires:
+            - build-1.9
+            - build-1.10
+          filters:
+            branches:
+              only: master

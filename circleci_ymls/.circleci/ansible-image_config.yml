@@ -1,0 +1,51 @@
+---
+version: 2.1
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+jobs:
+  dry-run:
+    executor: ccc
+    environment: &ccc-environment
+      NAME: ansible
+      # The MAJOR_VERSION should match ansible version in requirements.txt
+      MAJOR_VERSION: 5.7
+      CONFIGURE_ECR_REPO: true
+      ECR_OWNER_TEAM: InfraEng
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: ecr
+      TWISTLOCK_ENFORCE: false
+    steps:
+      - setup_remote_docker
+      - checkout
+      - run: scan
+
+  deploy:
+    executor: ccc
+    environment:
+      <<: *ccc-environment
+    steps:
+      - setup_remote_docker
+      - checkout
+      - run: publish
+
+workflows:
+  version: 2
+  build-ansible-image:
+    jobs:
+      - deploy:
+          context: org-global
+          filters:
+            branches:
+              only: main
+      - dry-run:
+          context: org-global
+          filters:
+            branches:
+              ignore:
+                - main

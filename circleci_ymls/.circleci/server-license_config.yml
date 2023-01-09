@@ -1,0 +1,67 @@
+version: 2.1
+
+orbs:
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+
+workflows:
+  workflow:
+    jobs:
+      - scan: # scan the image without publishing it
+          context: org-global
+          filters:
+            branches:
+              ignore:
+                - main
+                - /^server-\d.*/
+      - btd: # build, test, deploy
+          context: org-global
+          filters:
+            branches:
+              only:
+                - main
+                - /^server-\d.*/
+      - scotty-orb/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          requires:
+            - btd
+          promotion_component_list: "circleci/server-license"
+          filters:
+            branches:
+              only:
+                - main
+                - /^server-\d.*/
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    environment:
+      NAME: server-license
+      DOCKER_REGISTRY: dockerhub
+      DOCKERFILE_PATH: Dockerfile
+
+commands:
+  remote_docker:
+    steps:
+      - setup_remote_docker:
+          version: "18.09.3"
+      - run: docker version
+
+jobs:
+  scan:
+    executor: ccc
+    steps:
+      - remote_docker
+      - checkout
+      - run: scan
+
+  btd:
+    executor: ccc
+    steps:
+      - remote_docker
+      - checkout
+      - run: publish

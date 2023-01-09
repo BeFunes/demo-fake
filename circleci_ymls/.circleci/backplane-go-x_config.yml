@@ -1,0 +1,73 @@
+version: 2.1
+
+executors:
+  go:
+    docker:
+      - image: circleci/go-service:0.1-dev
+        auth:
+          username: $RO_DOCKER_HUB_USERNAME
+          password: $RO_DOCKER_HUB_PASSWORD
+  docker-compose:
+    machine:
+      image: ubuntu-2004:202111-02
+
+commands:
+  test-package:
+    description: "Run tests in a single package"
+    parameters:
+      package-name:
+        type: string
+    steps:
+      - checkout
+      - run:
+          name: docker login
+          command: >
+            echo $DOCKER_HUB_PASSWORD |
+            docker login --username $DOCKER_HUB_USER --password-stdin
+      - run:
+          name: run tests
+          command: TEST_DIR="./<< parameters.package-name >>/..." docker-compose run --rm testcontainer
+      - run:
+          name: Strip ANSI codes from xunit output
+          when: always
+          command: |
+            # The test output produces ANSI codes, which the XML writer converts into annoying
+            # \0xfffd characters - we'll strip these out to make the XML a bit more readable
+            sed -i 's/�\[[0-9;]*[a-zA-Z]//g' /tmp/test-results/*.xml || true
+      - store_test_results:
+          path: /tmp/test-results-<< parameters.package-name >>
+
+jobs:
+  lint:
+    executor: go
+    steps:
+      - checkout
+      - run: task go-service:private-go-mod-init
+      - run: task check-go-mod
+      - run: task lint
+  test-rabbitmq:
+    executor: docker-compose
+    steps:
+      - test-package:
+          package-name: "rabbitmq"
+  test-pubsub:
+    executor: docker-compose
+    steps:
+      - test-package:
+          package-name: "pubsub"
+
+workflows:
+  publish:
+    jobs:
+      - lint:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - test-rabbitmq:
+          context:
+            - org-global
+            - github-readonly
+      - test-pubsub:
+          context:
+            - org-global
+            - github-readonly

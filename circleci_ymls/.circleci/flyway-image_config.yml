@@ -1,0 +1,166 @@
+version: 2.1
+
+orbs:
+  slack: circleci/slack@3.4.2
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: flyway
+          DOCKERFILE_PATH: Dockerfile
+          DOCKERFILE_TARGET: production
+          DOCKER_REGISTRY: none
+          MAJOR_VERSION: "0.1"
+  integration:
+    machine:
+      image: ubuntu-2004:202201-02
+      docker_layer_caching: true
+
+jobs:
+  record-previous-release:
+    executor: ccc
+    working_directory: ~/flyway-image
+    steps:
+      - setup_remote_docker
+      - checkout
+      - run:
+          name: Log in to Docker Hub
+          command: docker login -u ${DOCKER_HUB_USER} -p ${DOCKER_HUB_PASSWORD}
+      - run:
+          name: Get the most recent build for the major version
+          command: docker pull circleci/${NAME}:${MAJOR_VERSION}
+      - run:
+          name: Record the previously installed packages
+          command: |
+            mkdir previous-release
+            docker run --entrypoint '/bin/sh' circleci/${NAME}:${MAJOR_VERSION} -c 'apt list --installed' > previous-release/package-list.txt
+      - persist_to_workspace:
+           root: previous-release
+           paths:
+             - package-list.txt
+  test:
+    executor: integration
+    steps:
+      - checkout
+      - run:
+          name: Build test container
+          command: |
+            docker build \
+              --target test \
+              --tag flyway:test \
+              .
+      - run:
+          name: Create Docker network for container-to-container comms
+          command: |
+            docker network inspect flyway >/dev/null 2>&1 \
+              || docker network create --driver bridge flyway
+      - run:
+          name: Start PostgreSQL container
+          command: |
+            docker run \
+              --detach \
+              --name postgres \
+              --network flyway \
+              -e POSTGRES_USER=test_user \
+              -e POSTGRES_PASSWORD=test_pass \
+              -e POSTGRES_DB=test_db \
+              postgres:12.5
+      - run:
+          name: Test with DATABASE_URL
+          command: ./bin/run-tests
+          environment:
+            DATABASE_URL: 'jdbc:postgresql://postgres:5432/test_db?user=test_user&password=test_pass'
+      - run:
+          name: Test with DATABASE_USER, DATABASE_PASS, DATABASE_URL
+          command: ./bin/run-tests
+          environment:
+            DATABASE_URL: 'jdbc:postgresql://postgres:5432/test_db?user=test_user&password=test_pass'
+            DATABASE_USER: wrong_user
+            DATABASE_PASSWORD: wrong_pass
+      - run:
+          name: Test with DATABASE_USER, DATABASE_PASS, DATABASE_HOST
+          command: ./bin/run-tests
+          environment:
+            DATABASE_HOST: postgres
+            DATABASE_USER: test_user
+            DATABASE_PASSWORD: test_pass
+            DATABASE_NAME: test_db
+  build-deploy:
+    executor: ccc
+    working_directory: ~/flyway-image
+    steps:
+      - setup_remote_docker
+      - checkout
+      - run:
+          name: Build a test version of the container
+          command: publish
+      - attach_workspace:
+          at: previous-release
+      - run:
+          name: Check if the version should be pushed for real
+          command: |
+            CONTAINER_VERSION=$(cat docker_image.tag)
+            if [ ! -f previous-release/package-list.txt ] ; then
+              echo "Not running under cron job; proceeding to publish step"
+            elif diff -u previous-release/package-list.txt <(docker run --entrypoint '/bin/sh' circleci/${NAME}:${CONTAINER_VERSION} -c 'apt list --installed');
+            then
+              echo "Detected cron job and no diff in packages; not publishing a new version"
+              circleci-agent step halt
+            else
+              echo "Diff detected; proceeding to publish step"
+            fi
+      - run:
+          name: Publish the container for real
+          command: |
+            if [ "${CIRCLE_BRANCH}" = "main" ]; then
+              DOCKER_REGISTRY=all publish
+            elif [[ "$CIRCLE_BRANCH" == experimental* ]]; then
+              branch="$(tr '/A-Z' '-a-z' \<<<"$CIRCLE_BRANCH" | sed 's/^[0-9-]\+//')"
+              export MAJOR_VERSION="${branch:-experimental}"
+              DOCKER_REGISTRY=all publish
+            fi
+      - slack/status:
+          fail_only: true
+          failure_message: "Failed to publish an image for ${CIRCLE_PROJECT_REPONAME}"
+          only_for_branches: main
+          include_project_field: false
+          include_job_number_field: false
+      - run:
+          name: Create a Jira ticket for failed builds
+          when: on_fail
+          command: |
+            if [ "${CIRCLE_BRANCH}" = "main" ]; then
+              bin/ensure-build-failure-issue
+            fi
+
+workflows:
+  version: 2
+  build-deploy-push:
+    jobs:
+      - test
+      - build-deploy:
+          context: org-global
+          requires:
+            - test
+  build-deploy-cron:
+    jobs:
+      - test
+      - record-previous-release:
+          context: org-global
+      - build-deploy:
+          context: org-global
+          requires:
+            - record-previous-release
+            - test
+    triggers:
+      - schedule:
+          cron: "0 0 * * *"
+          filters:
+            branches:
+              only:
+                - main

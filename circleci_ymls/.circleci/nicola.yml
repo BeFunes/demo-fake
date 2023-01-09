@@ -1,0 +1,341 @@
+common-init: &common-init
+  working_directory: /go/src/repo
+  environment:
+    SERVICE_NAME: reporting-service
+
+default-job-init: &default-job-init
+  docker:
+    - image: qlik/tiny-build
+      auth:
+        username: $DOCKERHUB_USERNAME
+        password: $DOCKERHUB_PASSWORD
+
+build-tools-init: &build-tools-init
+  docker:
+    - image: ghcr.io/qlik-trial/reporting-service-build-tools:8.0.1
+      auth:
+        username: $QLIK_DOCKER_DEV_USERNAME
+        password: $QLIK_DOCKER_DEV_PASSWORD
+
+setup-accesses-docker: &setup-accesses-docker
+  name: Setup dockerhub
+  command: |
+    git config --global url."https://urldefense.com/v3/__https://$*7BGITHUB_TOKEN*7D:x-oauth-basic@github.com/*22.insteadOf__;JSUl!!Nhk69END!Yv-J8sFpmJtj4PdYQ6TCGWguBy38u_dUfZmyCxgkGKNXWzl2IYoW7StL0wFp9e_7CyMXjGi2AG_nGXouX-43aw$  "https://urldefense.com/v3/__https://github.com/__;!!Nhk69END!Yv-J8sFpmJtj4PdYQ6TCGWguBy38u_dUfZmyCxgkGKNXWzl2IYoW7StL0wFp9e_7CyMXjGi2AG_nGXoKMIpPaA$ "
+    docker login -u "$DOCKERHUB_USERNAME" -p "$DOCKERHUB_PASSWORD"
+    echo $QLIK_DOCKER_DEV_PASSWORD | docker login -u $QLIK_DOCKER_DEV_USERNAME --password-stdin $QLIK_DOCKER_DEV_REGISTRY
+
+setup-access-ghcr: &setup-access-ghcr
+  name: Setup ghcr
+  command: |
+    echo $QLIK_DOCKER_DEV_PASSWORD | docker login -u $QLIK_DOCKER_DEV_USERNAME --password-stdin $QLIK_DOCKER_DEV_REGISTRY
+
+get-version: &get-version
+  name: get version
+  command: |
+    VERSION=$(cat workspace/version.txt)
+    echo "$VERSION" > workspace/version.txt
+    echo "Version--> $VERSION"
+
+setup_remote_docker: &setup_remote_docker
+  - setup_remote_docker:
+      version: 20.10.6
+      docker_layer_caching: false
+
+version: 2.1
+orbs:
+  twistcli: twistlock/twistcli-scan@1.0.4
+jobs:
+  golangci-lint:
+    <<: *common-init
+    <<: *build-tools-init
+    steps:
+      - checkout
+      - <<: *setup_remote_docker
+      - run:
+          name: Install golangci-lint
+          command: |
+            make golang-lint-install
+      - run:
+          name: Download go deps
+          command: |
+            go mod download
+      - run:
+          name: Lint code
+          command: |
+            make golang-lint-run
+
+  version:
+    <<: *common-init
+    <<: *default-job-init
+    steps:
+      - checkout
+      - <<: *setup_remote_docker
+      - run:
+          name: Create workspace
+          command: |
+            mkdir -p workspace
+      - run:
+          name: Set build version
+          command: |
+            set -x
+            if [ -n "${CIRCLE_TAG}" ]; then
+              version=${CIRCLE_TAG#v}
+            else
+              version=$(git describe --tags --abbrev=7 --match "v*")
+              version=${version#v}
+            fi
+            echo "Version--> $version"
+            echo "$version" > workspace/version.txt
+      - persist_to_workspace:
+          root: workspace
+          paths:
+            - version.txt
+
+  api-governance:
+    <<: *common-init
+    <<: *default-job-init
+    steps:
+      - checkout
+      - attach_workspace:
+          at: workspace
+      - <<: *setup_remote_docker
+      - run:
+          <<: *get-version
+      - run:
+          <<: *setup-accesses-docker
+      - run:
+          name: Prepare API Compliance
+          command: |
+            docker pull ghcr.io/qlik-trial/api-compliance
+            docker create -v /specs --name specs alpine:3.4 /bin/true
+            docker cp ./api-docs_3.0.yaml specs:/specs
+      - run:
+          name: Run API Compliance
+          command: >
+            VER=$(cat workspace/version.txt)
+
+            docker run --volumes-from specs
+            -e SPEC_PATHS="b9e1754d-f8db-4227-8534-766f317302b3@/specs/api-docs_3.0.yaml"
+            -e COMMIT_SHA="$CIRCLE_SHA1"
+            -e RELEASE_TAG="$VER"
+            -e CREDENTIALS_S3_SECRETKEY="$APICULTURIST_S3"
+            -e CREDENTIALS_GITHUB="$APICULTURIST_GITHUB"
+            -e CREDENTIALS_COLONY="$APICULTURIST_TOKEN"
+            ghcr.io/qlik-trial/api-compliance
+
+  api-guidelines-lint:
+    <<: *common-init
+    <<: *default-job-init
+    steps:
+      - checkout
+      - attach_workspace:
+          at: workspace
+      - <<: *setup_remote_docker
+      - run:
+          <<: *get-version
+      - run:
+          <<: *setup-accesses-docker
+      - run:
+          name: Lint API specifications
+          command: |
+            set -euo pipefail
+            docker create -v /app/specs --name specs alpine:3.11 /bin/true
+            # copy the spec into the newly created volume, only needed in combination with above
+            docker cp api-docs_3.0.yaml specs:/app/specs
+            # run the api-guidelines-lint
+            docker run --volumes-from specs ghcr.io/qlik-trial/api-guidelines-lint:0.1.6
+  build:
+    <<: *common-init
+    <<: *build-tools-init
+    steps:
+      - checkout
+      - attach_workspace:
+          at: workspace
+      - <<: *setup_remote_docker
+      - run:
+          <<: *get-version
+      - run:
+          name: Build Docker image
+          command: |
+            make build-docker VERSION=$(cat workspace/version.txt)
+      - run:
+          name: Persist docker image
+          command: |
+            docker save -o workspace/image.tar qlik/${SERVICE_NAME}:$(cat workspace/version.txt)
+      - persist_to_workspace:
+          root: workspace
+          paths:
+            - image.tar
+
+  deploy-ghcr:
+    <<: *common-init
+    <<: *build-tools-init
+    steps:
+      - checkout
+      - attach_workspace:
+          at: workspace
+      - <<: *setup_remote_docker
+      - run:
+          <<: *get-version
+      - run:
+          <<: *setup-access-ghcr
+      - run:
+          name: Load docker image
+          command: docker image load -i workspace/image.tar
+      - deploy:
+          name: Publish image to ghcr
+          command: |
+            export VERSION=$(cat workspace/version.txt)
+            echo "Version --> $VERSION"
+            echo "SERVICE_NAME --> ${SERVICE_NAME}"
+            echo "QLIK_DOCKER_DEV_REGISTRY --> ${QLIK_DOCKER_DEV_REGISTRY}"
+            docker tag qlik/${SERVICE_NAME}:$VERSION ${QLIK_DOCKER_DEV_REGISTRY}/${SERVICE_NAME}:$VERSION
+            if echo $VERSION | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$'
+            then
+              docker tag qlik/${SERVICE_NAME}:$VERSION ${QLIK_DOCKER_DEV_REGISTRY}/${SERVICE_NAME}:latest
+            fi
+            docker push -a ${QLIK_DOCKER_DEV_REGISTRY}/${SERVICE_NAME}
+            curl -s "https://urldefense.com/v3/__https://raw.githubusercontent.com/qlik-oss/ci-tools/master/scripts-circleci/github-cosign-dispatch.sh__;!!Nhk69END!Yv-J8sFpmJtj4PdYQ6TCGWguBy38u_dUfZmyCxgkGKNXWzl2IYoW7StL0wFp9e_7CyMXjGi2AG_nGXo2krlhmA$ " | bash
+      - run:
+          name: Package Helm chart
+          command: |
+            export VERSION_FILE=workspace/version.txt
+            curl -s "https://urldefense.com/v3/__https://raw.githubusercontent.com/qlik-oss/ci-tools/master/scripts-circleci/github-package-helm-dispatch.sh__;!!Nhk69END!Yv-J8sFpmJtj4PdYQ6TCGWguBy38u_dUfZmyCxgkGKNXWzl2IYoW7StL0wFp9e_7CyMXjGi2AG_nGXpIFSoWPg$ " | bash
+
+
+  dcompose-unit-test:
+    environment:
+      DOCKER_COMPOSE_VERSION: v2.4.1
+      QLIK_DOCKER_REPO: ghcr.io/qlik-trial/reporting-generator
+      QLIK_DOCKER_TEST_REPO: ghcr.io/qlik-trial/reporting-generator-test
+      QLIK_DOCKER_URL: ghcr.io/qlik-trial
+
+    docker:
+      - image: qlik/tiny-build
+        auth:
+          username: $DOCKERHUB_USERNAME
+          password: $DOCKERHUB_PASSWORD
+    steps:
+      - checkout
+      - run:
+          name: Install Docker Compose
+          command: |
+            curl -L "https://urldefense.com/v3/__https://github.com/docker/compose/releases/download/$*7BDOCKER_COMPOSE_VERSION*7D/docker-compose-$(uname__;JSU!!Nhk69END!Yv-J8sFpmJtj4PdYQ6TCGWguBy38u_dUfZmyCxgkGKNXWzl2IYoW7StL0wFp9e_7CyMXjGi2AG_nGXpHICsYNw$  -s)-$(uname -m)" -o /usr/bin/docker-compose
+            chmod 755 /usr/bin/docker-compose
+      - <<: *setup_remote_docker
+      - run:
+          name: docker login
+          command: |
+            echo $QLIK_DOCKER_DEV_PASSWORD | docker login -u "$QLIK_DOCKER_DEV_USERNAME" --password-stdin "$QLIK_DOCKER_URL"
+      - run:
+          name: docker-compose 🐳 start upstream services
+          command: |
+            make docker-compose-upstream-services-up
+      - run:
+          name: docker-compose 🐳 build the docker image with the tests
+          command: |
+            make docker-compose-tests-up            
+      - run:
+          name: docker-compose 🐳 run the tests image vs upstream services
+          command: |
+            make docker-compose-tests-run
+      - run:
+          name: docker-compose 🐳 stop upstream services and delete tests container
+          command: |
+            make docker-compose-tests-down
+
+workflows:
+  version: 2
+  build-test-push:
+    jobs:
+      - version:
+          filters:
+            branches:
+              ignore:
+                - /.*(released).*/
+            tags:
+              only: /.*/
+      - golangci-lint:
+          context: deploy-secrets
+          filters:
+            branches:
+              ignore:
+                - /.*(released).*/
+            tags:
+              only: /.*/
+      - dcompose-unit-test:
+          requires:
+            - version
+            - golangci-lint
+          context: deploy-secrets
+          filters:
+            branches:
+              ignore:
+                - /.*(released).*/
+            tags:
+              only: /.*/
+      - api-governance:
+          requires:
+            - version
+            - golangci-lint
+          context: deploy-secrets
+          filters:
+            branches:
+              ignore:
+                - /.*(released).*/
+            tags:
+              only: /.*/
+      - api-guidelines-lint:
+          requires:
+            - version
+            - golangci-lint
+          context: deploy-secrets
+          filters:
+            branches:
+              ignore:
+                - /.*(released).*/
+            tags:
+              only: /.*/
+      - build:
+          requires:
+            - version
+            - golangci-lint
+          context: deploy-secrets
+          filters:
+            branches:
+              ignore:
+                - /.*(released).*/
+            tags:
+              only: /.*/
+      - deploy-ghcr:
+          requires:
+            - build
+            - dcompose-unit-test
+          context: deploy-secrets
+          filters:
+            branches:
+              ignore:
+                - /.*(released).*/
+      - twistcli/scan-image:
+          requires:
+            - build
+          context: tl_scan_context
+          filters:
+            branches:
+              ignore:
+                - /.*(released).*/
+            tags:
+              only: /.*/
+          image: "qlik/reporting-service:$(cat workspace/version.txt)"
+          image-tar: image.tar
+          vuln-thresh: ''
+          comp-thresh: ''
+
+# Avoid non-master Slack noise
+experimental:
+  notify:
+    branches:
+      only:
+        - master
+
+# VS Code Extension Version: 1.5.0

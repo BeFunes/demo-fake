@@ -1,0 +1,160 @@
+version: 2.1
+orbs:
+  web-ui-orb: sandbox/web-ui-orb@5.2.0
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+
+jobs:
+  delete-canary:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    steps:
+      - checkout
+      - run: .circleci/delete-canary.sh web-ui-canary
+
+references:
+  version_code: &version_code 2
+  version_js: &version_js 37
+  version_cypress: &version_cypress 2
+  pusher_key: &pusher_key 1cf6e0e755e419d2ac9a
+  optimizely_sdk_key: &optimizely_sdk_key GfYszBpMkefBSwiiEkH3b3
+  hostname: &hostname app.circleci.com
+workflows:
+  version: 2
+  build-test-and-deploy:
+    jobs:
+      - web-ui-orb/dependencies:
+          name: dependencies
+          context: web-ui-npm
+          cache_version_js_dependencies: *version_js
+          cache_version_cypress_dependencies: *version_cypress
+          audit_command: npx improved-yarn-audit@^3.0.0 --ignore-dev-deps --min-severity high
+      - web-ui-orb/test:
+          name: test
+          cache_version_js_dependencies: *version_js
+          codecov: false
+          requires:
+            - dependencies
+      - web-ui-orb/chromatic-snapshot:
+          filters:
+            branches:
+              ignore: /renovate\/.*/
+          name: chromatic-snapshot
+          executor: web-ui-orb/node-browsers-large
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+      # Run Chromatic _after_ all jobs for Renovate PRs to reduce snapshot
+      # cost. Do this for only Renovate PRs to not slow down developer experience.
+      - web-ui-orb/chromatic-snapshot:
+          filters:
+            branches:
+              only: /renovate\/.*/
+          name: chromatic-snapshot-renovate
+          executor: web-ui-orb/node-browsers-large
+          cache_version_js_dependencies: *version_js
+          requires:
+            - test
+            - test-production-docker-image
+      - web-ui-orb/test-production-docker-image:
+          name: test-production-docker-image
+          image_name: web-ui
+          pusher_app_key: *pusher_key
+          optimizely_sdk_key: *optimizely_sdk_key
+          resource_class: large
+          hostname: *hostname
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+          context: web-ui-npm
+      - web-ui-orb/build-and-deploy-static:
+          name: build-and-deploy-static
+          cache_version_js_dependencies: *version_js
+          bucket_name: 'circleci-web-ui-assets/pipelines'
+          build_dir: ./.next
+          cdn_url: 'http://assets-app.circleci.com/pipelines'
+          pusher_app_key: *pusher_key
+          context: [web-ui-assets, web-ui-npm, web-ui-datadog]
+          requires:
+            - dependencies
+      - web-ui-orb/bundlesize-check:
+          name: check-bundle-size
+          cache_version_js_dependencies: *version_js
+          requires:
+            - test
+            - build-and-deploy-static
+      - can-deploy-canary:
+          type: approval
+          filters:
+            branches:
+              ignore: master
+          requires:
+            - test
+            - build-and-deploy-static
+            - test-production-docker-image
+      - web-ui-orb/build-and-publish-container:
+          name: publish
+          image_name: web-ui
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [org-global, web-ui-npm]
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-\d\..+/
+          requires:
+            - test
+            - build-and-deploy-static
+            - test-production-docker-image
+      - web-ui-orb/deploy-container:
+          name: deploy
+          image_name: web-ui
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [org-global, web-ui-npm]
+          pipeline_id: << pipeline.id >>
+          helm_max_history: 30
+          filters:
+            branches:
+              only: master
+          requires:
+            - publish
+      - web-ui-orb/build-and-publish-container:
+          name: publish-canary
+          image_name: web-ui
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [org-global, web-ui-npm]
+          filters:
+            branches:
+              ignore: master
+          requires:
+            - can-deploy-canary
+      - web-ui-orb/deploy-container:
+          name: deploy-canary
+          image_name: web-ui
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [org-global, web-ui-npm]
+          pipeline_id: << pipeline.id >>
+          release_version: canary
+          values_file: k8s-canary-values.yml
+          requires:
+            - publish-canary
+      - can-delete-canary:
+          type: approval
+          requires:
+            - deploy-canary
+      - delete-canary:
+          context: org-global
+          requires:
+            - can-delete-canary
+      - scotty-orb/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          promotion_component_list: 'circleci/web-ui'
+          requires:
+            - publish

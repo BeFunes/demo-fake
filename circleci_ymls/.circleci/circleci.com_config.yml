@@ -1,0 +1,428 @@
+version: 2.1
+orbs:
+  node: circleci/node@4.7.0
+
+workflow-references:
+  staging-branch-filters: &staging-branch-filters
+    filters:
+      branches:
+        only: staging
+  production-branch-filters: &production-branch-filters
+    filters:
+      branches:
+        only: master
+  non-production-branch-filters: &non-production-branch-filters
+    filters:
+      branches:
+        ignore: master
+
+workflows:
+  build-preview-deploy-check:
+    jobs:
+      - build-preview
+      - check-search-indexing-preview
+      - create-percy-snapshot:
+          requires:
+            - build-preview
+      - deploy-preview:
+          requires:
+            - build-preview
+      - check-html:
+          requires:
+            - build-preview
+      - update-caches:
+          requires:
+            - build-preview
+      - node/run:
+          name: test-for-scripts
+          version: '14.17'
+          cache-version: v1-create-jira
+          npm-run: test -- scripts
+          requires:
+            - build-preview
+
+  build-staging-check-deploy:
+    jobs:
+      - build-staging:
+          <<: *staging-branch-filters
+      - check-search-indexing:
+          <<: *staging-branch-filters
+      - check-html:
+          <<: *staging-branch-filters
+          requires:
+            - build-staging
+      - deploy-staging:
+          <<: *staging-branch-filters
+          requires:
+            - build-staging
+            - check-html
+      - update-caches:
+          <<: *staging-branch-filters
+          requires:
+            - build-staging
+
+  build-production-check-deploy:
+    jobs:
+      - build-production:
+          <<: *production-branch-filters
+      - check-search-indexing:
+          <<: *production-branch-filters
+      - check-html:
+          <<: *production-branch-filters
+          requires:
+            - build-production
+      - deploy-production:
+          <<: *production-branch-filters
+          requires:
+            - build-production
+            - check-html
+            - check-search-indexing
+      - update-search-index:
+          <<: *production-branch-filters
+          requires:
+            - build-production
+            - check-html
+            - check-search-indexing
+      - update-caches:
+          <<: *production-branch-filters
+          requires:
+            - build-production
+      - create-jira-tickets:
+          <<: *production-branch-filters
+          requires:
+            - build-production
+references:
+  default-container: &default-container
+    docker:
+      - image: cimg/ruby:2.6-browsers
+        auth:
+          username: circlecidotcom
+          password: $DOCKER_HUB_PASSWORD
+    resource_class: large
+    environment:
+      RAILS_ENV: test
+      RACK_ENV: test
+      CIRCLE_ARTIFACTS: /tmp/artifacts
+
+  persist-site-build-to-workspace: &persist-site-build-to-workspace
+    persist_to_workspace:
+      root: ./
+      paths:
+        - _site
+        - set_redirects.rb
+        - redirects.yml
+        - redirects-blog.yml
+        - redirects-blog-i18n-ja.yml
+        - .percy.yml
+
+  attach-workspace: &attach-workspace
+    attach_workspace:
+      at: ./
+
+  restore-source-cache: &restore-source-cache
+    restore_cache:
+      keys:
+        - v2-source-{{ .Branch }}-{{ .Revision }}
+        - v2-source-{{ .Branch }}-
+        - v2-source-
+  save-source-cache: &save-source-cache
+    save_cache:
+      key: v2-source-{{ .Branch }}-{{ .Revision }}
+      paths:
+        - ".git"
+  restore-node-cache: &restore-node-cache
+    restore_cache:
+      keys:
+        - v1-dep-js-{{ checksum "package.json" }}
+  install-shared-assets: &install-shared-assets
+    run:
+      name: Install shared assets
+      command: git submodule update --init src-shared
+  install-node-deps: &install-node-deps
+    run:
+      name: Install JS dependencies
+      command: |
+        npm install
+        node_modules/bower/bin/bower install
+  save-node-cache: &save-node-cache
+    save_cache:
+      key: v1-dep-js-{{ checksum "package.json" }}
+      paths:
+        - node_modules
+  restore-ruby-cache: &restore-ruby-cache
+    restore_cache:
+      keys:
+        - v1-dep-bundler-{{ checksum "Gemfile.lock" }}
+  install-ruby-deps: &install-ruby-deps
+    run:
+      name: Install Ruby dependencies
+      command: bundle check --path=vendor/bundle || bundle install --path=vendor/bundle --jobs=4 --retry=3
+  save-ruby-cache: &save-ruby-cache
+    save_cache:
+      key: v1-dep-bundler-{{ checksum "Gemfile.lock" }}
+      paths:
+        - vendor/bundle
+  install-aws-cli: &install-aws-cli
+    run:
+      name: Install AWS CLI
+      command: |
+        sudo ln -s /home/circleci /home/ubuntu
+        sudo ln -s /home/circleci/project /home/ubuntu/circleci.com
+        sudo apt-get update
+        sudo apt-get install awscli
+
+jobs:
+  update-caches:
+    <<: *default-container
+    steps:
+      - *restore-source-cache
+      - checkout
+      - *install-shared-assets
+      - *save-source-cache
+      - *restore-node-cache
+      - *restore-ruby-cache
+      - *install-node-deps
+      - *install-ruby-deps
+      - *save-node-cache
+      - *save-ruby-cache
+
+  build-preview:
+    <<: *default-container
+    steps:
+      - *restore-source-cache
+      - checkout
+      - *install-shared-assets
+      - *restore-node-cache
+      - *restore-ruby-cache
+      - *install-node-deps
+      - *install-ruby-deps
+      - run:
+          name: Jekyll build (preview)
+          command: |
+            export JEKYLL_BASE_URL="/${CIRCLE_BRANCH:-$CIRCLE_SHA1}"
+            bundle exec jekyll build --config _config.yml,_config_preview.yml
+            echo "${JEKYLL_BASE_URL}" > ./_site/.jekyll_path_prefix
+      - *persist-site-build-to-workspace
+
+  create-percy-snapshot:
+    <<: *default-container
+    steps:
+      - *attach-workspace
+      - run:
+          name: Create Percy snapshots
+          command: |
+            PREVIEW_ASSETS_PATH="./_site/${CIRCLE_BRANCH:-$CIRCLE_SHA1}"
+            PREVIEW_JA_ASSETS_PATH="${PREVIEW_ASSETS_PATH}/ja"
+            mkdir -p ${PREVIEW_ASSETS_PATH}/assets && cp -R ./_site/assets ${PREVIEW_ASSETS_PATH}
+            mkdir -p ${PREVIEW_JA_ASSETS_PATH}/assets && cp -R ./_site/ja/assets ${PREVIEW_JA_ASSETS_PATH}
+            mkdir -p ${PREVIEW_ASSETS_PATH}/next && cp -R ./_site/next ${PREVIEW_ASSETS_PATH}
+            npx @percy/cli@1.2.1 snapshot ./_site
+
+  deploy-preview:
+    <<: *default-container
+    steps:
+      - *install-aws-cli
+      - *attach-workspace
+      - run:
+          name: Copy preview robots.txt to root
+          command: |
+            aws s3 cp ./_site/robots.txt s3://static-preview.circleci.com/
+      - run:
+          name: Copy Google verification file to root
+          command: |
+            aws s3 cp ./_site/google4d3447327640ba31.html s3://static-preview.circleci.com/
+      - run:
+          name: Upload site build (branch preview)
+          command: |
+            PATH_PREFIX="${CIRCLE_BRANCH:-$CIRCLE_SHA1}"
+            aws s3 sync --delete ./_site s3://static-preview.circleci.com/${PATH_PREFIX}/
+      - run:
+          name: Set URL redirects
+          command: |-
+            ./set_redirects.rb --bucket static-preview.circleci.com --redirects-file redirects.yml
+
+  build-staging:
+    <<: *default-container
+    steps:
+      - *restore-source-cache
+      - checkout
+      - *install-shared-assets
+      - *restore-node-cache
+      - *restore-ruby-cache
+      - *install-node-deps
+      - *install-ruby-deps
+      - run:
+          name: Jekyll build (staging)
+          command: |
+            JEKYLL_ENV=production bundle exec jekyll build --config _config.yml,_config_staging.yml
+      - *persist-site-build-to-workspace
+
+  deploy-staging:
+    <<: *default-container
+    steps:
+      - *install-aws-cli
+      - *attach-workspace
+      - run:
+          name: Upload site build (staging)
+          command: |
+            aws s3 sync --delete ./_site s3://static-staging.circleci.com
+      - run:
+          name: Set static asset cache headers (staging)
+          command: |
+            aws s3 cp \
+              s3://static-staging.circleci.com/assets s3://static-staging.circleci.com/assets \
+              --recursive \
+              --metadata-directive REPLACE \
+              --cache-control public,max-age=31536000 || true
+            aws s3 cp \
+              s3://static-staging.circleci.com/ja/assets s3://static-staging.circleci.com/assets/ja \
+              --recursive \
+              --metadata-directive REPLACE \
+              --cache-control public,max-age=31536000 || true
+      - run:
+          name: Set URL redirects
+          command: |-
+            ./set_redirects.rb --bucket static-staging.circleci.com --redirects-file redirects.yml
+            ./set_redirects.rb --bucket static-staging.circleci.com --redirects-file redirects-blog.yml
+            ./set_redirects.rb --bucket static-staging.circleci.com --redirects-file redirects-blog-i18n-ja.yml
+
+  build-production:
+    <<: *default-container
+    steps:
+      - *restore-source-cache
+      - checkout
+      - *install-shared-assets
+      - *restore-node-cache
+      - *restore-ruby-cache
+      - *install-node-deps
+      - *install-ruby-deps
+      - run:
+          name: Jekyll build (production)
+          command: |
+            JEKYLL_ENV=production bundle exec jekyll build --config _config.yml,_config_production.yml
+      - *persist-site-build-to-workspace
+
+  deploy-production:
+    <<: *default-container
+    steps:
+      - *install-aws-cli
+      - *attach-workspace
+      - run:
+          name: Upload site build (production)
+          command: |
+            aws s3 sync \
+              ./_site s3://circle-production-static-site   `# Sync site build folder to production S3 bucket.` \
+              --delete                                     `# Clean up deleted files from S3.` \
+              --exclude "docs/*"                           `# Except don't delete docs site` \
+              --exclude "design-system/*"                  `# or design system` \
+              --exclude "orb-registry-web-assets/*"        `# or orb registry web assets.`
+      - run:
+          name: Set static asset cache headers
+          command: |
+            aws s3 cp \
+              s3://circle-production-static-site/assets s3://circle-production-static-site/assets \
+              --recursive \
+              --metadata-directive REPLACE \
+              --cache-control public,max-age=31536000 || true
+            aws s3 cp \
+              s3://circle-production-static-site/ja/assets s3://circle-production-static-site/assets/ja \
+              --recursive \
+              --metadata-directive REPLACE \
+              --cache-control public,max-age=31536000 || true
+            aws s3 cp \
+              s3://circle-production-static-site/tlh/assets s3://circle-production-static-site/assets/tlh \
+              --recursive \
+              --metadata-directive REPLACE \
+              --cache-control public,max-age=31536000 || true
+      - run:
+          name: Set URL redirects
+          command: |-
+            ./set_redirects.rb --bucket circle-production-static-site --redirects-file redirects.yml
+            ./set_redirects.rb --bucket circle-production-static-site --redirects-file redirects-blog.yml
+            ./set_redirects.rb --bucket circle-production-static-site --redirects-file redirects-blog-i18n-ja.yml
+
+  check-search-indexing-preview:
+    <<: *default-container
+    steps:
+      - *restore-source-cache
+      - checkout
+      - *install-shared-assets
+      - *restore-node-cache
+      - *restore-ruby-cache
+      - *install-node-deps
+      - *install-ruby-deps
+      - run:
+          name: Check for search indexability (preview)
+          command: |
+            export DISABLE_FAILING_LOGGER=true
+            bundle exec jekyll algolia --dry-run --source src --config _config.yml,_config_preview.yml
+
+  check-search-indexing:
+    <<: *default-container
+    steps:
+      - *restore-source-cache
+      - checkout
+      - *install-shared-assets
+      - *restore-node-cache
+      - *restore-ruby-cache
+      - *install-node-deps
+      - *install-ruby-deps
+      - run:
+          name: Check for search indexability
+          command: |
+            export DISABLE_FAILING_LOGGER=true
+            bundle exec jekyll algolia --dry-run --source src --config _config.yml,_config_production.yml
+
+  update-search-index:
+    <<: *default-container
+    steps:
+      - *restore-source-cache
+      - checkout
+      - *install-shared-assets
+      - *restore-node-cache
+      - *restore-ruby-cache
+      - *install-node-deps
+      - *install-ruby-deps
+      - run:
+          name: Update search index
+          command: |
+            bundle exec jekyll algolia --force-settings --source src --config _config.yml,_config_production.yml
+
+  check-html:
+    <<: *default-container
+    steps:
+      - *restore-source-cache
+      - checkout
+      - *install-shared-assets
+      - *restore-ruby-cache
+      - *install-ruby-deps
+      - *attach-workspace
+      - run:
+          name: Check HTML for errors
+          command: bundle exec rake validate
+
+  create-jira-tickets: # this is for changelog translation
+    executor:
+      name: node/default
+      tag: '14.17'
+    steps:
+      - checkout
+      - node/install-packages:
+          cache-version: v1-create-jira
+      - run:
+          name: Detect new changelog files
+          command: |
+            revision=$(npm run -s getPreviousJobHash -- --jobNumber=$CIRCLE_BUILD_NUM --jobName=$CIRCLE_JOB)
+            echo $revision
+            git diff $revision HEAD --name-only --diff-filter=A src/_i18n/en/_changelog/ | xargs -r basename -a > new_changelog.txt
+            git diff $revision HEAD --name-only --diff-filter=A src/_i18n/en/_changelog_ccie/ | xargs -r basename -a > new_changelog_server.txt
+            cat new_changelog.txt
+            cat new_changelog_server.txt
+      - run:
+          name: create JIRA tickets per each new changelog files for cloud
+          command: |
+            npm run createJira -- new_changelog.txt
+      - run:
+          name: create JIRA tickets per each new changelog files for server
+          command: |
+            npm run createJira -- new_changelog_server.txt --server

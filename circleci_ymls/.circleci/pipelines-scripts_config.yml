@@ -1,0 +1,57 @@
+jobs:
+  web-ui-prs-to-slack:
+    docker:
+      - image: circleci/node:14
+    environment:
+      OWNER: circleci
+      REPO: web-ui
+      TEAM_IDENTIFIER: pipelines
+      SLO_THRESHOLD_IN_HOURS: 24
+      WARN_THRESHOLD_IN_HOURS: 12
+    steps:
+      - checkout
+      - run:
+          name: install dependencies
+          command: yarn
+          working_directory: ./github_review_slo_bot
+      - run:
+          name: send to slack
+          command: yarn run warn
+          working_directory: ./github_review_slo_bot
+  web-ui-releases-prs-to-slack:
+    docker:
+      - image: circleci/node:14
+    environment:
+      OWNER: circleci
+      REPO: web-ui-releases
+      TEAM_IDENTIFIER: pipelines
+      SLO_THRESHOLD_IN_HOURS: 24
+      WARN_THRESHOLD_IN_HOURS: 12
+    steps:
+      - checkout
+      - run:
+          name: install dependencies
+          command: yarn
+          working_directory: ./github_review_slo_bot
+      - run:
+          name: send to slack
+          command: yarn run warn
+          working_directory: ./github_review_slo_bot
+
+workflows:
+  version: 2
+  prs-to-slack-on-schedule:
+    triggers:
+      - schedule:
+          cron: "44 11,19 * * 1-5"
+          filters:
+            branches:
+              only:
+                - main
+    jobs:
+      - web-ui-prs-to-slack
+      - web-ui-releases-prs-to-slack
+  prs-to-slack-on-push:
+    jobs:
+      - web-ui-prs-to-slack
+      - web-ui-releases-prs-to-slack

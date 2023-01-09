@@ -1,0 +1,34 @@
+version: 2.0
+
+jobs:
+  # first check it works
+  build:
+    docker:
+    - image: clojure:lein-2.8.1
+    steps:
+    - checkout
+    - run: lein deps
+    - run: lein check
+    - run: lein test
+
+  # then deploy to our internal repo (this won't work for
+  # people who fork this code into another org)
+  deploy:
+    docker:
+    - image: clojure:lein-2.8.1
+    steps:
+    - checkout
+    - run: lein deploy circle-s3
+
+workflows:
+  version: 2
+  build-and-deploy:
+    jobs:
+    - build
+    - deploy:
+        context: org-global
+        requires:
+        - build
+        filters:
+          branches:
+            only: main

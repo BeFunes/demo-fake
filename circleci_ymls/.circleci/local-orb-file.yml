@@ -1,0 +1,38 @@
+version: 2.1
+
+orbs:
+  localorb:
+    jobs:
+      localjob:
+        docker:
+          - image: cimg/base:2020.01
+        steps:
+          - checkout
+          - specialcheckout
+    
+    commands:
+      specialcheckout:
+        steps:
+          - checkout
+      localcommand:
+        steps:
+          - run: echo "Hello world"
+
+    executors:
+      localexecutor:
+        docker:
+          - image: cimg/base:2020.01
+
+jobs:
+  somejob:
+    executor: localorb/localexecutor
+    docker:
+      - image: cimg/base:2020.01
+    steps:
+      - localorb/localcommand
+
+workflows:
+  someworkflow:
+    jobs:
+      - localorb/localjob
+      - somejob

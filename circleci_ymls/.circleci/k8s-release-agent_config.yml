@@ -1,0 +1,59 @@
+version: 2.1
+
+go_image: &go_image
+  image: circleci/go-service:0.1-dev
+  auth:
+    username: $RO_DOCKER_HUB_USERNAME
+    password: $RO_DOCKER_HUB_PASSWORD
+
+executors:
+  go:
+    docker:
+      - *go_image
+
+jobs:
+  build:
+    executor: go
+    working_directory: ~/k8s-release-agent
+    steps:
+      - checkout:
+          path: ~/k8s-release-agent
+      - run: make build
+      - persist_to_workspace:
+          root: ~/k8s-release-agent
+          paths:
+            - bin
+  lint:
+    executor: go
+    working_directory: ~/k8s-release-agent
+    steps:
+      - checkout:
+          path: ~/k8s-release-agent
+      - run: make lint
+      - run: make tidy
+      - run: git diff --exit-code -- go.mod go.sum
+  test:
+    executor: go
+    working_directory: ~/k8s-release-agent
+    steps:
+      - checkout:
+          path: ~/k8s-release-agent
+      - run: make test RESULTS_DIR=/tmp/test-results
+      - store_test_results:
+          path: /tmp/test-results
+
+workflows:
+  lint-build-test:
+    jobs:
+      - lint:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - build:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - test:
+          context:
+            - dockerhub-readonly
+            - github-readonly

@@ -1,0 +1,440 @@
+version: 2.1
+
+orbs:
+  ccc: cci-dev/ccc@<<pipeline.parameters.dev-orb-version>>
+  orb-tools: circleci/orb-tools@10.0
+  bats: circleci/bats@1.0
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: command-convenience
+          DOCKERFILE_PATH: Dockerfile
+  shellcheck:
+    docker:
+      - image: koalaman/shellcheck-alpine:stable
+  circleci-cli:
+    docker:
+      - image: circleci/circleci-cli:alpine
+
+parameters:
+  run-integration-tests:
+    description: An internal flag to limit the workflows that are run before or by the Orb integration tests.
+    type: boolean
+    default: false
+  dev-orb-version:
+    description: >
+      The development version of the orb to test.
+      This value is automatically adjusted by the "trigger-integration-tests-workflow" job to correspond with the specific version created by the commit and should not be edited.
+      A "dev:alpha" version must exist for the initial pipeline run.
+    type: string
+    default: "dev:alpha"
+
+workflows:
+  version: 2
+  build-test-publish:
+    unless: << pipeline.parameters.run-integration-tests >>
+    jobs:
+      - shellcheck
+      - shfmt
+      - circleci-validate
+      - unittest:
+          context: org-global
+      - test:
+          context: org-global
+      - scan:
+          context:
+            - org-global
+          requires:
+            - unittest
+            - test
+          filters:
+            branches:
+              ignore:
+                - main
+                - /experimental/.*/
+      - publish:
+          context:
+            - org-global
+          requires:
+            - shellcheck
+            - shfmt
+            - circleci-validate
+            - unittest
+            - test
+          filters:
+            branches:
+              only:
+                - main
+                - /experimental/.*/
+  test-pack-orb:
+    unless: << pipeline.parameters.run-integration-tests >>
+    jobs:
+      - orb-tools/lint:
+          lint-dir: ./orb/src
+      - orb-tools/pack:
+          source-dir: ./orb/src
+      # Publish development version(s) of the orb.
+      - orb-tools/publish-dev:
+          orb-name: cci-dev/ccc
+          publish-branch-sha-version: true
+          context: backplane-orb-publishing
+          requires:
+            - orb-tools/lint
+            - orb-tools/pack
+      # Trigger an integration workflow to test the
+      # dev:${CIRCLE_SHA1:0:7} version of your orb
+      - orb-tools/trigger-integration-tests-workflow:
+          name: trigger-integration-dev
+          context: backplane-orb-publishing
+          requires:
+            - orb-tools/publish-dev
+
+  integration-test_deploy:
+    when: << pipeline.parameters.run-integration-tests >>
+    jobs:
+      # Run any integration tests defined within the `jobs` key.
+      - orb-integration-test:
+          context: org-global
+      # Only publishes the Orb if the commit subject contains `[semver:…]``
+      # See the documentation here for more details:
+      # https://github.com/circleci/command-convenience-containers/tree/main/orb#how-to-publish
+      - orb-tools/dev-promote-prod-from-commit-subject:
+          orb-name: cci-dev/ccc
+          context: backplane-orb-publishing
+          add-pr-comment: false
+          fail-if-semver-not-indicated: false
+          publish-version-tag: false
+          requires:
+            - orb-integration-test
+          filters:
+            branches:
+              only:
+                - master
+                - main
+
+
+commands:
+  download-twistcli:
+    description: Download the twistlock CLI
+    steps:
+      - run:
+          name: Download twistcli
+          command: |
+            set -o nounset
+
+            curl --user "${TWISTLOCK_USER}:${TWISTLOCK_PASS}" \
+                 --silent --show-error --fail --retry 3 --max-time 60 \
+                 --output twistcli \
+                 "${TWISTLOCK_URL}/api/v1/util/twistcli"
+            chmod a+x twistcli
+            ./twistcli -v
+  set-docker-image-major-version-and-publish:
+    description: Set Docker image major version and publish
+    steps:
+      - run:
+          name: Publish
+          command: |
+            if [[ "$CIRCLE_BRANCH" != "main" ]]; then
+              branch="$(echo "$CIRCLE_BRANCH" | tr '/A-Z' '-a-z' | sed 's/^[0-9-]\+//')"
+              export MAJOR_VERSION="${branch:-experimental}"
+            fi
+            publish
+
+jobs:
+  orb-integration-test:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    steps:
+      - checkout
+      - run:
+          name: Test /deploy/merge-values
+          command: |
+            # Given some YAML
+            echo "
+            a: 1
+            b:
+              c: 5
+            " > a.yml
+            echo "
+            a: null
+            b:
+              c: 7
+            d: 4
+            missing: null
+            " > b.yml
+            # Write expected output
+            echo "b:
+              c: 7
+            d: 4" > /tmp/expected.yml
+      - ccc/merge-values:
+          base-path: a.yml
+          override-path: b.yml
+          merged-path: /tmp/merge-output.yml
+      - run:
+          name: Compare output
+          command: |
+            git diff --no-index --exit-code /tmp/expected.yml /tmp/merge-output.yml
+
+  unittest:
+    executor: ccc
+    steps:
+      - checkout
+      - run: helm plugin install https://github.com/quintush/helm-unittest --version 0.2.8
+      - run: ./test/helm-unittest.sh
+
+  test:
+    machine:
+      image: ubuntu-2004:202201-02
+      docker_layer_caching: true
+    steps:
+      - run:
+          name: Print version information
+          command: |
+            python --version
+            docker --version
+      - checkout
+      - download-twistcli
+      - run:
+          name: Build docker image
+          command: docker build -t circleci/command-convenience:test .
+
+      # TODO: Eventually replace this with unittest.
+      - run:
+          name: Test rendering against golden files
+          command: test/check-values-against-golden.sh
+
+      - run:
+          name: Test default helm template
+          command: |
+            docker run --rm \
+              -v $PWD:/work -w /work \
+             circleci/command-convenience:test \
+              /work/test/lint-example-values.sh
+
+      - run:
+          name: Test create-helm-chart with custom values
+          command: |
+            docker run --rm \
+              -v $PWD:/work -w /work \
+              -e VALUES_FILE=test/testdata/custom-values/values.yaml \
+              circleci/command-convenience:test \
+              /deploy/generate-chart | \
+            tee /tmp/dry-run-output
+
+            for expected in "testService" "port: 6666" "stuff=nonsense" "name: REDIS_URL" "key:  redis.url"; do
+              echo "Checking for \"${expected}\" in dry run output"
+              grep -q "$expected" /tmp/dry-run-output
+            done
+
+      - run:
+          name: Test create-helm-chart with examples/values.yaml
+          command: |
+            docker run --rm \
+              -v $PWD:/work -w /work \
+              -e VALUES_FILE=examples/values.yaml \
+              circleci/command-convenience:test \
+              /deploy/generate-chart | \
+            tee /tmp/dry-run-output
+
+      - run:
+          name: Test create-helm-chart with examples/migrator-values.yaml
+          command: |
+            docker run --rm \
+              -v $PWD:/work -w /work \
+              -e VALUES_FILE=examples/migrator-values.yaml \
+              circleci/command-convenience:test \
+              /deploy/generate-chart | \
+            tee /tmp/dry-run-output
+
+      - run:
+          name: Test create-helm-chart with custom chart
+          command: |
+            docker run --rm \
+              -v $PWD:/work -w /work \
+              -e CUSTOM_CHART=test/testdata/custom-chart \
+              circleci/command-convenience:test \
+              /deploy/generate-chart | \
+            tee /tmp/dry-run-output
+
+            for expected in "app: myappisgreat" "name: some-secrets-v1.1" "symlinked: content"; do
+              echo "Checking for \"${expected}\" in dry run output"
+              grep -q "$expected" /tmp/dry-run-output
+            done
+
+      - run:
+          name: Test create-helm-chart with custom chart and empty RELEASE_SUFFIX
+          command: |
+            docker run --rm \
+              -v $PWD:/work -w /work \
+              -e CUSTOM_CHART=test/testdata/custom-chart \
+              -e RELEASE_SUFFIX="" \
+              circleci/command-convenience:test \
+              /deploy/generate-chart | \
+            tee /tmp/dry-run-output
+
+            for expected in "^\s+release: appname\$" "^\s+TAGS\+=',helm_release:appname'\$"; do
+              echo "Checking for \"${expected}\" in dry run output"
+              grep -qP "$expected" /tmp/dry-run-output
+            done
+
+      - run:
+          name: Test create-helm-chart with custom chart and custom RELEASE_SUFFIX
+          command: |
+            docker run --rm \
+              -v $PWD:/work -w /work \
+              -e CUSTOM_CHART=test/testdata/custom-chart \
+              -e RELEASE_SUFFIX="withsuffix" \
+              circleci/command-convenience:test \
+              /deploy/generate-chart | \
+            tee /tmp/dry-run-output
+
+            for expected in "^\s+release: appnamewithsuffix\$" "^\s+TAGS\+=',helm_release:appnamewithsuffix'\$"; do
+              echo "Checking for \"${expected}\" in dry run output"
+              grep -qP "$expected" /tmp/dry-run-output
+            done
+
+      - run:
+          name: Test create-helm-chart with custom chart and custom RELEASE_VERSION
+          command: |
+            docker run --rm \
+              -v $PWD:/work -w /work \
+              -e CUSTOM_CHART=test/testdata/custom-chart \
+              -e RELEASE_VERSION="v42" \
+              circleci/command-convenience:test \
+              /deploy/generate-chart | \
+            tee /tmp/dry-run-output
+
+            for expected in "^\s+release: appname-v42\$" "^\s+TAGS\+=',helm_release:appname-v42'\$"; do
+              echo "Checking for \"${expected}\" in dry run output"
+              grep -qP "$expected" /tmp/dry-run-output
+            done
+
+      - run:
+          name: Test create-helm-chart errors when both VALUES_FILE and CUSTOM_CHART are set
+          command: |
+            ! docker run --rm \
+              -v $PWD:/work -w /work \
+              -e VALUES_FILE=test/testdata/custom-values/values.yaml \
+              -e CUSTOM_CHART=test/testdata/custom-chart \
+              circleci/command-convenience:test \
+              /deploy/generate-chart 2>/tmp/both-values-and-custom
+
+            grep "options are incompatible" /tmp/both-values-and-custom
+
+      - run:
+          name: Test create-helm-chart errors on duplicate resources
+          command: |
+            ! docker run --rm \
+              -v $PWD:/work -w /work \
+              -e CUSTOM_CHART=test/testdata/duplicate \
+              circleci/command-convenience:test \
+              /deploy/generate-chart
+
+      - run:
+          name: Test /deploy/merge-values a.yaml b.yaml
+          working_directory: test/testdata/merge-values
+          command: |
+            docker run --rm \
+              -v $PWD:/work -w /work \
+              circleci/command-convenience:test \
+              /deploy/merge-values a.yaml b.yaml | \
+            tee /tmp/merge-output.yaml
+
+            git diff --no-index --exit-code a_plus_b.yaml /tmp/merge-output.yaml
+
+      - run:
+          name: Test /deploy/merge-values a.yaml b.yaml c.yaml
+          working_directory: test/testdata/merge-values
+          command: |
+            docker run --rm \
+              -v $PWD:/work -w /work \
+              circleci/command-convenience:test \
+              /deploy/merge-values a.yaml b.yaml c.yaml | \
+            tee /tmp/merge-output.yaml
+
+            git diff --no-index --exit-code a_plus_b_plus_c.yaml /tmp/merge-output.yaml
+
+      - run:
+          name: Test /deploy/merge-values with example data
+          working_directory: examples
+          command: |
+            docker run --rm \
+              -v $PWD:/work -w /work \
+              circleci/command-convenience:test \
+              /deploy/merge-values values.yaml canary-overrides.yaml | \
+              tee /tmp/canary-merge-output.yaml
+
+              grep "replicas: 1" /tmp/canary-merge-output.yaml
+              ! grep "^service:" /tmp/canary-merge-output.yaml
+
+  publish:
+    executor: ccc
+    environment:
+      DOCKER_REGISTRY: dockerhub
+    steps:
+      - setup_remote_docker
+      - checkout
+      - download-twistcli
+      - set-docker-image-major-version-and-publish
+      - store_artifacts:
+          path: /tmp/twistlock_scan.json
+      - store_artifacts:
+          path: /tmp/_lw-scanner_scan_result.json
+
+  scan:
+    executor: ccc
+    steps:
+      - setup_remote_docker
+      - checkout
+      - download-twistcli
+      - run: scan
+      - store_artifacts:
+          path: /tmp/twistlock_scan.json
+      - store_artifacts:
+          path: /tmp/_lw-scanner_scan_result.json
+
+  shellcheck:
+    executor: shellcheck
+    steps:
+      - checkout
+      - run:
+          name: shellcheck scripts
+          command: |
+            # ignore non-sh files by exlcuding SC1071
+            for dir in deploy deploy/bin deploy/scripts publish/bin publish/scripts promote-to-server/bin promote-to-server/scripts tugboat/bin tugboat/scripts; do
+              find ./${dir} -maxdepth 1 -type f | \
+              tee /dev/tty | \
+              xargs shellcheck --external-sources -e SC1071
+            done
+
+  shfmt:
+    docker:
+      - image: alpine:3.15
+    steps:
+      - checkout
+      - run:
+          name: install shfmt
+          command: |
+            apk add shfmt
+      - run:
+          name: shfmt scripts
+          command: |
+            shfmt -l -d .
+
+  circleci-validate:
+    executor: circleci-cli
+    steps:
+      - checkout
+      - run:
+          name: validate circleci config example files
+          command: |
+            circleci --skip-update-check config validate examples/circleci.yml

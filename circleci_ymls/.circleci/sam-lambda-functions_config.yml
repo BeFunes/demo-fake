@@ -1,0 +1,136 @@
+version: 2.1
+orbs:
+  aws-serverless: circleci/aws-sam-serverless@2.1.0
+
+references:
+  project: &project aws-sam-poc
+  dir: &dir ~/aws-sam-poc
+  processed-test-results-dir: &processed-test-results-dir ~/aws-sam-poc/functions/processed_test_results
+  ace-portal-data-dir: &ace-portal-data-dir ~/aws-sam-poc/functions/ace_portal_data
+executors:
+  python38:
+    docker:
+      - image: python:3.8
+    environment:
+      POETRY_VIRTUALENVS_PATH: /virtualenvs/3.8/envs
+      POETRY_CACHE_DIR: /virtualenvs/3.8/cache
+  python39:
+    docker:
+      - image: python:3.9
+    environment:
+      POETRY_VIRTUALENVS_PATH: /virtualenvs/3.9/envs
+      POETRY_CACHE_DIR: /virtualenvs/3.9/cache
+
+commands:
+  setup-python-dependencies:
+    description: Setup the python environment for testing and linting
+    steps:
+      - restore_cache:
+          keys:
+            - poetry-cache-{{ arch }}-{{ .Branch }}-{{ checksum "poetry.lock" }}
+            - poetry-cache-{{ arch }}-{{ .Branch }}
+            - poetry-cache
+      - restore_cache:
+          keys:
+            - pip-cache-{{ arch }}-{{ .Branch }}
+            - pip-cache
+      - run: echo "export PATH=$HOME/.poetry/bin:$PATH" >> $BASH_ENV
+      - run: curl -sSL https://raw.githubusercontent.com/python-poetry/poetry/master/get-poetry.py | python -
+      - run: poetry install
+      - save_cache:
+          key: poetry-cache-{{ arch }}-{{ .Branch }}-{{ checksum "poetry.lock" }}
+          paths: /virtualenvs
+      - save_cache:
+          key: pip-cache-{{ arch }}-{{ .Branch }}
+          paths: ~/.local
+  lint:
+    description: Lint the project.
+    parameters:
+      project:
+        type: string
+    steps:
+      - setup-python-dependencies
+      - run: poetry run pylint <<parameters.project>>
+
+  test:
+    description: Test the project.
+    steps:
+      - setup-python-dependencies
+      - run: poetry run pytest
+
+jobs:
+  lint-processed-test-results:
+    executor: python38
+    working_directory: *processed-test-results-dir
+    steps:
+      - checkout:
+          path: *dir
+      - lint:
+          project: processed_test_results
+
+  test-processed-test-results:
+    executor: python38
+    working_directory: *processed-test-results-dir
+    steps:
+      - checkout:
+          path: *dir
+      - test
+
+  lint-ace-portal-data:
+    executor: python39
+    working_directory: *ace-portal-data-dir
+    steps:
+      - checkout:
+          path: *dir
+      - lint:
+          project: ace_portal_data
+
+  test-ace-portal-data:
+    executor: python39
+    working_directory: *ace-portal-data-dir
+    steps:
+      - checkout:
+          path: *dir
+      - test
+
+workflows:
+  version: 2
+  test-publish-deploy:
+    jobs:
+      - test-processed-test-results
+      - lint-processed-test-results
+      - aws-serverless/deploy:
+          name: deploy-aws-sam-poc
+          stack-name: sam-lambda
+          template: ./functions/processed_test_results/template.yaml
+          context:
+            - lambda-sam-deploy-legacy
+          s3-bucket: "sam-lambda-storage-bucket"
+          capabilities: "CAPABILITY_NAMED_IAM"
+          parameter-overrides: "LambdaRoleARN=arn:aws:iam::183081753049:role/sam-lambda-execution"
+          filters:
+            branches:
+              only:
+                - main
+          requires:
+            - test-processed-test-results
+            - lint-processed-test-results
+
+      - lint-ace-portal-data
+      - test-ace-portal-data
+      - aws-serverless/deploy:
+          name: deploy-aws-ace-portal-data
+          stack-name: sam-lambda-ace-portal-data
+          template: ./functions/ace_portal_data/template.yaml
+          context:
+            - lambda-sam-deploy-cciprod
+          s3-bucket: "sam-lambda-ace-portal-data-storage-bucket"
+          capabilities: "CAPABILITY_NAMED_IAM"
+          parameter-overrides: "LambdaRoleARN=arn:aws:iam::045466806556:role/sam-lambda-ace-portal-data-execution"
+          filters:
+            branches:
+              only:
+                - main
+          requires:
+            - lint-ace-portal-data
+            - test-ace-portal-data

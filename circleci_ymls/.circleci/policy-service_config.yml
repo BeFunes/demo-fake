@@ -1,0 +1,322 @@
+version: 2.1
+
+orbs:
+  snyk: snyk/snyk@1.1.2
+
+workflows:
+  main-workflow:
+    jobs:
+      - lint:
+          context: [github-readonly]
+      - test:
+          context: [github-readonly]
+      - security-scans-deps-code:
+          context: [org-global, github-readonly]
+      - security-scans-snyk-deps-docker:
+          context: [org-global, github-readonly]
+      - build-and-deploy:
+          context: [org-global, github-readonly]
+          requires:
+            - lint
+            - test
+
+executors:
+  default:
+    docker:
+      - image: &goimage cimg/go:1.18
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    environment:
+      NAME: << pipeline.parameters.release-name >>
+      DOCKERFILE_PATH: Dockerfile
+      CONFIGURE_ECR_REPO: true
+      ECR_OWNER_TEAM: Security
+      EXTRA_DOCKER_BUILD_ARGS: "--secret id=github_user,env=GITHUB_USER --secret id=github_token,env=GITHUB_TOKEN"
+
+  snyk-base:
+    docker:
+      - image: *goimage
+    environment:
+      NAME: << pipeline.parameters.release-name >>
+      IMAGE_NAME: "circleci/policy-service"
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_BUILDKIT: 1
+      EXTRA_DOCKER_BUILD_ARGS: "--secret id=github_user,env=GITHUB_USER --secret id=github_token,env=GITHUB_TOKEN"
+
+parameters:
+  release-name:
+    type: string
+    default: "policy-service"
+  release-version:
+    type: string
+    default: "v1"
+
+jobs:
+  lint:
+    docker:
+      - image: *goimage
+    resource_class: large
+    steps:
+      - setup
+      - run:
+          name: generate
+          command: go generate -x ./...
+      - run:
+          name: go tidy
+          command: go mod tidy -v
+      - run:
+          name: verify no changes
+          command: git diff --ignore-matching-lines='Generated on ' --exit-code
+      - run: mkdir -p test-reports
+      - run: golangci-lint run -c .golangci.yml ./... --out-format junit-xml | tee test-reports/lint.xml
+      - store_results
+
+  security-scans-deps-code:
+    executor: snyk-base
+    steps:
+      - checkout
+      - run:
+          name: Fix GitHub URL Option
+          command: git config --global url."https://$GITHUB_USER:$GITHUB_TOKEN@github.com/circleci/".insteadOf "https://github.com/circleci/"
+      - when:
+          condition:
+            equal: [ main, << pipeline.git.branch >> ]
+          steps:
+            - run:
+                name: Running snyk CLI on main branch; uploading results
+                command: echo "We are running snyk scan and uploading the results"
+            - snyk/scan:
+                fail-on-issues: false
+                severity-threshold: high
+                monitor-on-build: true
+                project: 'circleci/${CIRCLE_PROJECT_REPONAME}'
+                organization: "circleci-78h"
+      - unless:
+          condition:
+            equal: [ main, << pipeline.git.branch >> ]
+          steps:
+            - run:
+                name: Running snyk CLI on branch; no results uploading
+                command: echo "We are running snyk scan locally and NOT uploading the branch scan results"
+            - snyk/scan:
+                fail-on-issues: false
+                severity-threshold: high
+                monitor-on-build: true
+                project: 'circleci/${CIRCLE_PROJECT_REPONAME}/${CIRCLE_BRANCH}'
+                organization: "circleci-78h"
+
+  security-scans-snyk-deps-docker:
+    executor: snyk-base
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: 20.10.14
+      - run:
+          name: Build Docker Image
+          command: 'docker build --secret id=github_user,env=GITHUB_USER --secret id=github_token,env=GITHUB_TOKEN -t $IMAGE_NAME:latest .'
+      - when:
+          condition:
+            equal: [ main, << pipeline.git.branch >> ]
+          steps:
+            - run:
+                name: Snyk Docker Scan - main - upload
+                command: echo "We are running snyk scan and uploading the results"
+            - snyk/scan:
+                docker-image-name: '$IMAGE_NAME:latest'
+                fail-on-issues: false
+                severity-threshold: high
+                monitor-on-build: true
+                project: 'circleci/${CIRCLE_PROJECT_REPONAME}'
+                target-file: Dockerfile
+                organization: "circleci-78h"
+      - unless:
+          condition:
+            equal: [ main, << pipeline.git.branch >> ]
+          steps:
+            - run:
+                name: Snyk Docker Scan - main - upload
+                command: echo "We are running snyk scan locally and NOT uploading the branch scan results"
+            - snyk/scan:
+                docker-image-name: '$IMAGE_NAME:latest'
+                fail-on-issues: false
+                severity-threshold: high
+                monitor-on-build: true
+                project: 'circleci/${CIRCLE_PROJECT_REPONAME}/${CIRCLE_BRANCH}'
+                target-file: Dockerfile
+                organization: "circleci-78h"
+
+  build-and-deploy:
+    executor: ccc
+    environment:
+      NAME: policy-service
+      IMAGE_NAME: "circleci/policy-service"
+      DOCKER_BUILDKIT: 1
+      AWS_DEFAULT_REGION: us-east-1
+      RELEASE_VERSION: << pipeline.parameters.release-version >>
+      VALUES_FILE: values.yaml
+    steps:
+      - remote_docker
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: publish docker image
+          command: |
+            set -x
+            if [[ "$CIRCLE_BRANCH" = "main" || "$CIRCLE_BRANCH" = "canary" ]]; then
+              # TODO change to all once dockerhub repo is ready
+              export DOCKER_REGISTRY=ecr
+            else
+              # this is how we tell CCC not to actually publish
+              export DOCKER_REGISTRY=none
+            fi
+            publish
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.tag
+      - run:
+          name: deploy on merge to main
+          command: |
+            set -x
+            if [[ "$CIRCLE_BRANCH" = "main" ]]; then
+              deploy
+            fi
+
+  test:
+    docker:
+      - image: *goimage
+      - image: circleci/postgres:13.3-ram
+        environment:
+          POSTGRES_USER: user
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: policyservice
+    resource_class: large
+    steps:
+      - setup
+      - run: export DATABASE_URL=postgres://user:password@127.0.0.1:5432/policyservice
+      - run: go run ./cmd/migrate
+      - run:
+          name: run tests
+          command: |
+            mkdir -p test-reports
+            # -count=1 is used to forcibly disable test result caching
+            gotestsum --junitfile="test-reports/junit.xml" -- -race -count=1 "${@:-./...}" -coverprofile=coverage.out -coverpkg=./...
+            go tool cover -html=coverage.out -o coverage.html
+            mv coverage.html /tmp/test-results
+      - store_artifacts:
+          path: /tmp/test-results
+      - store_results
+
+  policy-service-deploy:
+    executor: ccc
+    environment:
+      AWS_DEFAULT_REGION: us-east-1
+      RELEASE_VERSION: << pipeline.parameters.release-version >>
+    steps:
+      - when:
+          condition: << pipeline.parameters.release-name >>
+          steps:
+            - checkout
+            - attach_workspace:
+                at: .
+            - run: deploy
+            # TODO: re-enable once honeycomb is setup
+            # - notify_honeycomb
+      - unless:
+          condition: << pipeline.parameters.release-name >>
+          steps:
+            - run: echo add release-name to enable this job
+
+  TODO-helm-package-dry-run:
+    executor: ccc
+    steps:
+      - when:
+          condition: << pipeline.parameters.release-name >>
+          steps:
+            - checkout
+            - run:
+                name: Override container version & dry run
+                command: |
+                  IGNORE_VERSION=1 /deploy/dry-run
+                  ls -la .helm.diff
+            - run:
+                name: Install GitHub CLI
+                command: |
+                  curl -fsSL 'https://github.com/cli/cli/releases/download/v1.11.0/gh_1.11.0_linux_amd64.tar.gz' | tar -C /usr/local --strip-components=1 -xz
+            - run:
+                name: Comment on pull request
+                command: |
+                  if [ ! -s ".helm.diff" ]
+                  then
+                    echo "No diff found"
+                    exit 0
+                  fi
+                  if [ ! -n "$CI_PULL_REQUEST" ]
+                  then
+                    echo "No PR found"
+                    exit 0
+                  fi
+                  echo "## Helm diff: <sup>[CI link]( $CIRCLE_BUILD_URL )</sup>" > comment.txt
+                  echo '<details><summary>Details (click me)</summary>' >> comment.txt
+                  echo '' >> comment.txt
+                  echo '```diff' >> comment.txt
+                  cat '.helm.diff' >> comment.txt
+                  echo '```' >> comment.txt
+                  echo '</details>' >> comment.txt
+                  echo "Commenting on ${CI_PULL_REQUEST}"
+                  gh pr comment "${CI_PULL_REQUEST}" --body-file comment.txt
+      - unless:
+          condition: << pipeline.parameters.release-name >>
+          steps:
+            - run: echo add release-name to enable this job
+
+commands:
+  notify_honeycomb:
+    steps:
+      - run:
+          name: Notify Honeycomb
+          command: |
+            cat \<< EOF | tee /tmp/honeycomb-marker
+            {
+              "message": "Deploying policy-service $(<docker_image.tag)",
+              "type":"deploy"
+            }
+            EOF
+            curl https://api.honeycomb.io/1/markers/execution \
+              -H "X-Honeycomb-Team: $HONEYCOMB_WRITEKEY" \
+              -d @/tmp/honeycomb-marker
+
+  setup:
+    steps:
+      - checkout
+      - run: git config --global url."https://$GITHUB_USER:$GITHUB_TOKEN@github.com/circleci/".insteadOf "https://github.com/circleci/"
+      - run: export GOPRIVATE=github.com/circleci/*
+      - run: go mod download
+      - run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.45.2
+      - run: go install gotest.tools/gotestsum@latest
+
+  store_results:
+    steps:
+      - run:
+          name: Strip ANSI codes from xunit output
+          when: always
+          command: |
+            # The test output produces ANSI codes, which the XML writer converts into annoying
+            # \0xfffd characters - we'll strip these out to make the XML a bit more readable
+            sed -i 's/�\[[0-9;]*[a-zA-Z]//g' test-reports/*.xml || true
+      - store_artifacts:
+          path: test-reports
+      - store_test_results:
+          path: test-reports
+
+  remote_docker:
+    steps:
+      - setup_remote_docker:
+          version: 20.10.11
+          docker_layer_caching: true
+      - run: docker version

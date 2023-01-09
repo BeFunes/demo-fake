@@ -1,0 +1,21 @@
+version: 2.1
+
+orbs:
+
+deploy:
+
+version: 2.1
+jobs:
+    default:
+      docker:
+        - image: <redacted>
+  parameters:
+    config:
+      type: string
+  steps:
+    - setup_remote_docker
+    - attach_workspace:
+  at: ./
+    - run: make deploy-circle config=<<parameters.config>>
+
+# VS Code Extension Version: 1.5.0

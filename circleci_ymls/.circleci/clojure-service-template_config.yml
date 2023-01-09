@@ -1,0 +1,28 @@
+version: 2.1
+
+executors:
+  lein:
+    docker:
+      - image: circleci/clojure:lein-2.9.6
+
+jobs:
+  test-template:
+    executor: lein
+    steps:
+      - checkout
+      - run:
+          name: Render template
+          command: lein new circleci/clojure-service-template clojure-service-template-ci
+      - run:
+          name: Run tests in rendered template
+          command: |
+            cd clojure-service-template-ci
+            lein test
+      - store_artifacts:
+          path: clojure-service-template-ci
+
+workflows:
+  version: 2
+  test-service-template:
+    jobs:
+      - test-template

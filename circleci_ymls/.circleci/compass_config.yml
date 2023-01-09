@@ -1,0 +1,229 @@
+version: 2.1
+
+orbs:
+  web-ui-orb: sandbox/web-ui-orb@5.0.0
+
+references:
+  version_js: &version_js 1
+
+commands:
+  setup:
+    steps:
+      - checkout
+      - web-ui-orb/restore-js-deps:
+          cache_version: *version_js
+  login:
+    steps:
+      - run: echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
+
+executors:
+  node:
+    docker:
+      - image: circleci/node:14.17.6-browsers
+    working_directory: /home/circleci/web-ui
+    resource_class: large
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+jobs:
+  scan:
+    executor:
+      name: ccc
+    environment:
+      NAME: compass
+      DOCKERFILE_PATH: Dockerfile
+      EXTRA_DOCKER_BUILD_ARGS: --build-arg NPM_TOKEN
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker:
+          version: 19.03.13
+      - run: scan
+
+  build:
+    executor: node
+    steps:
+      - setup
+      - run:
+          name: Build distribution files
+          command: yarn build
+      - persist_to_workspace:
+          root: .
+          paths:
+            - dist
+
+  test:
+    executor: node
+    steps:
+      - setup
+      - run:
+          name: Run Tests
+          command: yarn test:ci
+
+  accessibility-report:
+    executor: node
+    steps:
+      - setup
+      - run:
+          name: Run Storybook
+          command: yarn run storybook
+          background: true
+      - run:
+          name: Run Accessibility Tests
+          command: yarn a11y-report --exit
+
+  lint:
+    executor: node
+    steps:
+      - setup
+      - run:
+          name: Lint source code
+          command: yarn lint
+      - run:
+          name: Check prettier
+          command: yarn prettier:ci
+
+  chromatic:
+    executor: node
+    steps:
+      - setup
+      - run:
+          name: Run Chromatic build
+          command: |
+            if [ "${CIRCLE_BRANCH}" != "main" ];
+            then
+              yarn chromatic
+            else
+              # We know any changes that make it to main *must* have been approved
+              yarn chromatic --auto-accept-changes
+            fi
+
+  publish-canary:
+    executor: node
+    steps:
+      - setup
+      - attach_workspace:
+          at: .
+      - login
+      - run:
+          name: Publish npm Package
+          command: |
+            name="$(jq --raw-output .name package.json)"
+            version="$(jq --raw-output .version package.json)-canary.$(git rev-parse --short HEAD)"
+            full_identifier="$name@$version"
+            echo "Checking for published version..."
+            if [ $(yarn -s info $full_identifier --json 2>&1 | jq -s '.[0].type == "error" or .[0].data.dist == null') == "true" ]
+            then
+              echo "Publishing $full_identifier…"
+              yarn version --no-git-tag-version --new-version $version
+              yarn publish --tag canary
+            else
+              echo "$full_identifier already published. Doing nothing."
+            fi
+
+  publish-release:
+    executor: node
+    steps:
+      - setup
+      - attach_workspace:
+          at: .
+      - login
+      - run:
+          name: Publish npm Package
+          command: |
+            name="$(jq --raw-output .name package.json)"
+            version="$(jq --raw-output .version package.json)"
+            full_identifier="$name@$version"
+            echo "Checking for published version..."
+            if [ $(yarn -s info $full_identifier --json 2>&1 | jq -s '.[0].type == "error" or .[0].data.dist == null') == "true" ]
+            then
+              echo "Publishing $full_identifier…"
+              yarn publish
+            else
+              echo "$full_identifier already published. Doing nothing."
+            fi
+          # Todo - Add this when auto-versioning is fixed
+          # command: yarn release
+
+  publish-main-storybook:
+    executor: node
+    steps:
+      - setup
+      - add_ssh_keys:
+          fingerprints:
+            - '8e:75:0b:ed:9c:43:9b:b1:6c:ee:e8:9f:08:2e:ea:5e'
+      - run:
+          name: Build Storybook
+          command: yarn build-storybook
+      - run:
+          name: Set git user
+          command: |
+            git config --global user.email "$GH_PAGES_EMAIL"
+            git config --global user.name "$GH_PAGES_NAME"
+      - run:
+          name: Publish Storybook
+          command: |
+            yarn publish-storybook --message "[skip ci] Deploying docs from @ $CIRCLE_SHA1"
+
+workflows:
+  test-and-publish:
+    jobs:
+      - scan:
+          context: [org-global, web-ui-npm]
+      - web-ui-orb/dependencies:
+          name: dependencies
+          context: web-ui-npm
+          cache_version_js_dependencies: *version_js
+      - build:
+          context: design-system
+          requires:
+            - dependencies
+      - test:
+          context: design-system
+          requires:
+            - dependencies
+      - accessibility-report:
+          context: design-system
+          requires:
+            - dependencies
+      - lint:
+          context: design-system
+          requires:
+            - dependencies
+      - chromatic:
+          context: design-system
+          requires:
+            - dependencies
+      - publish-canary:
+          context: design-system
+          filters:
+            branches:
+              ignore:
+                - main
+                - /^renovate\/.*/ # Ignore Renovate branches as they cause canary errors
+          requires:
+            - build
+            - lint
+            - test
+            - accessibility-report
+      - publish-release:
+          filters:
+            branches:
+              only: main
+          requires:
+            - build
+            - lint
+            - test
+            - accessibility-report
+      - publish-main-storybook:
+          context: design-system
+          filters:
+            branches:
+              only: main
+          requires:
+            - dependencies

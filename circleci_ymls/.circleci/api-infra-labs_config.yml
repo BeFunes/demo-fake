@@ -1,0 +1,60 @@
+version: 2.1
+
+orbs:
+  gh-pages: sugarshin/gh-pages@0.0.6
+
+executors:
+  mermaid:
+    docker:
+      - image: minlag/mermaid-cli:8.11.0
+
+jobs:
+  render-diagrams:
+    executor: mermaid
+    steps:
+      - checkout
+      - run:
+          name: Render diagrams
+          command: |
+            mkdir -p dist/diagrams
+            cd diagrams
+            for diagram in *.mmd; do
+              ~/node_modules/.bin/mmdc -p /puppeteer-config.json -i "${diagram}" -o "../dist/diagrams/${diagram%.mmd}.svg"
+            done
+      - run:
+          name: Generate index
+          working_directory: dist/diagrams
+          command: |
+            (
+              echo '<html><body><ul>'
+              echo '<p>Links from this page can be shared with CircleCI employees and are protected by SSO.</p>'
+              for image in *.svg; do
+              echo "<li><a href="${image}">${image}</a></li>"
+              done
+              echo '</ul></body></html>'
+            ) > index.html
+      - store_artifacts:
+          path: dist/diagrams
+      - run:
+          # Missing feature: https://github.com/mermaid-js/mermaid-cli/issues/138
+          name: Check for errors
+          command: |
+            ! grep -R 'Syntax error in graph' dist/diagrams
+      - persist_to_workspace:
+          root: .
+          paths:
+            - dist
+
+workflows:
+  render-diagrams:
+    jobs:
+      - render-diagrams
+      - gh-pages/deploy:
+          attach-workspace: true
+          ssh-fingerprints: "84:7b:07:af:30:dd:61:6c:eb:e5:51:db:af:33:37:41"
+          workspace-root: ~/project
+          requires:
+            - render-diagrams
+          filters:
+            branches:
+              only: main

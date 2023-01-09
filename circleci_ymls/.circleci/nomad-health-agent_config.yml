@@ -1,0 +1,188 @@
+version: 2.1
+
+orbs:
+  codecov: codecov/codecov@1.2.2
+  aws: circleci/aws-cli@2.0.0
+  slack: circleci/slack@4.4.4
+
+workflows:
+  ci:
+    jobs:
+      - lint
+      - build:
+          context:
+            - execution-ecr-readonly
+      - publish-binary:
+          context:
+            - execution-infrastructure-deploy
+          filters:
+            branches:
+              only:
+                - master
+          requires:
+            - build
+      - canary-deploy:
+          context:
+            - execution-infrastructure-deploy
+          filters:
+            branches:
+              only:
+                - master
+          requires:
+            - publish-binary
+            - build
+            - lint
+      - full-deploy-gate:
+          filters:
+            branches:
+              only:
+                - master
+          requires:
+            - publish-binary
+            - build
+            - lint
+#            - canary-deploy
+          type: approval
+      - terminate-canary-gate:
+          filters:
+            branches:
+              only:
+                - master
+          requires:
+            - canary-deploy
+          type: approval
+      - full-deploy:
+          context:
+            - execution-infrastructure-deploy
+          filters:
+            branches:
+              only:
+                - master
+          requires:
+            - full-deploy-gate
+      - network-agent-deploy:
+          context:
+            - execution-infrastructure-deploy
+          filters:
+            branches:
+              only:
+                - master
+          requires:
+            - publish-binary
+            - build
+            - lint
+      - terminate-canary:
+          context:
+            - execution-infrastructure-deploy
+          filters:
+            branches:
+              only:
+                - master
+          requires:
+            - terminate-canary-gate
+
+jobs:
+  lint:
+    resource_class: large
+    docker:
+      - image: cimg/go:1.17
+    steps:
+      - checkout
+      - run: ./do lint
+      - notify_failing_master
+
+  build:
+    resource_class: large
+    docker:
+      - image: cimg/go:1.17
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: 20.10.14
+      - aws/setup:
+          profile-name: cciexec
+      - run: go mod download
+      - run: ./do install-devtools
+      - run: ./do build
+      - run: ./do test
+      - run: echo $(./do version) >> target/version.txt
+
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target
+
+      - store_artifacts:
+          path: test-reports
+
+      - store_test_results:
+          path: test-reports
+      - notify_failing_master
+
+  publish-binary:
+    executor: aws/default
+    steps:
+      - checkout
+      - aws/setup:
+          profile-name: cciexec
+      - attach_workspace:
+          at: .
+      - run: ./scripts/ci/publish.sh $(cat target/version.txt)
+      - notify_failing_master
+
+  canary-deploy:
+    executor: aws/default
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - aws/setup:
+          profile-name: cciexec
+      - run: curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
+      - run: sudo dpkg -i session-manager-plugin.deb
+      - run: ./scripts/ci/canary-deploy.sh
+      - persist_to_workspace:
+          root: .
+          paths:
+            - canary_instances.txt
+
+  full-deploy:
+    executor: aws/default
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - aws/setup:
+          profile-name: cciexec
+      - run: ./scripts/ci/full-deploy.sh
+      - notify_failing_master
+
+  network-agent-deploy:
+    executor: aws/default
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - aws/setup:
+          profile-name: cciexec
+      - run: ./scripts/ci/network-agent-deploy.sh
+      - notify_failing_master
+
+  terminate-canary:
+    executor: aws/default
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - aws/setup:
+          profile-name: cciexec
+      - run: ./scripts/ci/terminate-instance.sh
+
+commands:
+  notify_failing_master:
+    steps:
+      - slack/notify:
+          channel: fleets-alerts
+          branch_pattern: master
+          event: fail
+          template: basic_fail_1

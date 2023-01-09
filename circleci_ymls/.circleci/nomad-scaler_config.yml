@@ -1,0 +1,292 @@
+version: 2.1
+
+workflows:
+  version: 2
+
+  build-test-deploy:
+    jobs:
+      - test
+      - lint
+      - build
+      - lint-helm-chart:
+          name: lint-helm-chart
+          chart: deploy
+          context: org-global
+      - docker-image:
+          context: org-global
+          requires:
+            - build
+      - deploy:
+          name: deploy
+          chart: deploy
+          release-version: eks
+          context: org-global
+          requires:
+            - test
+            - lint
+            - docker-image
+            - lint-helm-chart
+          filters:
+            branches:
+              only: master
+
+orbs:
+  slack: circleci/slack@4.4.4
+  codecov: codecov/codecov@1.0.2
+  ccc:
+    executors:
+      executor:
+        docker:
+        - image: circleci/command-convenience:0.1
+          auth:
+            username: $DOCKER_HUB_USER
+            password: $DOCKER_HUB_PASSWORD
+
+executors:
+  default:
+    docker:
+      - image: &goimage cimg/go:1.18
+    working_directory: ~/project
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    environment:
+      NAME: nomad-scaler
+      DOCKERFILE_PATH: Dockerfile
+      DEPLOY_TYPE: helm
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/nomad-scaler
+
+jobs:
+  test:
+    docker:
+      - image: *goimage
+      - image: minio/minio
+        environment:
+          MINIO_ACCESS_KEY: 'minio'
+          MINIO_SECRET_KEY: 'minio123'
+        command: ['server', '/data', '--address', ':9123']
+      - image: circleci/nomad:1.2.0-88-857e447
+        command: [start, agent, -dev]
+    working_directory: ~/project
+    steps:
+      - setup
+      - run: ./do create-stub-test-files
+      - run:
+          name: Run tests
+          command: |
+            mkdir -p /tmp/test-results/unit
+            gotestsum -- -coverprofile=coverage.txt ./...
+          environment:
+            GOTESTSUM_JUNITFILE: /tmp/test-results/unit/junit.xml
+      - store_test_results:
+          path: /tmp/test-results
+      - codecov/upload:
+          file: coverage.txt
+      - notify_failing_master
+
+  lint:
+    executor: default
+    resource_class: medium+
+    steps:
+      - setup
+      - run: go mod tidy -v
+      - run:
+          name: Check git diff
+          command: |
+            git --no-pager diff go.mod go.sum
+            git --no-pager diff --quiet go.mod go.sum
+      - run: ./do lint
+      - store_results
+      - notify_failing_master
+
+  lint-helm-chart:
+    parameters:
+      chart:
+        type: string
+    executor: ccc
+    environment:
+      CUSTOM_CHART: << parameters.chart >>
+    steps:
+      - checkout
+      - run:
+          name: create helm package
+          command: |
+            /deploy/scripts/dry-run.sh | tee helm-package.txt
+      - store_artifacts:
+          path: helm-package.txt
+      - run: ./<< parameters.chart >>/helm-package-asserts helm-package.txt
+      - notify_failing_master
+
+  build:
+    executor: default
+    steps:
+      - setup
+      - run: ./do build
+      - run: ./do version > app_version
+      - persist_to_workspace:
+          root: .
+          paths:
+            - app_version
+            - ./bin/linux
+      - notify_failing_master
+
+  docker-image:
+    executor: ccc
+    steps:
+      - create_and_scan_docker_image:
+          context: bin/linux
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.tag
+      - notify_failing_master
+
+  deploy:
+    parameters:
+      release-version:
+        type: string
+      chart:
+        type: string
+    executor: ccc
+    environment:
+      CUSTOM_CHART: << parameters.chart >>
+      RELEASE_VERSION: << parameters.release-version >>
+    steps:
+      - run:
+          name: Skip if not k9s
+          command: |
+            # Only deploy from k9s to avoid duplicate deploys
+            [[ "$CIRCLE_BUILD_URL" =~ ^https://k9s.sphereci.com ]] || \
+              circleci-agent step halt
+      - checkout
+      - attach_workspace:
+          at: .
+      - run: deploy
+      - notify_slack
+      - notify_failing_master
+
+commands:
+  setup:
+    steps:
+      - checkout
+      - run: go mod download
+      - run: ./do install-devtools
+  store_results:
+    steps:
+      - store_artifacts:
+          path: test-reports
+      - store_test_results:
+          path: test-reports
+  remote_docker:
+    steps:
+      - setup_remote_docker
+      - run: docker version
+
+  create_and_scan_docker_image:
+    parameters:
+      context:
+        description: The directory to use as docker build context
+        type: string
+    steps:
+      - remote_docker
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: create and scan docker image
+          command: |
+            set -x
+            if [[ "$CIRCLE_BRANCH" = "master" ]]; then
+              export DOCKER_REGISTRY=all
+            else
+              # this is how we tell CCC not to actually publish
+              export DOCKER_REGISTRY=none
+            fi
+
+            export CONTAINER_VERSION=$(cat app_version)
+
+            # Don't send as much build context to remote docker
+            # If `publish` accepted a context arg, this would be easier
+            cd << parameters.context >>
+            cp ~/project/Dockerfile .
+
+            publish
+
+            cp docker_image.tag ~/project
+
+  notify_failing_master:
+    steps:
+      - slack/notify:
+          channel: fleets-alerts
+          branch_pattern: master
+          event: fail
+          template: basic_fail_1
+
+  # Cribbed from the slack orb, then modified to suit
+  notify_slack:
+    steps:
+      - run:
+          name: Slack Notification
+          command: |
+            # Provide error if no webhook is set and error. Otherwise continue
+            if [ -z "${SLACK_WEBHOOK}" ]; then
+              echo '$SLACK_WEBHOOK not set'
+              exit 1
+            fi
+
+            version=$(<docker_image.tag)
+            message=$(git show "${CIRCLE_SHA1:-}" --no-patch --format=%s)
+
+            cat \<< EOF | tee /tmp/slack-webhook-body
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "Helm deployment triggered",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project:*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Author:*\n$CIRCLE_USERNAME"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Version:*\n$version"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*CircleCI Build:*\n<$CIRCLE_BUILD_URL|$CIRCLE_BUILD_NUM>"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Commit Message:*\n$message"
+                  }
+                }
+              ]
+            }
+            EOF
+
+            curl --fail -H 'Content-type: application/json' \
+                --data @/tmp/slack-webhook-body "${SLACK_WEBHOOK}"

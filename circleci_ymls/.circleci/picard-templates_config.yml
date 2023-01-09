@@ -1,0 +1,27 @@
+version: 2.1
+
+orbs:
+  orb-tools: circleci/orb-tools@7.3.0
+  cli: circleci/circleci-cli@0.1.2
+
+jobs:
+  validate:
+    executor: cli/default
+    resource_class: small
+    steps:
+      - checkout
+
+      - run:
+          name: circleci config validate
+          command: |
+            for file in ./*.yml; do
+              circleci config validate $file
+            done
+
+workflows:
+  validate-yaml:
+    jobs:
+      - orb-tools/lint
+      - validate:
+          requires:
+            - orb-tools/lint

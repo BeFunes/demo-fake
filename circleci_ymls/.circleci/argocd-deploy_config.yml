@@ -1,0 +1,78 @@
+---
+version: 2.1
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+commands:
+  initialize:
+    description: Initial CI setup before CCC runs
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: install helm & update chart dependencies
+          command: |
+            apk add openssl
+            curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3
+            chmod 700 get_helm.sh
+            ./get_helm.sh
+            helm dep update charts/argo-cd
+      # Override some chart values with template that CCC expects
+      - run: cp charts/argo-cd/Chart.yaml /tmp/Chart.yaml
+      - run: /deploy/merge-values /tmp/Chart.yaml chart-CI-overrides.yaml > charts/argo-cd/Chart.yaml
+      # Apply values now because CCC does not allow using custom values file with custom chart
+      - run: cp charts/argo-cd/values.yaml /tmp/values.yaml
+      - run: /deploy/merge-values /tmp/values.yaml prod-values.yaml > charts/argo-cd/values.yaml
+    # download the dependency chart (redis-ha)
+
+jobs:
+  install:
+    executor: ccc
+    environment: &ccc-environment
+      NAME: argocd
+      MAJOR_VERSION: 1.0
+      RELEASE_SUFFIX: ""
+      NAMESPACE: argocd
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: ecr
+      IMAGE_NAME: circleci/argocd
+      CONFIGURE_ECR_REPO: true
+      ECR_OWNER_TEAM: InfraEng
+      CUSTOM_CHART: charts/argo-cd
+      TWISTLOCK_ENFORCE: false   # TODO: Make the image pass twistlock
+    steps:
+      - initialize
+      - run: publish
+      - run: deploy
+
+  test:
+    executor: ccc
+    environment:
+      <<: *ccc-environment
+    steps:
+      - initialize
+      - run: scan
+      - run: /deploy/dry-run
+
+workflows:
+  version: 2
+  install-application:
+    jobs:
+      - install:
+          context:
+            - org-global
+            - infra-operators-deploy
+          filters:
+            branches:
+              only: main
+      - test:
+          context: org-global
+          filters:
+            branches:
+              ignore: main

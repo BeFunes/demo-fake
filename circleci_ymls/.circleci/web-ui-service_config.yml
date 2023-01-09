@@ -1,0 +1,286 @@
+version: 2.1
+
+orbs:
+  docker: circleci/docker@2.0.4
+  terraform: circleci/terraform@3.0.0
+
+executors:
+  go:
+    docker:
+      - image: circleci/go-service:0.1-dev
+        auth:
+          username: $RO_DOCKER_HUB_USERNAME
+          password: $RO_DOCKER_HUB_PASSWORD
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    environment:
+      EXTRA_DOCKER_BUILD_ARGS: "--secret id=github_user,env=GITHUB_USER --secret id=github_token,env=GITHUB_TOKEN"
+
+workflows:
+  build-test-deploy:
+    jobs:
+      # backplane standard
+      - build-service:
+          context: dockerhub-readonly
+      - lint-service:
+          context: dockerhub-readonly
+          requires:
+            - build-service
+      - test-service:
+          context: dockerhub-readonly
+          requires:
+            - build-service
+      - acceptance-test-service:
+          context: dockerhub-readonly
+          requires:
+            - build-service
+            - lint-service
+            - test-service
+
+      - dry-run-service:
+          context: org-global
+          requires:
+            - build-service
+            - lint-service
+            - test-service
+          filters:
+            branches:
+              # diffs are included automatically by actual deploys
+              ignore:
+                - main
+                - canary
+      - scan-service:
+          requires:
+            - build-service
+          context: org-global
+          filters:
+            branches:
+              # fret not, scans are run on main as part of the real publish
+              ignore:
+                - main
+                - canary
+      - can-deploy-canary:
+          type: approval
+          filters:
+            branches:
+              ignore:
+                - main
+          requires:
+            - build-service
+            - scan-service
+            - build-service
+            - lint-service
+            - test-service
+            - acceptance-test-service
+
+
+      - publish-deploy-service-canary:
+          context: org-global
+          filters:
+            branches:
+              ignore:
+                - main
+          requires:
+            - can-deploy-canary
+
+      - can-delete-canary:
+          type: approval
+          filters:
+            branches:
+              ignore:
+                - main
+          requires:
+            - publish-deploy-service-canary
+
+      - delete-canary:
+          context: org-global
+          filters:
+            branches:
+              ignore:
+                - main
+          requires:
+            - can-delete-canary
+
+      - deploy:
+          context: org-global
+          requires:
+            - acceptance-test-service
+          filters:
+            branches:
+              only: main
+
+
+      - terraform-lint:
+          context:
+            - pipelines-terraform
+            - ingestion-manager-adapters-alerts
+      - terraform-plan:
+          context:
+            - pipelines-terraform
+            - ingestion-manager-adapters-alerts
+          requires:
+            - terraform-lint
+          filters:
+            branches:
+              ignore: main
+      - terraform-apply:
+          context:
+            - pipelines-terraform
+            - ingestion-manager-adapters-alerts
+          filters:
+            branches:
+              only: main
+
+jobs:
+  delete-canary:
+    executor: ccc
+    steps:
+      - checkout
+      - run: .circleci/delete-canary.sh web-ui-service-canary
+
+  build-service:
+    executor: go
+    steps:
+      - checkout
+      - run: task ci:private-go-mod-init
+      - run: task build
+
+  lint-service:
+    executor: go
+    steps:
+      - checkout
+      - run: task ci:private-go-mod-init
+      - run: task lint
+
+  test-service:
+    executor: go
+    environment:
+      - STATSD_HOST: localhost
+    steps:
+      - checkout
+      - run: task ci:private-go-mod-init
+      - run: task test
+
+  acceptance-test-service:
+    executor: go
+    environment:
+      DOCKER_BUILDKIT: 1
+      COMPOSE_DOCKER_CLI_BUILD: 1
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: 20.10.12
+      - run: task ci:private-go-mod-init
+      - run: task vendor
+      - docker/install-docker-compose
+      - run: task run-acceptance-tests
+
+  deploy:
+    executor: ccc
+    environment:
+      NAME: web-ui-service
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/web-ui-service
+      DOCKER_REGISTRY: ecr
+      CONFIGURE_ECR_REPO: "true"
+      VALUES_FILE: service/values.yaml
+      DOCKERFILE_PATH: Dockerfile
+      RELEASE_VERSION: v1
+      ECR_OWNER_TEAM: Pipelines
+      GOPRIVATE: github.com/circleci
+      DOCKER_BUILDKIT: 1
+      COMPOSE_DOCKER_CLI_BUILD: 1
+    working_directory: ~/repo
+    steps:
+      - setup_remote_docker:
+          version: 20.10.11
+      - checkout
+      - attach_workspace:
+          at: .
+      - run: publish
+      - run: deploy
+
+  publish-deploy-service-canary:
+    executor: ccc
+    environment:
+      NAME: web-ui-service
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/web-ui-service
+      DOCKER_REGISTRY: ecr
+      VALUES_FILE: service/canary.yml
+      RELEASE_VERSION: canary
+      DEPLOY_ENVIRONMENT: canary
+      CONFIGURE_ECR_REPO: yes
+      DOCKERFILE_PATH: Dockerfile
+      ECR_OWNER_TEAM: Pipelines
+      DOCKER_BUILDKIT: 1
+      FORCE_ALLOW_OUTDATED: true
+      COMPOSE_DOCKER_CLI_BUILD: 1
+    working_directory: ~/repo
+    steps:
+      - setup_remote_docker:
+          version: 20.10.11
+      - checkout
+      - attach_workspace:
+          at: .
+      - run: publish
+      - run: /deploy/merge-values service/values.yaml service/canary-overrides.yml > service/canary.yml
+      - run: deploy
+
+  scan-service:
+    executor:
+      name: ccc
+    environment:
+      NAME: web-ui-service
+      DOCKERFILE_PATH: Dockerfile
+      TWISTCLI_DEBUG: true
+      DOCKER_BUILDKIT: 1
+      COMPOSE_DOCKER_CLI_BUILD: 1
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: 20.10.12
+      - run: scan
+      - store_artifacts:
+          path: ccc-image-scan-results
+          destination: web-ui-service/ccc-image-scan-results
+
+  dry-run-service:
+    executor: ccc
+    environment:
+      NAME: web-ui-service
+      DOCKERFILE_PATH: Dockerfile
+      VALUES_FILE: service/values.yaml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: /deploy/dry-run
+
+  terraform-lint:
+    executor:
+      name: terraform/default
+      tag: '1.0.11'
+    steps:
+      - checkout
+      - terraform/fmt:
+          path: ./alerts
+      - terraform/validate:
+          path: ./alerts
+  terraform-plan:
+    executor:
+      name: terraform/default
+      tag: '1.0.11'
+    steps:
+      - checkout
+      - terraform/plan:
+          path: ./alerts
+  terraform-apply:
+    executor:
+      name: terraform/default
+      tag: '1.0.11'
+    steps:
+      - checkout
+      - terraform/apply:
+          path: ./alerts

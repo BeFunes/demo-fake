@@ -1,0 +1,80 @@
+version: 2.1
+
+x-data:
+  big_resource_class: &big_resource_class
+    resource_class: xlarge
+    environment:
+      GOMAXPROCS: 8
+
+
+workflows:
+  main-workflow:
+    jobs:
+      - lint
+      - test
+      - build
+
+executors:
+  default:
+    docker:
+      - image: &goimage cimg/go:1.17
+
+jobs:
+  lint:
+    <<: *big_resource_class
+    docker:
+      - image: *goimage
+    steps:
+      - setup
+      - run:
+          name: go tidy
+          command: ./do check-gomod
+      - run: ./do lint-report
+      - store_results
+
+  build:
+    <<: *big_resource_class
+    docker:
+      - image: *goimage
+    steps:
+      - setup
+      - run: ./do build
+      - persist_to_workspace:
+          root: .
+          paths:
+            - build
+
+  test:
+    <<: *big_resource_class
+    docker:
+      - image: *goimage
+    steps:
+      - setup
+      - run: ./do create-stub-test-files
+      - run:
+          name: run tests
+          command: ./do test
+      - store_results
+
+commands:
+  setup:
+    steps:
+      - checkout
+      - run: |
+            cd tokenauth
+            go mod download
+      - run: ./do install-devtools
+
+  store_results:
+    steps:
+      - run:
+          name: Strip ANSI codes from xunit output
+          when: always
+          command: |
+            # The test output produces ANSI codes, which the XML writer converts into annoying
+            # \0xfffd characters - we'll strip these out to make the XML a bit more readable
+            sed -i 's/�\[[0-9;]*[a-zA-Z]//g' tokenauth/test-reports/*.xml || true
+      - store_artifacts:
+          path: tokenauth/test-reports
+      - store_test_results:
+          path: tokenauth/test-reports

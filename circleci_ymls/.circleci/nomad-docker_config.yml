@@ -1,0 +1,68 @@
+version: 2.1
+
+references:
+  ccc-image: &ccc-image
+    circleci/command-convenience:0.1
+
+  hub-auth: &hub-auth
+    username: $DOCKER_HUB_USER
+    password: $DOCKER_HUB_PASSWORD
+
+jobs:
+  download-nomad:
+    docker:
+      - image: cimg/base:stable
+        user: root
+    steps:
+      - checkout
+      - run:
+          name: Download
+          command: ./do download
+      - persist_to_workspace:
+          root: .
+          paths:
+            - pkg
+
+  publish-cloud-container:
+    working_directory: /root/nomad
+    docker:
+      - image: *ccc-image
+        auth: *hub-auth
+        environment:
+          NAME: nomad
+          DOCKER_REGISTRY: dockerhub
+          DOCKERFILE_PATH: Dockerfile
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: /root/nomad
+      - run: |
+          export CONTAINER_VERSION="$(<pkg/version)-${CIRCLE_BUILD_NUM}-$(git rev-parse --short HEAD)"
+          # This was added 23rd Nov 2021. Nomad which is packaged in this image is third-party software
+          # and this image is only used in CI for tests against Nomad's API. We are unable to get the
+          # provider to update these packages as they're using an older version of Golang.
+          #
+          # These dependencies could not be ignored in Prisma as they may be used in other software, and
+          # exceptions in Prisma are global. As a result they've told us to use this method until Nomad
+          # upgrades these packages.
+          #
+          # This should be reviewed when we upgrade Nomad next.
+          export TWISTLOCK_ENFORCE="false"
+          publish
+
+
+workflows:
+  version: 2
+  download-and-publish:
+    jobs:
+      - download-nomad:
+          context: org-global
+      - publish-cloud-container:
+          context: org-global
+          requires:
+            - download-nomad
+          filters:
+            branches:
+              only:
+                - master

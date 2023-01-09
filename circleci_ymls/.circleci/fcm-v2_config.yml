@@ -1,0 +1,78 @@
+version: 2.1
+
+executors:
+  generic:
+    docker:
+      - image: circleci/python:3.9
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    environment:
+      DOCKER_REGISTRY: ecr
+      NAMESPACE: sre
+    working_directory: ~/project
+
+commands:
+  install_deps:
+    steps:
+      - run: pip3 install -r requirements.txt
+
+jobs:
+  pytest:
+    executor: generic
+    environment:
+      CCI_TOKEN: ''
+    steps:
+      - checkout:
+          path: ~/project
+      - install_deps
+      - run:
+          name: running test
+          command: pytest test_units.py
+
+  build-and-deploy:
+    executor: ccc
+    environment:
+      NAME: crypto-config-parser
+      #CUSTOM_CHART: deploy/
+      VALUES_FILE: "deploy/values.yaml"
+      DOCKER_REGISTRY: ecr
+      DOCKERFILE_PATH: "./Dockerfile"
+      NAMESPACE: default
+    steps:
+      - setup_remote_docker
+      - checkout:
+          path: ~/project
+      - run: publish
+      - run: deploy
+  
+  dry-run:
+      executor: ccc
+      environment:
+        NAME: crypto-config-parser
+        #CUSTOM_CHART: deploy/
+        DOCKERFILE_PATH: "./Dockerfile"
+        VALUES_FILE: "deploy/values.yaml"
+      steps:
+        - checkout
+        - run: /deploy/dry-run       
+ 
+workflows:
+  version: 2
+  workflow:
+    jobs:
+      - pytest
+      - dry-run:
+          context: org-global
+      - build-and-deploy:
+          context: org-global
+          requires:
+            - pytest
+            - dry-run
+          filters:
+            branches:
+              only:
+                - main

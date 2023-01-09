@@ -1,0 +1,50 @@
+version: 2.1
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: jenkinsfile-converter
+          CUSTOM_CHART: .
+          NAMESPACE: internal-tools
+
+commands:
+  set-container-version:
+    steps:
+      - run:
+          name: Set CONTAINER_VERSION env var
+          command: |
+            echo "export CONTAINER_VERSION=0.1.${CIRCLE_BUILD_NUM}-$(git rev-parse --short HEAD)" | tee -a "${BASH_ENV}"
+
+jobs:
+  dry-run:
+    executor: ccc
+    steps:
+      - checkout
+      - set-container-version
+      - run: /deploy/generate-chart
+      - run: /deploy/dry-run
+  do-deploy:
+    executor: ccc
+    steps:
+      - checkout
+      - set-container-version
+      - run: deploy
+
+workflows:
+  main:
+    jobs:
+      - dry-run:
+          context: org-global
+      - do-deploy:
+          filters:
+            branches:
+              only:
+                - main
+          requires:
+            - dry-run
+          context: org-global

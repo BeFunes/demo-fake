@@ -1,0 +1,148 @@
+version: 2.1
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: opentelemetry-collector
+          RELEASE_SUFFIX: ""
+          MAJOR_VERSION: "0.53.0"
+          DOCKER_REGISTRY: ecr
+          DOCKERFILE_PATH: "./Dockerfile"
+          IMAGE_NAME: circleci/opentelemetry-collector
+          NAMESPACE: opentelemetry-collector-system
+          HELM_REPO: "https://open-telemetry.github.io/opentelemetry-helm-charts"
+          HELM_CHART: "open-telemetry/opentelemetry-collector"
+          UPSTREAM_CHART_VERSION: "0.18.0"
+          CUSTOM_CHART: charts/opentelemetry-collector
+          TWISTLOCK_ENFORCE: false # TODO(Liam): Enforce Twistlock
+          CONFIGURE_ECR_REPO: true
+          ECR_OWNER_TEAM: SRE
+  terraform:
+    docker:
+      - image: hashicorp/terraform:1.2.3
+
+orbs:
+  slack: circleci/slack@4.10.1
+  terraform: circleci/terraform@3.1.0
+
+commands:
+  initialize:
+    description: Initial CI setup before CCC runs
+    steps:
+      - checkout
+      - setup_remote_docker
+      # Fetch upstream chart
+      - run: helm repo add open-telemetry "${HELM_REPO}"
+      - run: helm repo update
+      - run: helm fetch --untar --version "${UPSTREAM_CHART_VERSION}" --destination charts "${HELM_CHART}"
+      # Override some chart values with template that CCC expects
+      - run: cp charts/opentelemetry-collector/Chart.yaml /tmp/Chart.yaml
+      - run: |
+          /deploy/merge-values \
+            /tmp/Chart.yaml \
+            chart-CI-overrides.yaml \
+          > charts/opentelemetry-collector/Chart.yaml
+      # Apply values because CCC can't use custom values file with custom chart
+      - run: cp charts/opentelemetry-collector/values.yaml /tmp/values.yaml
+      # Apply some values overrides specific to CI deployment
+      - run: |
+          /deploy/merge-values \
+            /tmp/values.yaml \
+            values-CI-overrides.yaml \
+          > charts/opentelemetry-collector/values.yaml
+      # Inject the Docker image version(tag)
+      - run: sed "s/MAJOR_VERSION/$MAJOR_VERSION/g" Dockerfile > tmp && mv tmp Dockerfile
+jobs:
+  deploy:
+    executor: ccc
+    steps:
+      - initialize
+      - run: |
+          export CONTAINER_VERSION="${MAJOR_VERSION}-${CIRCLE_BUILD_NUM}.$(git rev-parse --short HEAD)"
+          publish
+      - run: |
+          export CONTAINER_VERSION="${MAJOR_VERSION}-${CIRCLE_BUILD_NUM}.$(git rev-parse --short HEAD)"
+          deploy
+      - slack/notify:
+          channel: sre-team
+          event: fail
+          template: basic_fail_1
+
+  deploy-dry-run:
+    executor: ccc
+    steps:
+      - initialize
+      - run: |
+          export CONTAINER_VERSION="${MAJOR_VERSION}-${CIRCLE_BUILD_NUM}.$(git rev-parse --short HEAD)"
+          scan
+      - run: |
+          export CONTAINER_VERSION="${MAJOR_VERSION}-${CIRCLE_BUILD_NUM}.$(git rev-parse --short HEAD)"
+          /deploy/dry-run
+
+  plan:
+    executor: terraform
+    steps:
+      - checkout
+      - run:
+          name: "Merge in latest main to avoid rollbacks"
+          command: |
+            git config --global user.name "$(git show -s --format='%an' "${CIRCLE_SHA1}")"
+            git config --global user.email "$(git show -s --format='%ae' "${CIRCLE_SHA1}")"
+            git checkout --detach
+            git pull origin main --no-edit
+            git --no-pager diff --check
+      - terraform/init:
+          path: ./terraform/
+      - terraform/plan:
+          path: ./terraform/
+
+  apply:
+    executor: terraform
+    steps:
+      - checkout
+      - terraform/init:
+          path: ./terraform/
+      - terraform/apply:
+          path: ./terraform/
+      - slack/notify:
+          channel: sre-team
+          event: fail
+          template: basic_fail_1
+
+workflows:
+  version: 2
+  default:
+    jobs:
+      - deploy-dry-run:
+          context:
+            - org-global
+            - sre-notification
+          filters:
+            branches:
+              ignore:
+                - main
+      - deploy:
+          context:
+            - org-global
+            - sre-notification
+          filters:
+            branches:
+              only: main
+  terraform:
+    jobs:
+      - plan:
+          context: tracing-terraform
+      - apply:
+          context:
+            - tracing-terraform
+            - sre-notification
+          filters:
+            branches:
+              only: main
+          requires:
+            - plan

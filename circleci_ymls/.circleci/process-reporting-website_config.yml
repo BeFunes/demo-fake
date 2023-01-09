@@ -1,0 +1,116 @@
+version: 2 # use CircleCI 2.0
+jobs: # a collection of steps
+  build: # runs not using Workflows must have a `build` job as entry point
+    parallelism: 3 # run three instances of this job in parallel
+    docker: # run the steps with Docker
+      - image: circleci/ruby:2.4.2-stretch-node-browsers # ...with this image as the primary container; this is where all `steps` will run
+        environment: # environment variables for primary container
+          BUNDLE_JOBS: 3
+          BUNDLE_RETRY: 3
+          BUNDLE_PATH: vendor/bundle
+          PGHOST: 127.0.0.1
+          PGUSER: jira_metrics
+          RAILS_ENV: test
+          RAILS_MASTER_KEY: 99c6930a1d8ffa3fd5fa934b7a411e24
+      - image: circleci/postgres:10-alpine # database image
+        environment: # environment variables for database
+          POSTGRES_USER: jira_metrics
+          POSTGRES_DB: reporting_coryfoy_com_test
+          POSTGRES_PASSWORD: ""
+    steps: # a collection of executable commands
+
+      # Allow this to be aware of our deployment server
+      - add_ssh_keys:
+          fingerprints:
+            - "be:39:12:f0:c6:b5:01:42:ed:6d:f1:a0:c8:dc:d2:f4"
+
+      - run:
+           name: Add reporting site to known_hosts
+           command: ssh-keyscan -H reporting.coryfoy.com >> ~/.ssh/known_hosts
+
+      - checkout # special step to check out source code to working directory
+
+      - run:
+          name: Configure Bundler
+          command: |
+            echo 'export BUNDLER_VERSION=$(cat Gemfile.lock | tail -1 | tr -d " ")' >> $BASH_ENV
+            source $BASH_ENV
+            gem install bundler -v '2.0.1'
+
+      # Which version of bundler?
+      - run:
+          name: Which bundler?
+          command: bundle -v
+
+      # Restore bundle cache
+      # Read about caching dependencies: https://circleci.com/docs/2.0/caching/
+      - restore_cache:
+          keys:
+            - reporting-bundle-v2-{{ checksum "Gemfile.lock" }}
+            - reporting-bundle-v2-
+
+      - run: # Install Ruby dependencies
+          name: Bundle Install
+          command: bundle check || bundle install
+
+      # Store bundle cache for Ruby dependencies
+      - save_cache:
+          key: reporting-bundle-v2-{{ checksum "Gemfile.lock" }}
+          paths:
+            - vendor/bundle
+
+      # Only necessary if app uses webpacker or yarn in some other way
+      - restore_cache:
+          keys:
+            - reporting-yarn-{{ checksum "yarn.lock" }}
+            - reporting-yarn-
+
+      - run:
+          name: Yarn Install
+          command: yarn install --cache-folder ~/.cache/yarn
+
+      # Store yarn / webpacker cache
+      - save_cache:
+          key: reporting-yarn-{{ checksum "yarn.lock" }}
+          paths:
+            - ~/.cache/yarn
+
+      - run: sudo apt update && sudo apt install postgresql-client && sudo apt install rsync
+
+      - run:
+          name: Wait for DB
+          command: dockerize -wait tcp://localhost:5432 -timeout 1m
+
+      - run:
+          name: Database setup
+          command: bin/rails db:structure:load --trace
+
+      - run:
+          name: Run rspec in parallel
+          command: |
+            bundle exec rspec --profile 10 \
+                              --format documentation \
+                              --out test_results/rspec.xml \
+                              --format progress \
+                              $(circleci tests glob "spec/**/*_spec.rb" | circleci tests split --split-by=timings)
+
+      # Save test results for timing analysis
+      - store_test_results: # Upload test results for display in Test Summary: https://circleci.com/docs/2.0/collect-test-data/
+          path: test_results
+
+      # Set up caching for assets
+      - restore_cache:
+          key: reporting-assets-deploy
+
+      - run: RAILS_ENV=production bundle exec rake assets:precompile
+
+      - save_cache:
+          key: reporting-assets-deploy
+          paths:
+            - package-lock.json
+            - public/assets
+            - public/packs
+
+              #- run: scp -r . foyc@reporting.coryfoy.com:test.reporting/
+      - run: rsync -vr -e ssh --exclude=node_modules --exclude=test_results . foyc@reporting.coryfoy.com:reporting.coryfoy.com
+      - run: ssh foyc@reporting.coryfoy.com "touch /home/foyc/reporting.coryfoy.com/tmp/restart.txt"

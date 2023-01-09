@@ -1,0 +1,89 @@
+version: 2.1
+
+orbs:
+  node: circleci/node@4.7.0
+
+workflows:
+  build:
+    jobs:
+      - clojure
+      - golang
+      - java
+      - node/test:
+          name: js
+          app-dir: ./js
+          pkg-manager: yarn
+          cache-version: js-v1
+          version: 14.18.1
+      - python
+      - ruby
+      - deploy:
+          filters:
+            branches:
+              only:
+                - main
+          context: coderpad
+          requires:
+            - clojure
+            - golang
+            - java
+            - js
+            - python
+            - ruby
+
+jobs:
+  clojure:
+    docker:
+      - image: clojure
+    steps:
+      - checkout
+      - run: clojure clojure/stage_1.clj
+  golang:
+    docker:
+      - image: cimg/go:1.17.2
+    steps:
+      - checkout
+      - run: go run go/stage_1.go
+  java:
+    docker:
+      - image: cimg/openjdk:11.0
+    steps:
+      - checkout
+      - run: sudo apt-get update && sudo apt-get install junit4
+      - run: cp java/stage_1.java ./Solution.java
+      - run: which javac
+      - run: javac --version
+      - run: javac --class-path=/usr/share/java/junit4.jar:$(pwd) ./Solution.java
+      - run: which java
+      - run: java --version
+      - run: java --class-path=/usr/share/java/junit4.jar:$(pwd) Solution
+  python:
+    docker:
+      - image: cimg/python:3.10.0
+    steps:
+      - checkout
+      - run: python python/stage_1.py
+  ruby:
+    docker:
+      - image: cimg/ruby:3.0.2
+    steps:
+      - checkout
+      - run:
+          command: bundle install
+          working_directory: ./ruby
+      - run:
+          command: bundle exec ruby stage_1.rb
+          working_directory: ./ruby
+  deploy:
+    executor:
+      name: node/default
+      tag: 14.18.1
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: yarn
+          cache-version: deploy-v1
+          app-dir: ./deploy
+      - run:
+          command: yarn deploy
+          working_directory: ./deploy

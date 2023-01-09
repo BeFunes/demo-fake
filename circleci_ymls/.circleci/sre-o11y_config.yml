@@ -1,0 +1,62 @@
+---
+version: 2.1
+
+orbs:
+  terraform: circleci/terraform@3.0.1
+
+executors:
+  terraform:
+    docker:
+      - image: hashicorp/terraform:1.1.7
+
+jobs:
+  fmt:
+    executor: terraform
+    steps:
+      - checkout
+      - terraform/init:
+          path: ./terraform/
+      - terraform/fmt:
+          path: ./terraform/
+  plan:
+    executor: terraform
+    steps:
+      - checkout
+      - run:
+          name: "Merge in latest main to avoid rollbacks"
+          command: |
+            git config --global user.name "$(git show -s --format='%an' "${CIRCLE_SHA1}")"
+            git config --global user.email "$(git show -s --format='%ae' "${CIRCLE_SHA1}")"
+            git checkout --detach
+            git pull origin main --no-edit
+            git --no-pager diff --check
+      - terraform/init:
+          path: ./terraform/
+      - terraform/plan:
+          path: ./terraform/
+  apply:
+    executor: terraform
+    steps:
+      - checkout
+      - terraform/init:
+          path: ./terraform/
+      - terraform/apply:
+          path: ./terraform/
+
+workflows:
+  version: 2
+  terraform:
+    jobs:
+      - fmt:
+          context: sre-o11y-terraform
+      - plan:
+          context: sre-o11y-terraform
+          requires:
+            - fmt
+      - apply:
+          context: sre-o11y-terraform
+          filters:
+            branches:
+              only: main
+          requires:
+            - plan

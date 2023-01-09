@@ -1,0 +1,134 @@
+version: 2.1
+
+orbs:
+  web-ui-orb: sandbox/web-ui-orb@5.0.0
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+
+references:
+  optimizely_sdk_key: &optimizely_sdk_key GfYszBpMkefBSwiiEkH3b3
+  version_code: &version_code 2
+  version_js: &version_js 1
+  version_cypress: &version_cypress 1
+workflows:
+  version: 2
+
+  build-test-and-deploy:
+    jobs:
+      - web-ui-orb/dependencies:
+          name: dependencies
+          context: web-ui-npm
+          cache_version_js_dependencies: *version_js
+          cache_version_cypress_dependencies: *version_cypress
+      - web-ui-orb/storybook-build:
+          name: storybook-build
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+      - web-ui-orb/storybook-deploy:
+          bucket_name: circleci-web-ui-storybook
+          context: web-ui-storybook
+          requires:
+            - storybook-build
+          filters:
+            branches:
+              only: master
+      - web-ui-orb/test:
+          name: test
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+      - web-ui-orb/chromatic-snapshot:
+          name: chromatic-snapshot
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+            - storybook-build
+      - web-ui-orb/test-production-docker-image:
+          name: test-production-docker-image
+          image_name: web-ui-404
+          cache_version_js_dependencies: *version_js
+          optimizely_sdk_key: *optimizely_sdk_key
+          requires:
+            - dependencies
+          context: web-ui-npm
+      - web-ui-orb/build-and-deploy-static:
+          cache_version_js_dependencies: *version_js
+          name: build-and-deploy-static
+          bucket_name: circleci-web-ui-404-assets
+          cdn_url: http://assets-web-ui-404.circleci.com
+          context: [web-ui-404-assets, web-ui-npm, web-ui-datadog]
+          build_dir: .next
+          requires:
+            - dependencies
+      - web-ui-orb/build-and-publish-container:
+          name: publish
+          image_name: web-ui-404
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [web-ui-npm, org-global]
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-\d\..+/
+          requires:
+            - test
+            - build-and-deploy-static
+            - test-production-docker-image
+      - web-ui-orb/deploy-container:
+          name: deploy
+          image_name: web-ui-404
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [web-ui-npm, org-global]
+          pipeline_id: << pipeline.id >>
+          filters:
+            branches:
+              only: master
+          requires:
+            - publish
+      - scotty-orb/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          promotion_component_list: "circleci/web-ui-404"
+          requires:
+            - publish
+      - web-ui-orb/build-and-publish-container:
+          name: publish-canary
+          image_name: web-ui-404
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [web-ui-npm, org-global]
+          filters:
+            branches:
+              only: canary
+          requires:
+            - test
+            - build-and-deploy-static
+            - test-production-docker-image
+      - web-ui-orb/deploy-container:
+          name: deploy-canary
+          image_name: web-ui-404
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [web-ui-npm, org-global]
+          pipeline_id: << pipeline.id >>
+          release_version: canary
+          values_file: k8s-canary-values.yml
+          requires:
+            - publish-canary
+      - web-ui-orb/build-and-publish-container:
+          name: publish-noop
+          image_name: web-ui-404
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [web-ui-npm, org-global]
+          docker_registry: none
+          filters:
+            branches:
+              ignore:
+                - master
+                - /^server-\d\..+/
+                - canary
+          requires:
+            - build-and-deploy-static

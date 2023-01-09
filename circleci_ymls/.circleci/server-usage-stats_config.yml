@@ -1,0 +1,97 @@
+version: 2
+jobs:
+  update-stack:
+    docker:
+      - image: circleci/python:latest
+        environment:
+          AWS_CLI: /home/circleci/.local/bin/aws
+          AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - run:
+          name: Install AWS CLI
+          command: pip install awscli --upgrade --user
+      - checkout
+      - run:
+          name: Upload Lambda function code
+          command: |
+            . .circleci/env
+            zip -j ${LAMBDA_ZIP_BASENAME}-${CIRCLE_SHA1}-${CIRCLE_BUILD_NUM}.zip aws/server-usage-stats/index.js
+            ${AWS_CLI} s3 cp ${LAMBDA_ZIP_BASENAME}-${CIRCLE_SHA1}-${CIRCLE_BUILD_NUM}.zip s3://${LAMBDA_S3_BUCKET}
+      - run:
+          name: Update CloudFormation stack
+          command: |
+            . .circleci/env
+            ${AWS_CLI} s3 cp aws/server-usage-stats-cloudformation.yaml s3://${LAMBDA_S3_BUCKET}
+            ${AWS_CLI} cloudformation update-stack \
+              --stack-name ServerUsageStats \
+              --template-url https://s3.amazonaws.com/${LAMBDA_S3_BUCKET}/server-usage-stats-cloudformation.yaml \
+              --parameters ParameterKey=LambdaS3Key,ParameterValue=${LAMBDA_ZIP_BASENAME}-${CIRCLE_SHA1}-${CIRCLE_BUILD_NUM}.zip ParameterKey=LambdaS3Bucket,ParameterValue=${LAMBDA_S3_BUCKET} ParameterKey=LambdaExecutionRoleArn,ParameterValue=${LAMBDA_EXECUTION_ROLE_ARN} ParameterKey=UsageStatsS3Bucket,ParameterValue=${USAGE_STATS_S3_BUCKET}
+            ${AWS_CLI} cloudformation wait stack-update-complete \
+              --stack-name ServerUsageStats
+  unit-test:
+      docker:
+        - image: circleci/python:latest
+      steps:
+        - checkout
+        - run:
+            name: Execute unit tests 
+            command: |
+              . .circleci/env
+              ./test/push
+
+  lambda-integration-test:
+      docker:
+        - image: circleci/python:latest
+          environment:
+            AWS_CLI: /home/circleci/.local/bin/aws
+            AWS_DEFAULT_REGION: us-east-1
+      steps:
+        - run:
+            name: Install AWS CLI
+            command: pip install awscli --upgrade --user
+        - checkout
+        - run:
+            name: Execute integration test
+            command: |
+              . .circleci/env
+              ./aws_test/integration_test.sh
+  publish-image:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: server-usage-stats
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: dockerhub
+    working_directory: /root/server-usage-stats
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /root/server-usage-stats
+      - setup_remote_docker
+      - run:
+          command: publish
+workflows:
+  version: 2
+  update-stack-and-publish-image:
+    jobs:
+      - unit-test
+      - update-stack:
+          context: org-global
+      - lambda-integration-test:
+          context: org-global
+          filters:
+            branches:
+              ignore:
+                - master
+          requires:
+            - update-stack
+      - publish-image:
+          context: org-global
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-2\..*$/

@@ -1,0 +1,1035 @@
+---
+version: 2.1
+
+orbs:
+  shellcheck: circleci/shellcheck@2.0.0
+  scotty: cci-releng/scotty-orb@0.0.2
+  docker: circleci/docker@1.7.0
+
+refs:
+  deploy-job: &deploy-job
+    context: org-global
+    requires:
+      - build-cloud-uberjar
+      - validate-openapi-spec
+      - test
+      - lint
+    filters:
+      branches:
+        only: master
+
+workflows:
+  build_ci_image:
+    triggers:
+      - schedule:
+          cron: "30 10 * * 2" # At 10:30 on Tuesday
+          filters:
+            branches:
+              only:
+                - master
+    jobs:
+      - build_ci_image:
+          context: org-global
+
+  test-and-deploy:
+    jobs:
+      - lint
+      - check-links
+      - ensure-aot-up-to-date:
+          context: org-global
+      - shellcheck/check:
+          name: shellcheck
+          dir: ./script
+      - update-dependency-cache:
+          context: org-global
+      - validate-openapi-spec:
+          context: org-global
+      - test:
+          name: test
+          context: org-global
+      - fetch-assets:
+          context: org-global
+      - build-cloud-uberjar:
+          context: org-global
+      - publish-notifier:
+          <<: *deploy-job
+      - deploy-notifier:
+          context: org-global
+          requires:
+            - publish-notifier
+          filters:
+            branches:
+              only: master
+      - deploy-notifier-canary:
+          <<: *deploy-job
+          filters:
+            branches:
+              only: /canary-notifier/
+      - publish-hubot-worker:
+          <<: *deploy-job
+      - deploy-hubot-worker:
+          context: org-global
+          requires:
+            - publish-hubot-worker
+          filters:
+            branches:
+              only: master
+      - scan-www-api:
+          context: org-global
+          requires: [build-cloud-uberjar]
+          filters:
+            branches:
+              ignore: master
+      - publish-www-api:
+          <<: *deploy-job
+      - deploy-www-api:
+          context: org-global
+          requires:
+            - publish-www-api
+          filters:
+            branches:
+              only: master
+      - deploy-www-internal-api:
+          <<: *deploy-job
+          requires:
+            - deploy-www-api
+      - deploy-www-api-acl:
+          <<: *deploy-job
+          requires:
+            - deploy-www-api
+      - deploy-www-api-canary:
+          <<: *deploy-job
+          filters:
+            branches:
+              only: /canary/
+      - deploy-www-internal-api-canary:
+          <<: *deploy-job
+          filters:
+            branches:
+              only: /canary-internal/
+      - deploy-libs:
+          context: org-global
+          requires:
+            - lint
+            - test
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-\d\..+/
+      - publish-migrator:
+          <<: *deploy-job
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-\d\..+/
+      - deploy-migrator:
+          <<: *deploy-job
+          requires:
+            - publish-migrator
+      - build-server-uberjar:
+          context: org-global
+          requires:
+            - fetch-assets
+      - release-server:
+          context: org-global
+          requires:
+            - build-server-uberjar
+            - lint
+            - test
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-\d\..+/
+      - scotty/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          promotion_component_list: "circleci/frontend"
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-\d\..+/
+          requires:
+            - release-server
+      - notify-deployed:
+          context: org-global
+          requires:
+            - deploy-notifier
+            - deploy-hubot-worker
+            - deploy-libs
+            - deploy-www-api
+            - deploy-www-internal-api
+            - promote-to-server
+          filters:
+            branches:
+              only: master
+
+references:
+  clojure-service-image: &clojure-service-image
+    image: circleci/circleci-circle-ci:latest
+    auth:
+      username: $DOCKER_HUB_USER
+      password: $DOCKER_HUB_PASSWORD
+
+executors:
+  clojure-service:
+    working_directory: /root/circle
+    docker:
+      - *clojure-service-image
+  ccc:
+    working_directory: /root/circle
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+jobs:
+  build_ci_image:
+    machine:
+      image: ubuntu-2004:current
+    steps:
+      - checkout
+      - docker/check:
+          docker-username: DOCKER_HUB_USER
+          docker-password: DOCKER_HUB_PASSWORD
+      - docker/build:
+          image: circleci/circleci-circle-ci
+          path: .circleci
+          tag: latest
+      - docker/push:
+          image: circleci/circleci-circle-ci
+          tag: latest
+
+  update-dependency-cache:
+    executor: clojure-service
+    steps:
+      - checkout
+      - restore-m2-cache
+      - run: lein deps
+      - run: lein javac
+      - save-m2-cache
+      - compilation_cache_save
+  test:
+    docker:
+      - *clojure-service-image
+      - image: mongo:4.2
+        name: mongodb
+        environment:
+          CIRCLE_HEAP_SIZE: 3g
+          MONGO_INITDB_ROOT_USERNAME: testmongouser
+          MONGO_INITDB_ROOT_PASSWORD: opensesame
+          MONGO_INITDB_DATABASE: admin
+      - image: circleci/postgres:12.5-ram
+        name: postgres
+        environment:
+          POSTGRES_USER: circle
+          POSTGRES_DB: circle_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+      - image: rabbitmq:3.6-management-alpine
+        name: rabbitmq
+      - image: redis:4.0.2-alpine
+        name: redis
+    resource_class: large
+    working_directory: ~/circle
+    parallelism: 10
+    steps:
+      - checkout
+      - restore-m2-cache
+      - compilation_cache_restore
+      - run:
+          name: Configure git
+          command: |
+            git config --global user.email "noreply@circleci.com"
+            git config --global user.name "Building circleci/circle"
+      - run:
+          name: Configure sshd
+          command: |
+            ssh-keygen -y -f ~/.ssh/id_rsa > ~/.ssh/id_rsa.pub
+            cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+            sudo service ssh start
+            ssh-keyscan localhost >> ~/.ssh/known_hosts
+            ssh localhost echo "SSH is working"
+      - run:
+          name: Edit /etc/hosts
+          command: |
+            echo "127.0.0.1 circlehost circlehost-artifacts" | sudo tee -a /etc/hosts
+      - run:
+          name: Wait for other containers
+          command: |
+            dockerize -wait tcp://postgres:5432 -timeout 1m
+            dockerize -wait tcp://rabbitmq:5672 -timeout 1m
+            dockerize -wait tcp://rabbitmq:15672 -timeout 1m
+            dockerize -wait tcp://redis:6379 -timeout 1m
+            dockerize -wait tcp://mongodb:27017 -timeout 1m
+      - run:
+          name: Run Postgres Migrations
+          command: ./migrate.sh circle_test
+          working_directory: ~/circle/flyway
+      - run:
+          name: Ensure the RabbitMQ queues exist
+          command: ./script/ensure-rabbit-queues.sh rabbitmq
+      - run:
+          name: Run tests
+          environment:
+            AWS_DEFAULT_REGION: "us-east-1"
+            CIRCLE_ASSETS_SOURCE: "none"
+            CIRCLE_ENV: "test"
+            CIRCLE_PRIVATE_IP: "127.0.0.1"
+            CIRCLE_USE_EC2_API: "false"
+            REDIS__OUTPUT_RUNNING__URI: "redis://redis:6379/10"
+            REDIS__CACHE__URI: "redis://redis:6379/11"
+            REDIS__PUSHER__URI: "redis://redis:6379/12"
+            OPENCENSUS__SHUTDOWN_DELAY_MS: "0"
+          command: |
+            set -o errexit
+            set -o nounset
+            set -o pipefail
+            set -o xtrace
+
+            # Find all the test namespaces
+            find test -type f -name 'test_*.clj' -exec grep '^(ns ' {} + | awk '{print $2}' | sed -e 's,)$,,' > test.namespaces
+
+            # Attempt to split by times
+            circleci tests split --split-by=timings --timings-type=classname < test.namespaces > test.namespaces.split
+
+            # Split by name if we can't
+            if [ "$(wc -l < test.namespaces.split | sed -e 's,[^0-9],,g')" = "0" ]; then
+              circleci tests split < test.namespaces > test.namespaces.split
+
+              # Fail if we can't split
+              if [ "$(wc -l < test.namespaces.split | sed -e 's,[^0-9],,g')" = "0" ]; then
+                echo "Failed to split tests"
+                exit 1
+              fi
+            fi
+
+            # Actually run the tests
+            ./bin/kaocha $(cat test.namespaces.split | xargs -I {} echo " --focus {} --only-load-ns {}")
+      - store_test_results:
+          path: test/reports
+      - store_artifacts:
+          path: test/reports
+          destination: junit
+      - run:
+          name: Ensure that we've created no new VCR cassettes
+          command: |
+            if git status --porcelain=v1 | grep -q cassettes/; then
+              echo "New VCR cassettes were created"
+              # Save the new cassettes in a handy tarball artifact
+              tar -czvf new_cassettes.tar.gz $(git status --porcelain=v1 | grep --only-matching "cassettes/\S*$")
+              mv new_cassettes.tar.gz cassettes/
+              exit 1
+            fi
+      - store_artifacts:
+          path: cassettes/new_cassettes.tar.gz
+          destination: cassettes
+  fetch-assets:
+    executor: ccc
+    working_directory: ~/circle
+    steps:
+      - checkout
+      - run:
+          name: Fetch frontend assets
+          command: |
+            ./script/fetch-assets.sh
+            mkdir -p /service/workspace/resources/public
+            cp -r resources/public/* /service/workspace/resources/public/
+      - persist_to_workspace:
+          root: /service/workspace
+          paths:
+            - resources/public
+  build-cloud-uberjar:
+    executor: clojure-service
+    steps:
+      - checkout
+      - restore-m2-cache
+      - compilation_cache_restore
+      - compute-version
+      - attach_workspace:
+          at: /service/workspace
+      - run:
+          name: Build the uberjar for circleci.com
+          command: |
+            lein with-profile +include-secrets,+include-preload-btrfs uberjar
+            mkdir -p /service/workspace
+            cp target/circle-*-standalone.jar /service/workspace/circle-cloud.jar
+      - persist_to_workspace:
+          root: /service/workspace
+          paths:
+            - circle-cloud.jar
+  publish-notifier:
+    executor: ccc
+    environment:
+      NAME: circle-legacy-notifier
+      DOCKER_REGISTRY: all
+      DOCKERFILE_PATH: Dockerfile
+    working_directory: /root/circle
+    steps:
+      - setup_remote_docker:
+          version: 19.03.8
+      - checkout
+      - attach_workspace:
+          at: /service/workspace
+      - build_scan_publish:
+          dir: deploy/ccc-notifier
+      - run: mv deploy/ccc-notifier/docker_image.tag notifier_docker_image.tag
+      - persist_to_workspace:
+           root: .
+           paths:
+             - notifier_docker_image.tag
+      - rollbar_deploy:
+          access_token: LEGACY_NOTIFIER_ROLLBAR_TOKEN
+  deploy-notifier:
+    executor: ccc
+    environment:
+      NAME: circle-legacy-notifier
+      VALUES_FILE: /root/circle/deploy/ccc-notifier.yaml
+    working_directory: /root/circle
+    steps:
+      - setup_remote_docker:
+          version: 19.03.8
+      - checkout
+      - attach_workspace:
+          at: /service/workspace
+      - run:
+          name: rename docker image tag
+          command: |
+            mkdir -p deploy/ccc-notifier
+            mv /service/workspace/notifier_docker_image.tag deploy/ccc-notifier/docker_image.tag
+      - deploy_artifact:
+          dir: deploy/ccc-notifier
+      - rollbar_deploy:
+          access_token: LEGACY_NOTIFIER_ROLLBAR_TOKEN
+  deploy-notifier-canary:
+    executor: ccc
+    environment:
+      NAME: circle-legacy-notifier
+      DOCKER_REGISTRY: all
+      ATOMIC_DEPLOY: true
+      ATOMIC_TIMEOUT: "15m"
+      DOCKERFILE_PATH: Dockerfile
+      VALUES_FILE: /root/circle/deploy/merged-canary.yaml
+      RELEASE_VERSION: canary1
+    working_directory: /root/circle
+    steps:
+      - setup_remote_docker:
+          version: 19.03.8
+      - checkout
+      - run:
+          name: Ensure branch up to date
+          command: |
+            git fetch origin master
+            commits=$(git log --oneline --decorate origin/master --not HEAD)
+            if [[ -n "$commits" ]] ; then
+                echo "The following commits from master are missing:"
+                echo "$commits"
+                echo "Refusing to deploy outdated canary."
+                exit 1
+            fi
+      - attach_workspace:
+          at: /service/workspace
+      - run:
+          name: Merge Canary Values
+          command: /deploy/merge-values ccc-notifier.yaml ccc-notifier/canary-override.yaml > merged-canary.yaml
+          working_directory: deploy
+      - build_scan_publish_and_deploy:
+          dir: deploy/ccc-notifier
+      - rollbar_deploy:
+          access_token: LEGACY_NOTIFIER_ROLLBAR_TOKEN
+          environment: canary
+  publish-hubot-worker:
+    executor: ccc
+    environment:
+      NAME: circle-hubot-worker
+      DEPLOY_CLOJURE_JARFILE: circle-cloud.jar
+      DOCKER_REGISTRY: all
+    working_directory: /root/circle
+    steps:
+      - setup_remote_docker:
+          version: 19.03.8
+      - checkout
+      - attach_workspace:
+          at: /service/workspace
+      - build_scan_publish
+      - run: mv docker_image.tag hubot_docker_image.tag
+      - persist_to_workspace:
+           root: .
+           paths:
+             - hubot_docker_image.tag
+  deploy-hubot-worker:
+    executor: ccc
+    environment:
+      NAME: circle-hubot-worker
+      VALUES_FILE: /root/circle/deploy/ccc-hubot.yaml
+    working_directory: /root/circle
+    steps:
+      - setup_remote_docker:
+          version: 19.03.8
+      - checkout
+      - attach_workspace:
+          at: /service/workspace
+      - run: mv /service/workspace/hubot_docker_image.tag docker_image.tag
+      - deploy_artifact
+  scan-www-api:
+    executor: ccc
+    environment:
+      NAME: circle-www-api
+      DOCKERFILE_PATH: Dockerfile
+      EXTRA_DOCKER_BUILD_ARGS: --build-arg MAXMIND_GEOIP_LICENSE_KEY
+    working_directory: /root/circle
+    steps:
+      - setup_remote_docker:
+          version: 19.03.8
+      - checkout
+      - attach_workspace:
+          at: /service/workspace
+      - build_and_scan:
+          dir: deploy/ccc-www-api
+  publish-www-api:
+    executor: ccc
+    environment:
+      NAME: circle-www-api
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: all
+      EXTRA_DOCKER_BUILD_ARGS: --build-arg MAXMIND_GEOIP_LICENSE_KEY
+    working_directory: /root/circle
+    steps:
+      - setup_remote_docker:
+          version: 19.03.8
+      - checkout
+      - attach_workspace:
+          at: /service/workspace
+      - build_scan_publish:
+          dir: deploy/ccc-www-api
+      - run: mv deploy/ccc-www-api/docker_image.tag www_api_docker_image.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - www_api_docker_image.tag
+  deploy-www-api:
+    executor: ccc
+    environment:
+      NAME: circle-www-api
+      VALUES_FILE: /root/circle/deploy/ccc-www-api.yaml
+      EXTRA_DOCKER_BUILD_ARGS: --build-arg MAXMIND_GEOIP_LICENSE_KEY
+    working_directory: /root/circle
+    steps:
+      - setup_remote_docker:
+          version: 19.03.8
+      - checkout
+      - attach_workspace:
+          at: /service/workspace
+      - run:
+          name: rename docker image tag
+          command: |
+            mkdir -p deploy/ccc-www-api/
+            mv /service/workspace/www_api_docker_image.tag deploy/ccc-www-api/docker_image.tag
+      - deploy_artifact:
+          dir: deploy/ccc-www-api
+      - rollbar_deploy:
+          access_token: WWW_API_ROLLBAR_TOKEN
+      - notify_honeycomb:
+          version: $(< ./deploy/ccc-www-api/docker_image.tag)
+      - persist_to_workspace:
+          root: ./deploy/ccc-www-api
+          paths:
+            - docker_image.tag
+  deploy-www-internal-api:
+    executor: ccc
+    environment:
+      NAME: circle-www-internal-api
+      DOCKER_REGISTRY: all
+      DEPLOY_TYPE: helm
+      IMAGE_NAME: circleci/circle-www-api
+      VALUES_FILE: /root/circle/deploy/merged-internal-api.yaml
+    working_directory: /root/circle
+    steps:
+      - setup_remote_docker:
+          version: 19.03.8
+      - checkout
+      - attach_workspace:
+          at: /service/workspace
+      - run:
+          name: Create helm chart
+          command: /deploy/merge-values ccc-www-api.yaml ccc-www-internal-api/internal-api-override.yaml > merged-internal-api.yaml
+          working_directory: deploy
+      - run:
+          name: Build www-internal-api container
+          command: |
+            cp /service/workspace/docker_image.tag deploy/ccc-www-api/
+            cd deploy/ccc-www-api
+            deploy
+          environment:
+            CLOJURE_MAIN_CLASS: circle.internal.init
+      - rollbar_deploy:
+          access_token: WWW_API_ROLLBAR_TOKEN
+      - notify_honeycomb:
+          version: $(< ./deploy/ccc-www-api/docker_image.tag)
+  deploy-www-api-acl:
+    executor: ccc
+    environment:
+      NAME: circle-www-api-acl
+      DOCKER_REGISTRY: all
+      DEPLOY_TYPE: helm
+      IMAGE_NAME: circleci/circle-www-api
+      VALUES_FILE: /root/circle/deploy/merged-acl.yaml
+    working_directory: /root/circle
+    steps:
+      - setup_remote_docker:
+          version: 19.03.8
+      - checkout
+      - attach_workspace:
+          at: /service/workspace
+      - run:
+          name: Create Helm Chart
+          command: /deploy/merge-values ccc-www-api.yaml ccc-www-api/acl-override.yaml > merged-acl.yaml
+          working_directory: deploy
+      - run:
+          name: Build www-api-acl container
+          command: |
+            cp /service/workspace/docker_image.tag deploy/ccc-www-api/
+            cd deploy/ccc-www-api
+            deploy
+      - rollbar_deploy:
+          access_token: WWW_API_ROLLBAR_TOKEN
+          environment: acl
+  deploy-www-api-canary:
+    executor: ccc
+    environment:
+      NAME: circle-www-api
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: all
+      ATOMIC_DEPLOY: true
+      ATOMIC_TIMEOUT: "15m"
+      IMAGE_NAME: circleci/circle-www-api
+      VALUES_FILE: /root/circle/deploy/merged-canary.yaml
+      RELEASE_VERSION: canary1
+      EXTRA_DOCKER_BUILD_ARGS: --build-arg MAXMIND_GEOIP_LICENSE_KEY
+    working_directory: /root/circle
+    steps:
+      - setup_remote_docker:
+          version: 19.03.8
+      - checkout
+      - run:
+          name: Ensure branch up to date
+          command: |
+            git fetch origin master
+            commits=$(git log --oneline --decorate origin/master --not HEAD)
+            if [[ -n "$commits" ]] ; then
+                echo "The following commits from master are missing:"
+                echo "$commits"
+                echo "Refusing to deploy outdated canary."
+                exit 1
+            fi
+      - attach_workspace:
+          at: /service/workspace
+      - run:
+          name: Merge Canary Values
+          command: /deploy/merge-values ccc-www-api.yaml ccc-www-api/canary-override.yaml > merged-canary.yaml
+          working_directory: deploy
+      - build_scan_publish_and_deploy:
+          dir: deploy/ccc-www-api
+      - rollbar_deploy:
+          access_token: WWW_API_ROLLBAR_TOKEN
+          environment: canary
+  deploy-www-internal-api-canary:
+    executor: ccc
+    environment:
+      NAME: circle-www-internal-api
+      IMAGE_NAME: circleci/circle-www-api
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: all
+      ATOMIC_DEPLOY: true
+      ATOMIC_TIMEOUT: "15m"
+      VALUES_FILE: /root/circle/deploy/internal-canary.yaml
+      RELEASE_VERSION: canary1
+      CLOJURE_MAIN_CLASS: circle.internal.init
+      EXTRA_DOCKER_BUILD_ARGS: --build-arg MAXMIND_GEOIP_LICENSE_KEY
+    working_directory: /root/circle
+    steps:
+      - setup_remote_docker:
+          version: 19.03.8
+      - checkout
+      - run:
+          name: Ensure branch up to date
+          command: |
+            git fetch origin master
+            commits=$(git log --oneline --decorate origin/master --not HEAD)
+            if [[ -n "$commits" ]] ; then
+                echo "The following commits from master are missing:"
+                echo "$commits"
+                echo "Refusing to deploy outdated canary."
+                exit 1
+            fi
+      - attach_workspace:
+          at: /service/workspace
+      - run:
+          name: Create values file for www-internal-api
+          command: /deploy/merge-values ccc-www-api.yaml ccc-www-internal-api/internal-api-override.yaml > merged-internal-api.yaml
+          working_directory: deploy
+      - run:
+          name: Merge Canary Values
+          command: /deploy/merge-values /root/circle/deploy/merged-internal-api.yaml ccc-www-internal-api/canary-override.yaml > internal-canary.yaml
+          working_directory: deploy
+      - build_scan_publish_and_deploy:
+          dir: deploy/ccc-www-api
+      - rollbar_deploy:
+          access_token: WWW_API_ROLLBAR_TOKEN
+          environment: canary
+  deploy-libs:
+    executor: clojure-service
+    steps:
+      - checkout
+      - restore-m2-cache
+      - compilation_cache_restore
+      - compute-version
+      - run:
+          name: Deploy circleci/circle lib
+          command: |
+            lein deploy circle-s3
+      - run:
+          name: Deploy circleci/circle lib including tests
+          command: |
+            echo -n '-with-tests' >> .version
+            lein with-profile +include-tests deploy circle-s3
+  publish-migrator:
+    executor: ccc
+    environment:
+      NAME: circle-migrator
+      DOCKER_REGISTRY: all
+      MIGRATIONS_SQL_PATH: sql
+      CONFIGURE_ECR_REPO: "true"
+      ECR_OWNER_TEAM: Extensibility
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: 19.03.8
+      - run:
+          name: Build and publish the circleci/circle domain DB migrator image
+          command: publish
+          working_directory: flyway
+      - run: mv flyway/docker_image.tag migrator_docker_image.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - migrator_docker_image.tag
+  deploy-migrator:
+    executor: ccc
+    environment:
+      NAME: circle-migrator
+      VALUES_FILE: /root/repo/deploy/ccc-migrator.yaml
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: 19.03.8
+      - attach_workspace:
+          at: ~/repo/flyway
+      - run:
+          command: mv flyway/migrator_docker_image.tag flyway/docker_image.tag
+      - run:
+          name: Deploy the circleci/circle domain DB migrator
+          command: deploy
+          working_directory: ~/repo/flyway
+  build-server-uberjar:
+    executor: clojure-service
+    steps:
+      - checkout
+      - restore-m2-cache
+      - run: lein deps
+      - attach_workspace:
+          at: /service/workspace
+      - compute-version
+      - run:
+          name: Build Uberjar
+          command: |
+            cp -r /service/workspace/resources/public resources/public
+            lein uberjar
+      - run:
+          name: Sanitize Uberjar
+          command: |
+            # Sanitize uberjar from files potentially containing sensitive info
+            #   amazonica READ contain a sample AWS creds causing false positives - just remove it
+            zip -d ./target/circle-*-standalone.jar \
+              'project.clj' \
+              'META-INF/*/project.clj' \
+              'META-INF/leiningen/amazonica/amazonica/README.md'
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target
+  release-server:
+    executor: ccc
+    working_directory: ~/circle
+    environment:
+      NAME: frontend
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: dockerhub
+      TWISTLOCK_ENFORCE: "false" # Temporary until leiningen can pass the scan
+    steps:
+      - setup_remote_docker:
+          version: 19.03.8
+      - checkout
+      - attach_workspace:
+          at: /service/workspace
+      - run:
+          name: Install additional tools
+          command: |
+            apk --no-cache add libarchive-tools zip gnupg
+      - compute-version
+      - run:
+          name: Server Release
+          command: |
+            set -o nounset
+            set -o errexit
+            cp -r /service/workspace/resources/public resources/public
+            mkdir -p target
+            cp /service/workspace/target/*.jar target/
+            ./script/publish/enterprise-resources.sh
+  notify-deployed:
+    executor: clojure-service
+    steps:
+      - rollbar_deploy:
+          access_token: ROLLBAR_ACCESS_TOKEN
+
+  ensure-aot-up-to-date:
+    executor: clojure-service
+    steps:
+      - checkout
+      - restore-m2-cache
+      - compilation_cache_restore
+      - run: lein run -m circle.aot
+      - run:
+          name: Ensure aot.edn is up to date.
+          command: git diff --ignore-space-at-eol --exit-code aot.edn
+      - run:
+          when: on_fail
+          name: Explain
+          command: |
+            echo The aot.edn is stale. Run `lein run -m circle.aot` and commit \
+                 the changed aot.edn, or download the artifact attached to this job.
+            exit 1
+      - store_artifacts:
+          path: aot.edn
+
+  lint:
+    environment:
+      VERSION: "2021.09.25"
+    docker:
+      - image: cimg/base:2020.01
+    steps:
+      - checkout
+      - run:
+          name: Install
+          command: |
+            curl --fail --location --silent --remote-name "https://github.com/borkdude/clj-kondo/releases/download/v${VERSION}/clj-kondo-${VERSION}-linux-static-amd64.zip"
+            unzip clj-kondo-${VERSION}-linux-static-amd64.zip
+      - run:
+          name: Run
+          shell: /bin/bash
+          command: |
+            ./clj-kondo --lint src:test > report.txt
+            case $? in
+              2) echo Exited with warnings ;;
+              0) echo Exited success  ;;
+              *) exit 1 ;;
+            esac
+      - run:
+          run: Show Output
+          command: cat report.txt
+          when: always
+      - store_artifacts:
+          path: report.txt
+
+  validate-openapi-spec:
+    executor: clojure-service
+    resource_class: large
+    steps:
+      - checkout
+      - restore-m2-cache
+      - compilation_cache_restore
+      - run:
+          name: Generate Spec Files
+          command: |
+            lein run -m circle.http.api.v2/write-spec-files
+      - store_artifacts:
+          path: target/openapi.yml
+      - store_artifacts:
+          path: target/openapi.json
+      - run:
+          name: Run openapi-spec-validator
+          command: |
+            python3 -m openapi_spec_validator target/openapi.yml
+            python3 -m openapi_spec_validator target/openapi.json
+      - run:
+          name: Download Production Open API
+          command: curl --fail --silent --retry 3  --output prod.json https://circleci.com/api/v2/openapi.json
+      - run:
+          name: Compare With Prod (Informative only)
+          command: ( diff -u <(jq -S . prod.json) <(jq -S . target/openapi.json) || true ) | tee diff.txt
+      - store_artifacts:
+          path: diff.txt
+
+  check-links:
+    docker:
+      - image: raviqqe/liche:0.1.1
+    steps:
+      - checkout
+      - run: /liche -r -d. -x '^https?:\/\/' README.md docs/
+
+commands:
+  compute-version:
+    steps:
+      - run:
+          name: Compute a single version for all libs and containers
+          command: |
+            set -o nounset
+            echo -n "0.2.<<pipeline.number>>-${CIRCLE_SHA1:0:7}" > .version
+            cat .version
+
+  build_and_scan:
+    parameters:
+      dir:
+        description: use a custom working dir instead of the default
+        type: string
+        default: .
+    steps:
+      - run:
+          name: Copy Jar
+          command: cp /service/workspace/circle-cloud.jar << parameters.dir >>/
+      - run:
+          name: Build & Scan
+          command: |
+            cd << parameters.dir >>
+            export DOCKER_REGISTRY=none
+            publish
+      - store_artifacts:
+          path: /tmp/twistlock_scan.json
+
+  build_scan_publish:
+    parameters:
+      dir:
+        description: use a custom working dir instead of the default
+        type: string
+        default: .
+    steps:
+      - run:
+          name: Copy Jar
+          command: cp /service/workspace/circle-cloud.jar << parameters.dir >>/
+      - run:
+          name: Build, Scan, Publish
+          command: |
+            cd << parameters.dir >>
+            publish
+      - store_artifacts:
+          path: /tmp/twistlock_scan.json
+
+  deploy_artifact:
+    parameters:
+      dir:
+        description: use a custom working dir instead of the default
+        type: string
+        default: .
+    steps:
+      - run:
+          name: Deploy
+          command: |
+            cd << parameters.dir >>
+            deploy
+
+  build_scan_publish_and_deploy:
+    parameters:
+      dir:
+        description: use a custom working dir instead of the default
+        type: string
+        default: .
+    steps:
+      - run:
+          name: Copy Jar
+          command: cp /service/workspace/circle-cloud.jar << parameters.dir >>/
+      - run:
+          name: Build, Scan, Publish & Deploy
+          command: |
+            cd << parameters.dir >>
+            publish
+            deploy
+      - store_artifacts:
+          path: /tmp/twistlock_scan.json
+
+  compilation_cache_save:
+    steps:
+      - run:
+          name: Generate Cache Checksum
+          command: git ls-files -s resources/protocol | git hash-object --stdin > /tmp/protos_checksum
+      - save_cache:
+          key: compilation-cache-v1-{{ checksum "project.clj" }}-{{ checksum "/tmp/protos_checksum" }}
+          paths:
+            - ./target/classes
+            - ./target/java
+  compilation_cache_restore:
+    steps:
+      - run:
+          name: Generate Cache Checksum
+          command: git ls-files -s resources/protocol | git hash-object --stdin > /tmp/protos_checksum
+      - restore_cache:
+          keys:
+            - compilation-cache-v1-{{ checksum "project.clj" }}-{{ checksum "/tmp/protos_checksum" }}
+      - run:
+          name: "Restore mtime"
+          command: script/git_commit_time.py resources/protocol/*
+
+  restore-m2-cache:
+    steps:
+      - restore_cache:
+          keys:
+            - v1-m2-{{ checksum "project.clj" }}
+            - v1-m2-
+
+
+  save-m2-cache:
+    steps:
+      - save_cache:
+          key: v1-m2-{{ checksum "project.clj" }}
+          paths:
+            - ~/.m2
+
+  rollbar_deploy:
+    parameters:
+      access_token:
+        type: env_var_name
+      environment:
+        type: string
+        default: production
+    steps:
+      - run:
+          name: Notify Rollbar
+          command: |
+            curl https://api.rollbar.com/api/1/deploy/ \
+              --form access_token="$<< parameters.access_token >>" \
+              --form environment="<< parameters.environment >>" \
+              --form revision=$CIRCLE_SHA1 \
+              --form local_username=$CIRCLE_USERNAME \
+              --form comment="$(git show --no-patch --format=%s)"
+
+  notify_honeycomb:
+    parameters:
+      version:
+        type: string
+    steps:
+      - run:
+          name: Notify Honeycomb
+          command: |
+            cat \<< EOF | tee /tmp/honeycomb-marker
+            {
+              "message": "Deploying circleci/circle << parameters.version >>",
+              "type":"deploy"
+            }
+            EOF
+            curl https://api.honeycomb.io/1/markers/distributed-traces \
+              -H "X-Honeycomb-Team: $HONEYCOMB_WRITEKEY" \
+              -d @/tmp/honeycomb-marker

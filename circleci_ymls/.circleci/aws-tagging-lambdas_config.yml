@@ -1,0 +1,19 @@
+version: 2
+jobs:
+  test:
+    docker:
+      - image: cimg/python:3.10
+    steps:
+      - checkout
+      - run: sudo apt-get update
+      - run: pip install pylint
+      - run: pip install --requirement ./notify_slack/requirements.txt
+      - run: pip install --requirement requirements.txt
+      - run: pip install --requirement requirements-dev.txt
+      - run: cd notify_slack; python3 -m unittest
+
+workflows:
+  version: 2
+  test-publish-deploy:
+    jobs:
+      - test

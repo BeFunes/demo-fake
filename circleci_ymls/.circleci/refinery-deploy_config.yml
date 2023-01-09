@@ -1,0 +1,158 @@
+---
+version: 2.1
+
+orbs:
+  slack: circleci/slack@4.10.1
+  terraform: circleci/terraform@3.1.0
+
+executors:
+  terraform:
+    docker:
+      - image: hashicorp/terraform:1.2.2
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: refinery
+          MAJOR_VERSION: "1.14.1"
+          RELEASE_SUFFIX: ""
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: ecr
+          IMAGE_NAME: circleci/refinery
+          CONFIGURE_ECR_REPO: true
+          ECR_OWNER_TEAM: InfraEng
+          CUSTOM_CHART: refinery
+          TWISTLOCK_ENFORCE: false # TODO: Make the image pass twistlock
+
+commands:
+  initialize:
+    description: Initial CI setup before CCC runs
+    steps:
+      - checkout
+      - setup_remote_docker
+      # Override some chart values with template that CCC expects
+      - run: cp refinery/Chart.yaml /tmp/Chart.yaml
+      # Inject the Docker image version(tag)
+      - run: sed "s/MAJOR_VERSION/$MAJOR_VERSION/g" Dockerfile > tmp && mv tmp Dockerfile
+      # Inject the Helm appVersion
+      - run: sed "s/MAJOR_VERSION/$MAJOR_VERSION/g" /tmp/Chart.yaml > tmp && mv tmp /tmp/Chart.yaml
+      - run: /deploy/merge-values /tmp/Chart.yaml chart-CI-overrides.yml > refinery/Chart.yaml
+      # Apply values now because CCC does not allow using custom values file with custom chart
+      - run: cp refinery/values.yaml /tmp/values.yaml
+      - run: /deploy/merge-values /tmp/values.yaml values-prod.yml > refinery/values.yaml
+
+jobs:
+  install:
+    executor: ccc
+    steps:
+      - initialize
+      - run: |
+          export CONTAINER_VERSION="${MAJOR_VERSION}-${CIRCLE_BUILD_NUM}.$(git rev-parse --short HEAD)"
+          publish
+      - run: |
+          export CONTAINER_VERSION="${MAJOR_VERSION}-${CIRCLE_BUILD_NUM}.$(git rev-parse --short HEAD)"
+          deploy
+      - slack/notify:
+          channel: sre-team
+          event: fail
+          template: basic_fail_1
+
+  test:
+    executor: ccc
+    steps:
+      - initialize
+      - run: |
+          export CONTAINER_VERSION="${MAJOR_VERSION}-${CIRCLE_BUILD_NUM}.$(git rev-parse --short HEAD)"
+          scan
+      - run: |
+          export CONTAINER_VERSION="${MAJOR_VERSION}-${CIRCLE_BUILD_NUM}.$(git rev-parse --short HEAD)"
+          /deploy/dry-run
+
+  canary:
+    executor: ccc
+    environment:
+      RELEASE_SUFFIX: "-canary"
+    steps:
+      - initialize
+      - run: |
+          export CONTAINER_VERSION="${MAJOR_VERSION}-${CIRCLE_BUILD_NUM}.$(git rev-parse --short HEAD)"
+          publish
+      - run: |
+          export CONTAINER_VERSION="${MAJOR_VERSION}-${CIRCLE_BUILD_NUM}.$(git rev-parse --short HEAD)"
+          deploy
+      - slack/notify:
+          channel: sre-team
+          event: fail
+          template: basic_fail_1
+
+  plan:
+    executor: terraform
+    steps:
+      - checkout
+      - run:
+          name: "Merge in latest main to avoid rollbacks"
+          command: |
+            git config --global user.name "$(git show -s --format='%an' "${CIRCLE_SHA1}")"
+            git config --global user.email "$(git show -s --format='%ae' "${CIRCLE_SHA1}")"
+            git checkout --detach
+            git pull origin main --no-edit
+            git --no-pager diff --check
+      - terraform/init:
+          path: ./terraform/
+      - terraform/plan:
+          path: ./terraform/
+
+  apply:
+    executor: terraform
+    steps:
+      - checkout
+      - terraform/init:
+          path: ./terraform/
+      - terraform/apply:
+          path: ./terraform/
+      - slack/notify:
+          channel: sre-team
+          event: fail
+          template: basic_fail_1
+
+workflows:
+  version: 2
+  install-application:
+    jobs:
+      - install:
+          context:
+            - org-global
+            - sre-notification
+          filters:
+            branches:
+              only: main
+      - test:
+          context: org-global
+          filters:
+            branches:
+              ignore: main
+      - canary:
+          context:
+            - org-global
+            - sre-notification
+          filters:
+            branches:
+              only: canary
+          requires:
+            - test
+  terraform:
+    jobs:
+      - plan:
+          context: tracing-terraform
+      - apply:
+          context:
+            - tracing-terraform
+            - sre-notification
+          filters:
+            branches:
+              only: main
+          requires:
+            - plan

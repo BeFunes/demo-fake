@@ -1,0 +1,22 @@
+version: 2.1
+
+setup: true
+
+orbs:
+  path-filtering: circleci/path-filtering@0.0.2
+
+workflows:
+  version: 2
+  generate-config:
+    jobs:
+      - path-filtering/filter:
+          base-revision: main
+          mapping: |
+            project.clj                   enable-publish true
+            .*/project.clj                enable-publish true
+            .circleci/.*                  enable-publish true
+            .*profiles.clj                enable-publish true
+            VERSION                       enable-publish true
+            scripts/.*                    enable-publish true
+            .*/src/.*                     enable-publish true
+            .*/resources/.*               enable-publish true

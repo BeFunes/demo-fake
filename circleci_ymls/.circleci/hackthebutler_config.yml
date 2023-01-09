@@ -1,0 +1,69 @@
+version: 2.1
+
+jobs:
+  start-runner:
+    docker:
+      - image: z00b/thebutler:0.0.1
+        entrypoint: bash
+    steps:
+      - checkout
+      - run:
+          name: Jenkins Runner
+          command: |
+            ngrok http --subdomain=${CIRCLE_WORKFLOW_ID} 8080 > /dev/null &
+            CASC_JENKINS_CONFIG=${PWD}/jenkins-config.yml /app/bin/jenkinsfile-runner --jenkins-war /jenkins-war/ --plugins /usr/share/jenkins/ref/plugins --file Jenkinsfile --httpPort 8080
+
+  load-agent-secret: # this will call out to our jenkinsfile-runner to get the agent secret and then wait
+    docker:
+      - image: cimg/base:2021.04
+    steps:
+      - run: sleep 60
+      - run: curl --silent --retry 20 https://${CIRCLE_WORKFLOW_ID}.ngrok.io/computer/double-o-7/jenkins-agent.jnlp | grep -Po '[a-fA-F0-9]'{64} > /tmp/double-o-7
+      - run: curl --silent --retry 20 https://${CIRCLE_WORKFLOW_ID}.ngrok.io/computer/ninety-nine/jenkins-agent.jnlp | grep -Po '[a-fA-F0-9]'{64} > /tmp/ninety-nine
+      - persist_to_workspace:
+          root: /tmp/
+          paths:
+            - double-o-7
+            - ninety-nine
+
+  run-double-o-7:
+    docker:
+      - image: jenkins/inbound-agent:latest-jdk8
+        entrypoint: bash
+    environment:
+      - JENKINS_WEB_SOCKET: true
+      - JENKINS_AGENT_WORKDIR: /home/jenkins/agent
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /tmp/
+      - run: /usr/local/bin/jenkins-agent -noreconnect -webSocket -url https://${CIRCLE_WORKFLOW_ID}.ngrok.io/ $(cat /tmp/double-o-7 | tr -d '\n') double-o-7
+      - store_artifacts:
+          path: /tmp/HelloWorld.class
+
+  run-ninety-nine:
+    docker:
+      - image: jenkins/inbound-agent:latest-jdk8
+        entrypoint: bash
+    environment:
+      - JENKINS_WEB_SOCKET: true
+      - JENKINS_AGENT_WORKDIR: /home/jenkins/agent
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /tmp/
+      - run: /usr/local/bin/jenkins-agent -noreconnect -webSocket -url https://${CIRCLE_WORKFLOW_ID}.ngrok.io/ $(cat /tmp/ninety-nine | tr -d '\n') ninety-nine
+      - store_artifacts:
+          path: /tmp/GoodbyeWorld.class
+
+workflows:
+  build-workflow:
+    jobs:
+      - start-runner
+      - load-agent-secret
+      - run-double-o-7:
+          requires:
+            - load-agent-secret
+      - run-ninety-nine:
+          requires:
+            - load-agent-secret

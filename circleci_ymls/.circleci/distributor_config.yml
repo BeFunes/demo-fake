@@ -1,0 +1,508 @@
+version: 2.1
+
+parameters:
+  run-schedule:
+    type: boolean
+    default: false
+
+workflows:
+  main:
+    when:
+      not: << pipeline.parameters.run-schedule >>
+    jobs:
+      - lint
+      - test
+      - build
+      - docs
+      - test-e2e:
+          requires:
+            - build
+      - db-schema:
+          context: org-global
+      - verify-generated
+      - lint-helm-chart:
+          context: org-global
+      - shellcheck/check:
+          pattern: 'do'
+          name: shellcheck-do
+      - docker-image:
+          context: org-global
+          requires:
+            - build
+      - migrator-image:
+          context: org-global
+          requires:
+            - build
+      - deploy:
+          requires:
+            - lint
+            - test
+            - test-e2e
+            - db-schema
+            - docker-image
+            - migrator-image
+            - lint-helm-chart
+            - docs
+          context: org-global
+          filters:
+            branches:
+              only: master
+      - scotty-orb/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          promotion_component_list: "circleci/distributor circleci/distributor-migrator"
+          requires:
+            - deploy
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-\d\..+/
+      - deploy-canary:
+          requires:
+            - lint
+            - test
+            - test-e2e
+            - db-schema
+            - docker-image
+            - migrator-image
+            - lint-helm-chart
+            - docs
+          context: org-global
+          filters:
+            branches:
+              only: canary
+
+orbs:
+  aws-cli: circleci/aws-cli@0.1.20
+  shellcheck: circleci/shellcheck@1.3.16
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+  slack: circleci/slack@4.4.4
+
+x-data:
+  big_resource_class: &big_resource_class
+    resource_class: xlarge
+    environment:
+      GOMAXPROCS: 8
+  very_big_resource_class: &very_big_resource_class
+    resource_class: 2xlarge
+    environment:
+      GOMAXPROCS: 16
+
+executors:
+  default:
+    docker:
+      - image: &goimage cimg/go:1.18
+    working_directory: ~/project
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    environment:
+      NAME: distributor
+      DOCKERFILE_PATH: Dockerfile
+      DEPLOY_TYPE: helm
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/distributor
+      CUSTOM_CHART: deploy/
+
+commands:
+  setup:
+    steps:
+      - checkout
+      - run: ./do install-devtools
+  store_results:
+    steps:
+      - run:
+          name: Strip ANSI codes from xunit output
+          when: always
+          command: |
+            # The test output produces ANSI codes, which the XML writer converts into annoying
+            # \0xfffd characters - we'll strip these out to make the XML a bit more readable
+            sed -i 's/�\[[0-9;]*[a-zA-Z]//g' test-reports/*.xml || true
+      - store_artifacts:
+          path: test-reports
+      - store_test_results:
+          path: test-reports
+  remote_docker:
+    steps:
+      - setup_remote_docker:
+          version: "18.09.3"
+      - run: docker version
+  # Cribbed from the slack orb, then modified to suit
+  notify_slack:
+    steps:
+      - run:
+          name: Slack Notification
+          command: |
+            # Provide error if no webhook is set and error. Otherwise continue
+            if [ -z "${SLACK_WEBHOOK}" ]; then
+              echo '$SLACK_WEBHOOK not set'
+              exit 1
+            fi
+
+            version=$(<docker_image.tag)
+            message=$(git show HEAD --no-patch --format=%s | jq -R '.' | sed -e 's/^"//' -e 's/"$//')
+
+            cat \<< EOF | tee /tmp/slack-webhook-body
+            {
+            	"blocks": [
+            		{
+            			"type": "header",
+            			"text": {
+            				"type": "plain_text",
+            				"text": "Helm deployment triggered",
+            				"emoji": true
+            			}
+            		},
+            		{
+            			"type": "section",
+            			"fields": [
+            				{
+            					"type": "mrkdwn",
+            					"text": "*Project:*\n$CIRCLE_PROJECT_REPONAME"
+            				},
+            				{
+            					"type": "mrkdwn",
+            					"text": "*Author:*\n$CIRCLE_USERNAME"
+            				}
+            			]
+            		},
+            		{
+            			"type": "section",
+            			"fields": [
+            				{
+            					"type": "mrkdwn",
+            					"text": "*Version:*\n$version"
+            				},
+            				{
+            					"type": "mrkdwn",
+            					"text": "*CircleCI Build:*\n<$CIRCLE_BUILD_URL|$CIRCLE_BUILD_NUM>"
+            				}
+            			]
+            		},
+            		{
+            			"type": "section",
+            			"text": {
+            				"type": "mrkdwn",
+            				"text": "*Commit Message:*\n$message"
+            			}
+            		}
+            	]
+            }
+            EOF
+
+            curl --fail -H 'Content-type: application/json' \
+                --data @/tmp/slack-webhook-body "${SLACK_WEBHOOK}"
+
+  notify_honeycomb:
+    steps:
+      - run:
+          name: Notify Honeycomb
+          command: |
+            cat \<< EOF | tee /tmp/honeycomb-marker
+            {
+              "message": "Deploying distributor $(<docker_image.tag)",
+              "type":"deploy"
+            }
+            EOF
+            curl https://api.honeycomb.io/1/markers/execution \
+              -H "X-Honeycomb-Team: $HONEYCOMB_WRITEKEY" \
+              -d @/tmp/honeycomb-marker
+
+  create_and_scan_docker_image:
+    parameters:
+      context:
+        description: The directory to use as docker build context
+        type: string
+    steps:
+      - remote_docker
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: create and scan docker image
+          command: |
+            set -x
+            if [[ "$CIRCLE_BRANCH" = "master" || "$CIRCLE_BRANCH" = "canary" || "$CIRCLE_BRANCH" =~ ^server-[0-9]\..+ ]]; then
+              export DOCKER_REGISTRY=all
+            else
+              # this is how we tell CCC not to actually publish
+              export DOCKER_REGISTRY=none
+            fi
+
+            export CONTAINER_VERSION=$(cat app_version)
+
+            # Don't send as much build context to remote docker
+            # If `publish` accepted a context arg, this would be easier
+            cd << parameters.context >>
+            cp ~/project/Dockerfile .
+
+            publish
+
+            cp docker_image.tag ~/project
+
+  notify_failing_master:
+    steps:
+      - slack/notify:
+          channel: tasks-alerts
+          branch_pattern: master
+          event: fail
+          template: basic_fail_1
+
+jobs:
+  lint:
+    executor: default
+    <<: *big_resource_class
+    steps:
+      - setup
+      - run:
+          name: verify modules are tidy
+          command: |
+            go mod tidy -v
+            git diff --exit-code
+      - run: ./do install-devtools
+      - run: ./do lint-report ./... --timeout=2m
+      - store_results
+      - notify_failing_master
+
+  test:
+    docker:
+      - image: *goimage
+      - image: circleci/postgres:11.4-alpine-ram
+        environment:
+          POSTGRES_USER: distributor
+          POSTGRES_PASSWORD: distributor
+          POSTGRES_DB: distributor
+      - image: circleci/postgres:13.3-ram
+        environment:
+          PGPORT: 5434
+          PGDATA: /dev/shm/pgdata-runner/data
+          POSTGRES_USER: runneradmin
+          POSTGRES_PASSWORD: runneradmin
+          POSTGRES_DB: runneradmin
+      - image: circleci/postgres:12.4-ram
+        environment:
+          PGPORT: 5433
+          PGDATA: /dev/shm/pgdata12/data
+          POSTGRES_USER: circle
+          POSTGRES_PASSWORD: circle
+          POSTGRES_DB: circle
+      - image: circleci/redis:5.0.6-alpine
+        command: [ "--databases", "1000000" ]
+      - image: bitnami/memcached:1.6.6
+        environment:
+          MEMCACHED_USERNAME: "memcached"
+          MEMCACHED_PASSWORD: "memcached"
+          MEMCACHED_MAX_ITEM_SIZE: "5242880"
+    <<: *big_resource_class
+    parallelism: 2
+    steps:
+      - setup
+      - run: ./do create-stub-test-files
+      - run:
+          name: run tests
+          command: >
+            ACCEPTANCE_COVERAGE="$PWD/test-reports/coverage-acceptance.txt"
+            ./do test ./...
+            -coverpkg='./...'
+            -coverprofile='test-reports/coverage.txt'
+      - store_results
+      - notify_failing_master
+
+  test-e2e:
+    docker:
+      - image: *goimage
+      - image: circleci/postgres:11.4-alpine-ram
+        environment:
+          POSTGRES_USER: distributor
+          POSTGRES_PASSWORD: distributor
+          POSTGRES_DB: distributor
+      - image: circleci/postgres:13.3-ram
+        environment:
+          PGPORT: 5434
+          PGDATA: /dev/shm/pgdata-runner/data
+          POSTGRES_USER: runneradmin
+          POSTGRES_PASSWORD: runneradmin
+          POSTGRES_DB: runneradmin
+      - image: circleci/postgres:12.4-ram
+        environment:
+          PGPORT: 5433
+          PGDATA: /dev/shm/pgdata12/data
+          POSTGRES_USER: circle
+          POSTGRES_PASSWORD: circle
+          POSTGRES_DB: circle
+      - image: circleci/redis:5.0.6-alpine
+        command: [ "--databases", "1000000" ]
+    steps:
+      - setup
+      - attach_workspace:
+          at: .
+      - run:
+          name: run e2e tests
+          command: |
+              ./target/execution.e2e.test/binaries/linux/amd64/execution.e2e.test \
+                -split-db=true \
+                -distributor-binary=./target/distributor/binaries/linux/amd64/distributor \
+                -dispatcher-binary=./target/dispatcher/binaries/linux/amd64/dispatcher
+      - notify_failing_master
+
+  db-schema:
+    machine:
+      image: ubuntu-2004:202107-02
+    steps:
+      - checkout
+      - run:
+          name: docker login
+          command: >
+            echo $DOCKER_HUB_PASSWORD |
+            docker login --username $DOCKER_HUB_USER --password-stdin
+      - run: ./do schema
+      - run:
+          name: Check that the DB schema dump matches migrations
+          command: |
+            # If the `diff` exit code is not zero, the migrations/schema.sql file is
+            # out-of date.
+            # Run ./do schema locally to update it
+            git diff --exit-code
+      - notify_failing_master
+
+  verify-generated:
+    executor: default
+    steps:
+      - setup
+      - run:
+          name: install protobuf binaries
+          command: |
+            mkdir -p /tmp/protoc
+            cd /tmp/protoc
+
+            wget https://github.com/protocolbuffers/protobuf/releases/download/v3.17.3/protoc-3.17.3-linux-x86_64.zip
+            unzip protoc*.zip
+            sudo mv bin/protoc /usr/local/bin/
+            sudo mv include/google /usr/local/include
+      - run:
+          name: generate
+          command: ./do generate
+      - run:
+          name: Ensure that anything generated is comitted
+          command: git diff --exit-code
+      - notify_failing_master
+
+  build:
+    executor: default
+    <<: *very_big_resource_class
+    steps:
+      - setup
+      - run: ./do build
+      - run: ./do build-stripped-binaries
+      - run: ./do version > app_version
+      - persist_to_workspace:
+          root: .
+          paths:
+            - app_version
+            - ./bin/linux
+            - ./target
+      - notify_failing_master
+
+  docker-image:
+    executor: ccc
+    environment:
+      TWISTLOCK_ENFORCE: false
+    steps:
+      - create_and_scan_docker_image:
+          context: bin/linux
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.tag
+      - notify_failing_master
+
+  migrator-image:
+    executor: ccc
+    environment:
+      DOCKERFILE_PATH: ""
+      NAME: distributor-migrator
+      MIGRATIONS_SQL_PATH: "distributor"
+      TWISTLOCK_ENFORCE: false
+    steps:
+      - create_and_scan_docker_image:
+          context: migrations
+      - run: mv docker_image.tag docker_image.migrator.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.migrator.tag
+      - notify_failing_master
+
+  lint-helm-chart:
+    executor: ccc
+    steps:
+      - checkout
+      - run:
+          name: create helm package
+          command: |
+            if [[ "$CIRCLE_BRANCH" == "canary" ]]; then
+              sed -i.bak 's/canary: false/canary: true/' deploy/values.yaml
+            fi
+            /deploy/scripts/dry-run.sh | tee helm-package.txt
+      - store_artifacts:
+          path: helm-package.txt
+      - notify_failing_master
+
+  deploy:
+    executor: ccc
+    environment:
+      AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - aws-cli/setup:
+          profile-name: cci
+          aws-access-key-id: BINARY_S3_AWS_ACCESS_KEY_ID
+          aws-secret-access-key: BINARY_S3_AWS_SECRET_ACCESS_KEY
+      - run: apk --no-cache add openssl jq
+      - run: ./do deploy-e2e-test
+      - run: ./do release-e2e-test
+      - run: ./do docs-publish
+      - run:
+          name: substitute migrator values
+          command: |
+            MIGRATOR_VERSION="$(< docker_image.migrator.tag)"
+            sed -i.bak "s|\<<migrator_image_name>>|183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/distributor-migrator:${MIGRATOR_VERSION}|g" deploy/values.yaml
+      - run: deploy
+      - notify_slack
+      - notify_honeycomb
+      - notify_failing_master
+
+  deploy-canary:
+    executor: ccc
+    environment:
+      RELEASE_VERSION: canary
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: substitute canary values
+          command: |
+            # We don't run migrations as part of canary
+            sed -i.bak 's/canary: false/canary: true/' deploy/values.yaml
+      - run: deploy
+
+  docs:
+    docker:
+      - image: pandoc/core:2.9.2.1
+    steps:
+      - checkout
+      - run: apk add bash
+      - run:
+          command: ./do external-docs
+          environment:
+            PANDOC_COMMAND: docker-entrypoint.sh
+      - persist_to_workspace:
+          root: .
+          paths:
+            - ./api/docs

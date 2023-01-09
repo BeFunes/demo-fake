@@ -1,0 +1,121 @@
+version: 2.1
+
+orbs:
+  shellcheck: circleci/shellcheck@2.2.4
+
+workflows:
+  internal:
+    jobs:
+      - lint:
+          base_path: .
+          context:
+            - github-readonly
+      - linted:
+          requires:
+            - lint
+      - db-schema:
+          context:
+            - org-global
+            - github-readonly
+      - shellcheck/check:
+          dir: ./scripts
+      - shellchecked:
+          requires:
+            - shellcheck/check
+      - test:
+          base_path: .
+          context:
+            - org-global
+            - github-readonly
+      - tests-passed:
+          requires:
+            - test
+
+jobs:
+  lint:
+    parameters:
+      base_path:
+        type: string
+        description: the base path of the package, without a leading slash
+    machine:
+      image: ubuntu-2004:202111-02
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: lint
+          command: ./scripts/lint.sh
+
+  db-schema:
+    machine:
+      image: ubuntu-2004:202201-02
+    steps:
+      - checkout
+      - run:
+          name: docker login
+          command: >
+            echo $DOCKER_HUB_PASSWORD |
+            docker login --username $DOCKER_HUB_USER --password-stdin
+      - run: ./scripts/dump_schema.sh
+      - run:
+          name: Check that the DB schema dump matches migrations
+          command: |
+            # If the `diff` exit code is not zero, the migrations/schema.sql file is
+            # out-of date.
+            # Run ./scripts/dump_schema.sh locally to update it
+            git diff --exit-code
+
+  test:
+    parameters:
+      base_path:
+        type: string
+        description: the base path of the package, without a leading slash
+    machine:
+      image: ubuntu-2004:202111-02
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: dbname
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: docker login
+          command: >
+            echo $DOCKER_HUB_PASSWORD |
+            docker login --username $DOCKER_HUB_USER --password-stdin
+      - run:
+          name: run tests
+          command: ./scripts/test.sh
+      - run: ls
+      - run:
+          name: Strip ANSI codes from xunit output
+          when: always
+          command: |
+            # The test output produces ANSI codes, which the XML writer converts into annoying
+            # \0xfffd characters - we'll strip these out to make the XML a bit more readable
+            sed -i 's/�\[[0-9;]*[a-zA-Z]//g' test-reports/*.xml || true
+      - store_artifacts:
+          path: ./<<parameters.base_path>>/test-reports
+      - store_test_results:
+          path: ./<<parameters.base_path>>/test-reports
+
+  linted:
+    executor: default
+    steps:
+      - run: echo "linted"
+
+  tests-passed:
+    executor: default
+    steps:
+      - run: echo "tests passed"
+
+  shellchecked:
+    executor: default
+    steps:
+      - run: echo "shellcheck passed"
+
+executors:
+  default:
+    docker:
+      - image: &goimage cimg/go:1.18

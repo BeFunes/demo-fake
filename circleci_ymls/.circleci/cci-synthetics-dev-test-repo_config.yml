@@ -1,0 +1,10 @@
+# This configuration is a placeholder. cci-synthetics will replace this
+# configuration with a real configuration for each check branch it generates.
+
+version: 2.1
+orbs:
+  welcome: circleci/welcome-orb@0.4.1
+workflows:
+  welcome:
+    jobs:
+      - welcome/run

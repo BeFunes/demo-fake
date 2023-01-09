@@ -1,0 +1,59 @@
+#########################################
+#         REUSABLE YAML ANCHORS         #
+#########################################
+install_deps: &install_deps
+  run:
+    name: Installing Dependencies
+    command: |
+      apk add curl bash
+      sh -c "curl https://raw.githubusercontent.com/kadwanev/retry/master/retry -o /usr/local/bin/retry && chmod +x /usr/local/bin/retry"
+
+create_env: &create_env
+  run:
+    name: Creating Test Environment
+    command: |
+      cd $TEST_DIR
+      terraform init
+      # Piping Terraform Plan to /dev/null to prevent secrets from being displayed in CI output
+      terraform plan -var="prefix=server-ldap-$CIRCLE_BUILD_NUM"> /dev/null
+      terraform apply -var="prefix=server-ldap-$CIRCLE_BUILD_NUM" -auto-approve
+
+verify_replicated: &verify_ldap
+  run:
+    name: Verifying LDAP Installation
+    command: |
+      cd $TEST_DIR
+      export ADDRESS=$(terraform output service_box_public_ip)
+      bash -c 'retry -v "nc -v -w 1 $ADDRESS 389"'
+
+destroy_env: &destroy_env
+  run:
+    name: Destroying Test Environment
+    when: always
+    command: |
+      cd $TEST_DIR
+      terraform destroy -var="prefix=server-ldap-$CIRCLE_BUILD_NUM" -auto-approve
+
+#########################################
+#            CIRCLE CONFIG              #
+#########################################
+version: 2
+jobs:
+  standard-openldap:
+    docker:
+      - image: hashicorp/terraform:light
+    environment:
+      TEST_DIR: "examples/openldap"
+      USE_DOMAIN: false
+    steps:
+      - checkout
+      - <<: *install_deps
+      - <<: *create_env
+      - <<: *verify_ldap
+      - <<: *destroy_env
+          
+workflows:
+  version: 2
+  tests:
+    jobs:
+      - standard-openldap

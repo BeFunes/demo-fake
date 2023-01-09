@@ -1,0 +1,222 @@
+version: 2.1
+
+orbs:
+  docker: circleci/docker@2.0.5
+
+executors:
+  go:
+    docker:
+      - image: circleci/go-service:0.1-dev
+        auth:
+          username: $RO_DOCKER_HUB_USERNAME
+          password: $RO_DOCKER_HUB_PASSWORD
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    environment:
+      GO_BINARY_PATH: ./bin/app
+      DOCKER_REGISTRY: all
+      CONFIGURE_ECR_REPO: yes
+      NAME: circleci-tests-run-manager
+      ECR_OWNER_TEAM: TestAndDebug
+
+jobs:
+  build:
+    executor: go
+    environment:
+      GO_BUILD_TARGET: ./cmd/server/main.go
+    steps:
+      - checkout
+      - run: task go-service:private-go-mod-init
+      - run: task go-service:build
+      - persist_to_workspace:
+          root: .
+          paths:
+            - bin/app
+
+  lint:
+    executor: go
+    steps:
+      - checkout
+      - run: task go-service:private-go-mod-init
+      - run: task lint
+      - run: task check-tidy
+
+  test:
+    executor: go
+    steps:
+      - checkout
+      - run: task go-service:private-go-mod-init
+      - run: task ci:test RESULTS_DIR=/tmp/test-results
+      - store_test_results:
+          path: /tmp/test-results
+
+  e2e-test:
+    executor: go
+    steps:
+      - setup_remote_docker:
+          version: "20.10.14"
+      - checkout
+      - run: task go-service:private-go-mod-init
+      - run: task vendor
+      - run: task ci:install-docker-compose
+      - docker/install-docker-compose
+      - run: task e2e-test
+
+  scan:
+    executor:
+      name: ccc
+    environment:
+      TWISTCLI_DEBUG: true
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: scan
+      - store_artifacts:
+          path: ccc-image-scan-results
+          destination: service/ccc-image-scan-results
+
+  publish-deploy:
+    executor: ccc
+    environment:
+      VALUES_FILE: service/values.yml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: publish
+      - run: deploy
+
+  publish-deploy-canary:
+    executor: ccc
+    environment:
+      VALUES_FILE: service/canary.yml
+      RELEASE_VERSION: canary
+      DEPLOY_ENVIRONMENT: canary
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: publish
+      - run: /deploy/merge-values service/values.yml service/canary-overrides.yml > service/canary.yml
+      - run: deploy
+
+  delete-canary:
+    executor: ccc
+    steps:
+      - checkout
+      - run: .circleci/delete-canary.sh circleci-tests-run-manager-canary   
+
+  dry-run-service:
+    executor: ccc
+    environment:
+      NAME: circleci-tests-run-manager
+      DOCKERFILE_PATH: Dockerfile
+      VALUES_FILE: service/values.yml
+    steps:
+      - setup_remote_docker
+      - checkout
+      - run: /deploy/dry-run     
+
+workflows:
+  main-workflow:
+    jobs:
+      - build:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - lint:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+          requires:
+            - build
+      - test:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+          requires:
+            - build
+      - e2e-test:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+          requires:
+            - build 
+      - scan:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - build
+          filters:
+            branches:
+              ignore:
+                - main
+                - canary
+      - dry-run-service:
+          context: org-global
+          requires:
+            - scan
+          filters:
+            branches:
+              # diffs are included automatically by actual deploys
+              ignore:
+                - main
+                - canary 
+      - publish-deploy:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - build
+            - lint
+            - test
+            - e2e-test
+          filters:
+            branches:
+              only: main
+      - can-deploy-canary:
+          type: approval
+          requires:
+            - build
+            - lint
+            - test
+            - e2e-test
+          filters:
+            branches:
+              only:
+                - canary 
+      - publish-deploy-canary:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - can-deploy-canary
+          filters:
+            branches:
+              only:
+                - canary                
+      - can-delete-canary:
+          type: approval
+          requires:
+            - publish-deploy-canary
+          filters:
+            branches:
+              only:
+                - canary
+      - delete-canary:
+          context: org-global
+          requires:
+            - can-delete-canary
+          filters:
+            branches:
+              only:
+                - canary

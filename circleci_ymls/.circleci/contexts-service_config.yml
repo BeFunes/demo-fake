@@ -1,0 +1,571 @@
+version: 2.1
+
+orbs:
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+
+references:
+  clojure-service-image: &clojure-service-image
+    image: circleci/clojure-service:0.8-dev
+    auth:
+      username: $DOCKER_HUB_USER
+      password: $DOCKER_HUB_PASSWORD
+
+  postgresql-image: &postgresql-image
+    image: postgres:12.4-alpine
+    environment:
+      POSTGRES_USER: contexts_service
+      POSTGRES_DB: contexts_service
+      POSTGRES_HOST_AUTH_METHOD: trust
+
+  vault-image: &vault-image
+    image: circleci/vault-cci:0.3.41-d8ee23c
+    environment:
+      SKIP_SETCAP: skip
+
+  command-convenience-image: &command-convenience-image
+    image: circleci/command-convenience:0.1
+    auth:
+      username: $DOCKER_HUB_USER
+      password: $DOCKER_HUB_PASSWORD
+
+  command-convenience-environment: &command-convenience-environment
+    CONTAINER_ORG: circleci
+    DOCKER_REGISTRY: all
+    DEPLOY_TYPE: helm
+    RELEASE_VERSION: v2
+
+  restore-maven-local-repository: &restore-maven-local-repository
+    restore_cache:
+      keys:
+        - v1-mvn-{{ checksum "client/project.clj" }}-{{ checksum "server/project.clj" }}
+        - v1-mvn-
+
+  save-maven-local-repository: &save-maven-local-repository
+    save_cache:
+      key: v1-mvn-{{ checksum "client/project.clj" }}-{{ checksum "server/project.clj" }}
+      paths:
+        - /root/.m2
+
+  working_directory: &working_directory
+    working_directory: /root/contexts-service
+
+  migrate: &migrate
+    run:
+      name: Migrate database
+      command: |
+        dockerize -wait tcp://localhost:5432 -timeout 1m
+        flyway migrate
+
+  configuration: &configuration
+    POSTGRESQL__CONTEXTS_DB__URI: jdbc:postgresql://localhost:5432/contexts_service?user=contexts_service&password=
+    HEALTH_CHECK_PORT: 3011
+    GRPC_SERVER__PORT: 8091
+    CRYPTO_BACKEND: vault
+    VAULT__URL: http://localhost:8200
+    VAULT__MOUNT__TRANSIT: transit
+
+jobs:
+  build-cache:
+    docker:
+      - *clojure-service-image
+    <<: *working_directory
+    steps:
+      - checkout
+      - *restore-maven-local-repository
+      - run:
+          name: Download Server dependencies
+          command: lein deps
+          working_directory: /root/contexts-service/server
+      - run:
+          name: Download Client dependencies
+          command: lein deps
+          working_directory: /root/contexts-service/client
+      - *save-maven-local-repository
+
+  test-client:
+    docker:
+      - *clojure-service-image
+      - *postgresql-image
+      - *vault-image
+    <<: *working_directory
+    steps:
+      - checkout
+      - *restore-maven-local-repository
+      - *migrate
+      - run:
+          name: Run client tests
+          working_directory: /root/contexts-service/client
+          command: |
+            lein test \
+              --plugin kaocha.plugin/junit-xml \
+              --junit-xml-file target/test-results/results.xml
+      - store_test_results:
+          path: client/target/test-results
+      - store_artifacts:
+          path: client/target/test-results
+          destination: raw-test-output
+
+  test-schema:
+    docker:
+      - *clojure-service-image
+      - *postgresql-image
+    <<: *working_directory
+    steps:
+      - checkout
+      - *migrate
+      - run:
+          name: Add Postgres Debian repository
+          command: |
+            echo "deb http://apt.postgresql.org/pub/repos/apt/ buster-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
+              && curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add -
+      - run:
+          name: Install PostgreSQL client
+          command: |
+            apt-get update \
+              && apt-get upgrade -y \
+              && apt-get install postgresql-client-12
+      - run:
+          name: Dump migrated schema
+          command: |
+              FILENAME="/tmp/schema.sql" \
+              PG_DUMP_COMMAND="pg_dump --host=localhost" ./scripts/dump_schema
+      - run:
+          name: Check that schema.sql accounts for migrations
+          command: |
+            # If the `diff` exit code is not zero, the schema.sql file is
+            # out-of date. Generate the schema.sql file locally with
+            # ./scripts/dump-schema and check in to source control.
+            diff /tmp/schema.sql schema_postgres.sql
+      - store_artifacts:
+          path: /tmp/schema.sql
+
+  test-server:
+    docker:
+      - *clojure-service-image
+      - *postgresql-image
+      - *vault-image
+    <<: *working_directory
+    steps:
+      - checkout
+      - *restore-maven-local-repository
+      - *migrate
+      - run:
+          name: Run server tests
+          working_directory: /root/contexts-service/server
+          command: |
+            apt-get update
+            apt-get install --assume-yes --no-install-recommends jq
+            ./docker-entrypoint.sh test \
+              --plugin kaocha.plugin/junit-xml \
+              --junit-xml-file target/test-results/results.xml
+          environment:
+            <<: *configuration
+      - store_test_results:
+          path: server/target/test-results
+      - store_artifacts:
+          path: server/target/test-results
+          destination: raw-test-output
+
+  codecov:
+    docker:
+      - *clojure-service-image
+      - *postgresql-image
+      - *vault-image
+    <<: *working_directory
+    steps:
+      - checkout
+      - *restore-maven-local-repository
+      - *migrate
+      - run:
+          name: Run server tests
+          working_directory: /root/contexts-service/server
+          command: |
+            apt-get update
+            apt-get install --assume-yes --no-install-recommends jq
+            ./docker-entrypoint.sh cloverage --codecov
+          environment:
+            <<: *configuration
+      - store_test_results:
+          path: server/target/test-results
+      - store_artifacts:
+          path: server/target/test-results
+          destination: raw-test-output
+      - store_artifacts:
+          path: server/target/coverage
+
+  build-uberjar:
+    docker:
+      - *clojure-service-image
+      - *postgresql-image
+      - *vault-image
+    <<: *working_directory
+    steps:
+      - checkout
+      - *restore-maven-local-repository
+      - run:
+          name: uberjar
+          working_directory: /root/contexts-service/server
+          command: lein uberjar
+      - run:
+          command: mv target/contexts-service-*-standalone.jar target/contexts-service-standalone.jar
+          working_directory: /root/contexts-service/server
+      - persist_to_workspace:
+          root: .
+          paths:
+            - server/target/contexts-service-standalone.jar
+
+  test-publish-migrator:
+    docker:
+      - <<: *command-convenience-image
+        environment:
+          <<: *command-convenience-environment
+          NAME: contexts-service-migrator
+          DOCKERFILE_PATH: migrator.Dockerfile
+    <<: *working_directory
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Publish docker image
+          command: publish
+          environment:
+            DOCKER_REGISTRY: none
+
+  helm-publish-migrator:
+    docker:
+      - <<: *command-convenience-image
+        environment:
+          <<: *command-convenience-environment
+          NAME: contexts-service-migrator
+          DOCKERFILE_PATH: migrator.Dockerfile
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/contexts-service-migrator
+          VALUES_FILE: migrator/values.yml
+    <<: *working_directory
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Publish docker image
+          command: publish
+      - run: mv docker_image.tag docker_image.migrator.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.migrator.tag
+
+  helm-deploy-migrator:
+    docker:
+      - <<: *command-convenience-image
+        environment:
+          <<: *command-convenience-environment
+          NAME: contexts-service-migrator
+          DOCKERFILE_PATH: migrator.Dockerfile
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/contexts-service-migrator
+          VALUES_FILE: migrator/values.yml
+    <<: *working_directory
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: mv docker_image.migrator.tag docker_image.tag
+      - run:
+          name: Deploy docker image
+          command: deploy
+
+  test-publish-service:
+    docker:
+      - <<: *command-convenience-image
+        environment:
+          <<: *command-convenience-environment
+          NAME: contexts-service
+          DOCKERFILE_PATH: server.Dockerfile
+    <<: *working_directory
+    steps:
+      - checkout
+      - *restore-maven-local-repository
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run:
+          name: Publish docker image
+          command: publish
+          environment:
+            DOCKER_REGISTRY: none
+
+  helm-publish-service:
+    docker:
+      - <<: *command-convenience-image
+        environment:
+          <<: *command-convenience-environment
+          NAME: contexts-service
+          DOCKERFILE_PATH: server.Dockerfile
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/contexts-service
+          VALUES_FILE: server/values.yml
+    <<: *working_directory
+    steps:
+      - checkout
+      - *restore-maven-local-repository
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run:
+          name: Publish docker image
+          command: publish
+      - run: mv docker_image.tag docker_image.service.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.service.tag
+
+  # Deploy the "job context fetching" version of the service - see description in values.yml
+  helm-deploy-service:
+    docker:
+      - <<: *command-convenience-image
+        environment:
+          <<: *command-convenience-environment
+          NAME: contexts-service
+          DOCKERFILE_PATH: server.Dockerfile
+          VALUES_FILE: server/values.yml
+    <<: *working_directory
+    steps:
+      - checkout
+      - *restore-maven-local-repository
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run: mv docker_image.service.tag docker_image.tag
+      - run:
+          name: Deploy docker image
+          command: deploy
+
+  # Deploy the "API" version of the service - see description in values-api-overrides.yml
+  helm-deploy-api:
+    docker:
+      - <<: *command-convenience-image
+        environment:
+          <<: *command-convenience-environment
+          NAME: contexts-service-api
+          # Ensure helm chart uses correct service image name, since NAME for the deployment
+          # is overridden above.
+          IMAGE_NAME: circleci/contexts-service
+          DOCKERFILE_PATH: server.Dockerfile
+          VALUES_FILE: server/api-values.yml
+    <<: *working_directory
+    steps:
+      - checkout
+      - *restore-maven-local-repository
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run: mv docker_image.service.tag docker_image.tag
+      - run:
+          name: Merge API override values
+          command: /deploy/merge-values values.yml values-api-overrides.yml > api-values.yml
+          working_directory: ./server
+      - run:
+          name: Deploy docker image
+          command: deploy
+
+  helm-deploy-service-canary:
+    docker:
+      - <<: *command-convenience-image
+        environment:
+          <<: *command-convenience-environment
+          NAME: contexts-service
+          RELEASE_VERSION: canary1
+          DOCKERFILE_PATH: server.Dockerfile
+          VALUES_FILE: server/canary-values.yml
+    <<: *working_directory
+    steps:
+      - checkout
+      - *restore-maven-local-repository
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run: mv docker_image.service.tag docker_image.tag
+      - run:
+          name: Merge canary values
+          command: /deploy/merge-values values.yml canary-overrides.yml > canary-values.yml
+          working_directory: ./server
+      - run:
+          name: Deploy docker image
+          command: deploy
+
+  helm-deploy-api-canary:
+    docker:
+      - <<: *command-convenience-image
+        environment:
+          <<: *command-convenience-environment
+          NAME: contexts-service-api
+          # Ensure helm chart uses correct service image name, since NAME for the deployment
+          # is overridden above.
+          IMAGE_NAME: circleci/contexts-service
+          RELEASE_VERSION: canary1
+          DOCKERFILE_PATH: server.Dockerfile
+          VALUES_FILE: server/canary-values.yml
+    <<: *working_directory
+    steps:
+      - checkout
+      - *restore-maven-local-repository
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run: mv docker_image.service.tag docker_image.tag
+      - run:
+          name: Merge canary values
+          command: /deploy/merge-values values.yml values-api-overrides.yml canary-overrides.yml > canary-values.yml
+          working_directory: ./server
+      - run:
+          name: Deploy docker image
+          command: deploy
+
+  deploy-client:
+    docker:
+      - *clojure-service-image
+      - *postgresql-image
+      - *vault-image
+    <<: *working_directory
+    steps:
+      - checkout
+      - *restore-maven-local-repository
+      - run:
+          name: Deploy contexts-service-client
+          command: lein deploy circle-s3
+          working_directory: /root/contexts-service/client
+
+workflows:
+  version: 2
+  build-and-deploy:
+    jobs:
+      - build-cache:
+          context: org-global
+      - test-client:
+          context: org-global
+          requires:
+            - build-cache
+      - test-server:
+          context: org-global
+          requires:
+            - build-cache
+      - test-schema:
+          context: org-global
+          requires:
+            - build-cache
+      - codecov:
+          context: org-global
+          requires:
+            - build-cache
+      - build-uberjar:
+          context: org-global
+          requires:
+            - build-cache
+      - test-publish-migrator:
+          context: org-global
+          requires:
+            - build-cache
+          filters:
+            branches:
+              ignore:
+                - main
+                - /^canary\/.+$/
+                - /^canary-api\/.+$/
+                - /^server-\d\..+/
+      - helm-publish-migrator:
+          context: org-global
+          requires:
+            - test-client
+            - test-server
+          filters:
+            branches:
+              only:
+                - main
+                - /^canary\/.+$/
+                - /^canary-api\/.+$/
+                - /^server-\d\..+/
+      - helm-deploy-migrator:
+          context: org-global
+          requires:
+            - helm-publish-migrator
+          filters:
+            branches:
+              only:
+                - main
+      - test-publish-service:
+          context: org-global
+          requires:
+            - build-uberjar
+          filters:
+            branches:
+              ignore:
+                - main
+                - /^canary\/.+$/
+                - /^canary-api\/.+$/
+                - /^server-\d\..+/
+      - helm-publish-service:
+          context: org-global
+          requires:
+            - build-uberjar
+            - test-client
+            - test-server
+          filters:
+            branches:
+              only:
+                - main
+                - /^canary\/.+$/
+                - /^canary-api\/.+$/
+                - /^server-\d\..+/
+      - scotty-orb/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          requires:
+            - helm-publish-service
+            - helm-publish-migrator
+          promotion_component_list: "circleci/contexts-service circleci/contexts-service-migrator"
+          filters:
+            branches:
+              only:
+                - main
+                - /^server-\d\..+/
+      - helm-deploy-service:
+          context: org-global
+          requires:
+            - helm-publish-service
+            - helm-deploy-migrator
+          filters:
+            branches:
+              only:
+                - main
+      - helm-deploy-api:
+          context: org-global
+          requires:
+            - helm-publish-service
+            - helm-deploy-migrator
+          filters:
+            branches:
+              only:
+                - main
+      - helm-deploy-service-canary:
+          context: org-global
+          requires:
+            - helm-publish-service
+          filters:
+            branches:
+              only:
+                - /^canary\/.+$/
+      - helm-deploy-api-canary:
+          context: org-global
+          requires:
+            - helm-publish-service
+          filters:
+            branches:
+              only:
+                - /^canary-api\/.+$/
+      - deploy-client:
+          context: org-global
+          requires:
+            - helm-deploy-service
+          filters:
+            branches:
+              only:
+                - main

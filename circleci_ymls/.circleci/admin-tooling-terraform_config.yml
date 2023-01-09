@@ -1,0 +1,130 @@
+version: 2.1
+orbs:
+  shellcheck: circleci/shellcheck@2.2.4
+  terraform: circleci/terraform@3.0.0
+  slack: circleci/slack@4.8.3
+
+jobs:
+  validate-and-plan:
+    parameters:
+      environment:
+        default: "development"
+        type: enum
+        enum: ["development", "production"]
+    executor: terraform/default
+    steps:
+      - checkout
+      - terraform/init:
+          path: "./<<parameters.environment>>"
+      - terraform/validate:
+          path: "./<<parameters.environment>>"
+      - terraform/plan:
+          path: "./<<parameters.environment>>"
+      - persist_to_workspace:
+          paths: .
+          root: .
+  refresh-okta-api-token:
+    docker:
+      - image: cimg/base:2021.12
+    steps:
+      - checkout
+      - run:
+          name: validate-env-vars
+          command: |
+            ./.circleci/scripts/check_environment_variables.sh \
+            TF_VAR_okta_api_token_development \
+            TF_VAR_okta_org_name_development \
+            TF_VAR_okta_base_url_development \
+            TF_VAR_okta_api_token_production \
+            TF_VAR_okta_org_name_production \
+            TF_VAR_okta_base_url_production
+      - run:
+          name: refresh-development-token
+          command: ./.circleci/scripts/refresh_okta_api_token.sh development
+      - run:
+          name: refresh-production-token
+          command: ./.circleci/scripts/refresh_okta_api_token.sh production
+      - slack/notify:
+          event: fail
+          channel: C01UK1XTNUF # admin-tooling-alerts
+          mentions: '@admin-tooling-engineering'
+          template: basic_fail_1
+  slack-notify:
+    docker:
+      - image: cimg/base:2021.12
+    steps:
+      - slack/notify:
+          channel: C01UK1XTNUF # admin-tooling-alerts
+          mentions: '@admin-tooling-engineering'
+
+workflows:
+  test-and-deploy-development:
+    jobs:
+      - shellcheck/check:
+          name: shellcheck
+          dir: ./.circleci/scripts/
+      - terraform/fmt:
+          checkout: true
+          recursive: true
+      - validate-and-plan:
+          name: plan-development
+          environment: development
+          context: admin-tooling-terraform
+          requires:
+            - terraform/fmt
+      - terraform/apply:
+          name: apply-development
+          attach-workspace: true
+          path: './development'
+          context: admin-tooling-terraform
+          filters:
+            branches:
+              only: main
+          requires:
+            - plan-development
+
+  test-and-deploy-production:
+    jobs:
+      - shellcheck/check:
+          name: shellcheck
+          dir: ./.circleci/scripts/
+      - terraform/fmt:
+          checkout: true
+          recursive: true
+      - validate-and-plan:
+          name: plan-production
+          environment: production
+          context: admin-tooling-terraform
+          requires:
+            - terraform/fmt
+      - terraform/apply:
+          name: apply-production
+          attach-workspace: true
+          path: './production'
+          context: admin-tooling-terraform
+          filters:
+            branches:
+              only: main
+          requires:
+            - plan-production
+      - slack-notify:
+          context:
+            - admin-tooling-slack-notifications
+          filters:
+            branches:
+              only: main
+          requires:
+            - apply-production
+
+  refresh-api-token:
+    triggers:
+      - schedule:
+          cron: "0 0 * * *"
+          filters:
+            branches:
+              only: main
+    jobs:
+      - refresh-okta-api-token:
+          context:
+            - admin-tooling-terraform
+            - admin-tooling-slack-notifications

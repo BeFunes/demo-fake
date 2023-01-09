@@ -1,0 +1,74 @@
+version: 2.1
+
+parameters:
+  run-schedule:
+    type: boolean
+    default: false
+  run-thursday:
+    type: boolean
+    default: false
+
+commands:
+  setup-container:
+    parameters:
+      directory:
+        type: string
+        default: '.'
+    steps:
+      - checkout
+      - run:
+          name: install pip requirements
+          command: cd <<parameters.directory>> && pip install --requirement requirements.txt
+
+jobs:
+  slack-lint-python:
+    docker:
+      - image: cimg/python:3.9
+    steps:
+      - setup-container:
+          directory: 'slack'
+      - run:
+          name: install pylint
+          command: pip install pylint==2.9.6
+      - run:
+          name: pylint
+          command: cd slack && pylint --output-format=colorized *.py
+
+  slack-update-ask-mac-alias:
+    docker:
+      - image: cimg/python:3.9
+    steps:
+      - setup-container:
+          directory: 'slack'
+      - run:
+          name: slack-update-ask-mac-alias
+          command: cd slack && python3 update-ask-mac-from-pagerduty.py
+
+  slack-weekly-xcode-popularity:
+    docker:
+      - image: cimg/python:3.9
+    steps:
+      - setup-container:
+          directory: 'slack'
+      - run:
+          name: slack-weekly-xcode-popularity
+          command: cd slack && python3 weekly-xcode-popularity.py
+
+workflows:
+  lint:
+    when:
+      and:
+        - not: <<pipeline.parameters.run-schedule>>
+        - not: <<pipeline.parameters.run-thursday>>
+    jobs:
+      - slack-lint-python
+
+  hourly:
+    when: << pipeline.parameters.run-schedule >>
+    jobs:
+      - slack-update-ask-mac-alias
+
+  weekly-thursday-afternoon:
+    when: << pipeline.parameters.run-thursday >>
+    jobs:
+      - slack-weekly-xcode-popularity

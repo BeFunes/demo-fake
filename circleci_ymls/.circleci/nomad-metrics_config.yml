@@ -1,0 +1,86 @@
+version: 2.1
+
+jobs:
+
+  build:
+    docker:
+      - image: cimg/go:1.14
+
+    steps:
+      - checkout
+
+      - run: ./do lint
+      - run: ./do test
+      - store_artifacts:
+          path: test-reports
+      - store_test_results:
+          path: test-reports
+      - run: ./do build
+
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target
+
+  release:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+
+      - create_and_scan_docker_image:
+          context: target/binaries/linux/amd64
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.tag
+
+commands:
+  create_and_scan_docker_image:
+    parameters:
+      context:
+        description: The directory to use as docker build context
+        type: string
+    steps:
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run:
+          name: create and scan docker image
+          command: |
+            set -x
+            export NAME=nomad-metrics
+            export DOCKERFILE_PATH=~/project/Dockerfile
+
+            if [[ "$CIRCLE_BRANCH" = "master" ]]; then
+              export DOCKER_REGISTRY=all
+            else
+              # this is how we tell CCC not to actually publish
+              export DOCKER_REGISTRY=none
+            fi
+
+            export CONTAINER_VERSION=$(~/project/do version)
+
+            # Don't send as much build context to remote docker
+            # If `publish` accepted a context arg, this would be easier
+            cd << parameters.context >>
+
+            publish
+
+            cp docker_image.tag ~/project
+
+workflows:
+  version: 2
+  build_release:
+    jobs:
+      - build
+      - release:
+          context: org-global
+          requires:
+            - build

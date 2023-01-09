@@ -1,0 +1,26 @@
+version: 2.1
+
+setup: true
+
+orbs:
+  path-filtering: circleci/path-filtering@0.0.2
+
+workflows:
+  always-run:
+    jobs:
+      - path-filtering/filter:
+          mapping: |
+            cypress/integration/adminTests/.* run-old-ui-tests true
+            cypress/integration/beforeAll/.* run-old-ui-tests true
+            cypress/integration/pages/.* run-old-ui-tests true
+            cypress/integration/tests/.* run-old-ui-tests true
+            .circleci/.* run-all-tests true
+            cypress.json run-all-tests true
+            package-lock.json run-all-tests true
+            package.json run-all-tests true
+            reporter.json run-all-tests true
+            cypress/fixtures/.* run-all-tests true
+            cypress/plugins/.* run-all-tests true
+            cypress/support/.* run-all-tests true
+          base-revision: master
+          config-path: .circleci/continue-config.yml

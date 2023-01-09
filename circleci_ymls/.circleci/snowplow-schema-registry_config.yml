@@ -1,0 +1,76 @@
+version: 2.1
+
+executors:
+  igluctl:
+    docker:
+      - image: ubuntu:latest
+        auth:
+          username: $RO_DOCKER_HUB_USERNAME
+          password: $RO_DOCKER_HUB_PASSWORD
+
+commands:
+  setup-igluctl:
+    description: pulls in the latest igluctl version
+    steps:
+      - checkout
+      - run: apt-get update
+      - run: DEBIAN_FRONTEND="noninteractive" apt-get install -y openjdk-11-jre
+      - run: apt-get install -y wget
+      - run: apt-get install -y unzip
+      - run: apt-get install -y awscli
+      - run: apt-get install -y jq
+      - run: mkdir -p /lib/snowplow/
+      - run: wget -P /lib/snowplow/ https://github.com/snowplow-incubator/igluctl/releases/download/0.8.0/igluctl_0.8.0.zip
+      - run: unzip /lib/snowplow/igluctl_0.8.0.zip
+      - run: chmod +x igluctl
+
+  setup-aws-profile:
+    description: configure aws profile to assume role
+    steps:
+      - run: aws --profile executor configure set aws_access_key_id ${AWS_ACCESS_KEY_ID}
+      - run: aws --profile executor configure set aws_secret_access_key ${AWS_SECRET_ACCESS_KEY}
+      - run: aws --profile executor configure set region 'us-east-1'
+      - run: aws --profile executor sts assume-role --role-arn arn:aws:iam::045466806556:role/snowflake_circleci_snowplow_schema_bucket_access --role-session-name "RoleSession1" > output.json
+      - run: aws --profile temp configure set aws_access_key_id $(jq -r '.Credentials.AccessKeyId' output.json)
+      - run: aws --profile temp configure set aws_secret_access_key $(jq -r '.Credentials.SecretAccessKey' output.json)
+      - run: aws --profile temp configure set aws_session_token $(jq -r '.Credentials.SessionToken' output.json)
+
+jobs:
+
+  lint:
+    description: Lint the project.
+    executor: igluctl
+    steps:
+      - setup-igluctl
+      - run: ./igluctl lint schemas/
+
+  pull:
+    description: pulls standard snowplow schema registry
+    executor: igluctl
+    steps:
+      - setup-igluctl
+      - run: ./igluctl static pull schemas/ iglucentral.acme.com/
+
+  upload_to_s3:
+    description: upload schema to circleci-snowplow s3 bucket.
+    executor: igluctl
+    steps:
+      - setup-igluctl
+      - setup-aws-profile
+      - run: ./igluctl static s3cp --profile temp --region us-east-1 schemas/ circleci-snowplow-schemas
+
+workflows:
+  commit:
+    jobs:
+      - lint:
+          context:
+            - dockerhub-readonly
+      - upload_to_s3:
+          context:
+            - snowplow
+          filters:
+            branches:
+              only:
+                - main
+          requires:
+            - lint

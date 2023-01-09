@@ -1,0 +1,101 @@
+version: 2.1
+
+executors:
+  integration:
+    machine:
+      image: ubuntu-2004:202101-01
+      docker_layer_caching: true
+      resource_class: xlarge
+
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+commands:
+jobs:
+  molecule-test:
+    executor: integration
+    parameters:
+      scenario:
+        type: string
+        default: "default"
+    steps:
+      - checkout
+      - run:
+          name: Run molecule test
+          no_output_timeout: 25m
+          command: |
+            docker run -ti --rm \
+              -v $PWD:/workdir \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -w /workdir/ \
+            quay.io/ansible/toolset:0.5 molecule test -s "<< parameters.scenario >>"
+
+  deploy:
+    executor: ccc
+    environment: &ccc-environment
+      NAME: stackstorm
+      IMAGE_NAME: circleci/st2packs
+      TWISTLOCK_ENFORCE: false #TODO: make this pass security scan
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: ecr
+      CONFIGURE_ECR_REPO: true
+      ECR_OWNER_TEAM: infra_eng
+      CUSTOM_CHART: chart
+      NAMESPACE: sre
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: helm dependency update ./chart
+      # Override some chart values with template that CCC expects
+      - run: cp chart/Chart.yaml /tmp/Chart.yaml
+      - run: /deploy/merge-values /tmp/Chart.yaml chart-CI-overrides.yml > chart/Chart.yaml
+      # Apply values now because CCC does not allow using custom values file with custom chart
+      - run: cp chart/values.yaml /tmp/values.yaml
+      - run: /deploy/merge-values /tmp/values.yaml values.prod.yml > chart/values.yaml
+      # Scan and dry-run
+      - run: publish
+      - run: deploy
+
+  dry-run:
+    executor: ccc
+    environment:
+      <<: *ccc-environment
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: helm dependency update ./chart
+      # Override some chart values with template that CCC expects
+      - run: cp chart/Chart.yaml /tmp/Chart.yaml
+      - run: /deploy/merge-values /tmp/Chart.yaml chart-CI-overrides.yml > chart/Chart.yaml
+      # Apply values now because CCC does not allow using custom values file with custom chart
+      - run: cp chart/values.yaml /tmp/values.yaml
+      - run: /deploy/merge-values /tmp/values.yaml values.prod.yml > chart/values.yaml
+      # Scan and dry-run
+      - run: scan
+      - run: /deploy/dry-run
+
+workflows:
+  version: 2
+  test-publish-deploy:
+    jobs:
+      - molecule-test:
+          matrix:
+            parameters:
+              scenario:
+                - default
+      - dry-run:
+          context: org-global
+          filters:
+            branches:
+              ignore: main
+#      - deploy:
+#          context: org-global
+#          filters:
+#            branches:
+#              only: main
+#          requires:
+#            - molecule-test

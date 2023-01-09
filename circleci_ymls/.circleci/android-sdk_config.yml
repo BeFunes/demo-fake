@@ -1,0 +1,20 @@
+version: 2
+jobs:
+  build:
+    environment:
+      TERM: dumb
+    docker:
+      - image: docker:stable-git
+    working_directory: /android-sdk
+    steps:
+      - checkout
+      - setup_docker_engine
+      - run:
+          name: Build Docker image
+          command: docker build -t marcomorain/android:0.$CIRCLE_BUILD_NUM .
+      - run:
+          name: Test Docker image
+          command: ./test.sh
+      - run:
+          name: Push Docker image
+          command: ./deploy.sh

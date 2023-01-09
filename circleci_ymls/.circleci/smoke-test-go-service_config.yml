@@ -1,0 +1,426 @@
+version: 2.1
+
+executors:
+  # go-service image is a Golang image that has convenience tooling (go,
+  # linters, task, etc) already installed. This image has a taskfile at
+  # /Taskfile_go_service_image.yml that has additional building-related tasks.
+  #
+  # See https://github.com/circleci/go-service-image for more information
+  go:
+    docker:
+      - image: circleci/go-service:0.1-dev
+        auth:
+          username: $RO_DOCKER_HUB_USERNAME
+          password: $RO_DOCKER_HUB_PASSWORD
+
+  # This executor is for testing migrations; if your service does not have a
+  # postgres database this is unncessary
+  postgres:
+    docker:
+      - image: circleci/flyway:0.1
+        auth:
+          username: $RO_DOCKER_HUB_USERNAME
+          password: $RO_DOCKER_HUB_PASSWORD
+        environment:
+          DATABASE_URL: "jdbc:postgresql://localhost:5432/smoke_test_db?user=smoke_test_user&password=smoke_test_pass"
+          DATABASE_MIGRATIONS: migrations/sql
+      - image: postgres:12-alpine
+        environment:
+          POSTGRES_USER: smoke_test_user
+          POSTGRES_DB: smoke_test_db
+          POSTGRES_PASSWORD: smoke_test_pass
+
+  # The CCC executor has commands for publishing/deploying the service
+  # See https://github.com/circleci/command-convenience-containers for more inforamation.
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          CONFIGURE_ECR_REPO: true
+          DOCKER_REGISTRY: ecr
+          ECR_OWNER_TEAM: Backplane
+
+jobs:
+  # Builds the service using the special go-service:build task. This is
+  # equivalent to the build task you might use for local development except that
+  # it also adds LDFLAGS for backplane-go
+  build-service:
+    executor: go
+    working_directory: ~/smoke-test-go-service/service
+    steps:
+      - checkout:
+          path: ~/smoke-test-go-service
+      - run: task go-service:build GO_BINARY_NAME=service
+      - persist_to_workspace:
+          root: .
+          paths:
+            - bin/service
+
+  build-client-service:
+    executor: go
+    working_directory: ~/smoke-test-go-service/client-service
+    steps:
+      - checkout:
+          path: ~/smoke-test-go-service
+      - run: task go-service:build GO_BINARY_NAME=client-service
+      - persist_to_workspace:
+          root: .
+          paths:
+            - bin/client-service
+
+  # Ensure the files being committed have been linted/gofmted, to reduce noise
+  # in PRs and keep code stylistically consistent
+  lint-service:
+    executor: go
+    working_directory: ~/smoke-test-go-service/service
+    steps:
+      - checkout:
+          path: ~/smoke-test-go-service
+      - run: task go-service:private-go-mod-init
+      - run: task lint
+      - run: task lint-go-mod
+
+  lint-client-service:
+    executor: go
+    working_directory: ~/smoke-test-go-service/client-service
+    steps:
+      - checkout:
+          path: ~/smoke-test-go-service
+      - run: task go-service:private-go-mod-init
+      - run: task lint
+      - run: task lint-go-mod
+
+  # Run the tests. Results are nicely formatted in a tab in the build UI.
+  test-service:
+    executor: go
+    working_directory: ~/smoke-test-go-service/service
+    steps:
+      - checkout:
+          path: ~/smoke-test-go-service
+      - run: task go-service:private-go-mod-init
+      - run: task ci:test RESULTS_DIR=/tmp/test-results
+      - store_test_results:
+          path: /tmp/test-results
+
+  test-client-service:
+    executor: go
+    working_directory: ~/smoke-test-go-service/client-service
+    steps:
+      - checkout:
+          path: ~/smoke-test-go-service
+      - run: task go-service:private-go-mod-init
+      - run: task ci:test RESULTS_DIR=/tmp/test-results
+      - store_test_results:
+          path: /tmp/test-results
+
+  # Test the SQL migrations in the service/migrations/sql folder
+  test-migrator:
+    executor:
+      name: postgres
+    working_directory: ~/smoke-test-go-service/service
+    steps:
+      - checkout:
+          path: ~/smoke-test-go-service
+      - run: run-migrations | tee /tmp/test-migrator-output && grep "Successfully applied 2 migrations" /tmp/test-migrator-output
+
+  # For non-production workflows that don't publish an image, still scan the
+  # image so CVEs are detected long before the merge into the main branch
+  scan-service:
+    executor:
+      name: ccc
+    environment:
+      NAME: smoke-test-go-service
+      GO_BINARY_PATH: bin/service
+      TWISTCLI_DEBUG: true
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: scan
+      - store_artifacts:
+          path: ccc-image-scan-results
+          destination: smoke-test-go-service/ccc-image-scan-results
+
+  scan-client-service:
+    executor:
+      name: ccc
+    environment:
+      NAME: smoke-test-go-client-service
+      GO_BINARY_PATH: bin/client-service
+      TWISTCLI_DEBUG: true
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: scan
+      - store_artifacts:
+          path: ccc-image-scan-results
+          destination: smoke-test-go-service/ccc-image-scan-results
+
+  # Build/lint the Helm chart and render it in the build output
+  dry-run-service:
+    executor: ccc
+    environment:
+      NAME: smoke-test-go-service
+      VALUES_FILE: service/values.yml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: /deploy/dry-run
+
+  dry-run-client-service:
+    executor: ccc
+    environment:
+      NAME: smoke-test-go-client-service
+      VALUES_FILE: client-service/values.yml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: /deploy/dry-run
+
+  # Run database migrations before updating the service
+  publish-deploy-migrator:
+    executor:
+      name: ccc
+    environment:
+      NAME: smoke-test-go-service-migrator
+      MIGRATIONS_SQL_PATH: migrations/sql
+      VALUES_FILE: migrations/sql/values.yml
+    working_directory: ~/smoke-test-go-service/service
+    steps:
+      - checkout:
+          path: ~/smoke-test-go-service
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: publish
+      - run: deploy
+
+  # Publishes the service image to ECR and deploys it to K8s
+  publish-deploy-service:
+    executor: ccc
+    environment:
+      NAME: smoke-test-go-service
+      GO_BINARY_PATH: bin/service
+      VALUES_FILE: service/values.yml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: publish
+      - run: deploy
+
+  publish-deploy-client-service:
+    executor: ccc
+    environment:
+      NAME: smoke-test-go-client-service
+      GO_BINARY_PATH: bin/client-service
+      VALUES_FILE: client-service/values.yml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Set correct Rollbar access token
+          command: |
+            echo "export ROLLBAR_ACCESS_TOKEN=$ROLLBAR_ACCESS_TOKEN_CLIENT_SERVICE" >> "${BASH_ENV}"
+      - attach_workspace:
+          at: .
+      - run: publish
+      - run: deploy
+
+  # Publishes a canary image to ECR and deploys it to K8s
+  # See the 'Canarying' section in the README for more information
+  publish-deploy-service-canary:
+    executor: ccc
+    environment:
+      NAME: smoke-test-go-service
+      DEPLOY_ENVIRONMENT: canary
+      GO_BINARY_PATH: bin/service
+      RELEASE_VERSION: canary
+      VALUES_FILE: service/canary.yml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: publish
+      - run: /deploy/merge-values service/values.yml service/canary-overrides.yml > service/canary.yml
+      - run: deploy
+
+  publish-deploy-client-service-canary:
+    executor: ccc
+    environment:
+      NAME: smoke-test-go-client-service
+      DEPLOY_ENVIRONMENT: canary
+      GO_BINARY_PATH: bin/client-service
+      RELEASE_VERSION: canary
+      VALUES_FILE: client-service/canary.yml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: publish
+      - run: /deploy/merge-values client-service/values.yml client-service/canary-overrides.yml > client-service/canary.yml
+      - run: deploy
+
+workflows:
+  deploy:
+    jobs:
+      - build-service:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - lint-service:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+          requires:
+            - build-service
+      - test-service:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+          requires:
+            - build-service
+      - test-migrator:
+          context:
+            - dockerhub-readonly
+      - dry-run-service:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - build-service
+          filters:
+            branches:
+              # diffs are included automatically by actual deploys
+              ignore:
+                - main
+                - canary
+      - scan-service:
+          requires:
+            - build-service
+          context:
+            - org-global
+            - github-readonly
+          filters:
+            branches:
+              # fret not, scans are run on main as part of the real publish
+              ignore:
+                - main
+                - canary
+      - publish-deploy-migrator:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - lint-service
+            - test-service
+            - test-migrator
+            - scan-service
+          filters:
+            branches:
+              only:
+                # Migrations aren't run for canaries because you can only roll forwards.
+                - main
+      - publish-deploy-service:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - publish-deploy-migrator
+            - lint-service
+            - lint-client-service
+            - test-service
+            - test-client-service
+            - test-migrator
+          filters:
+            branches:
+              only:
+                - main
+      - publish-deploy-service-canary:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - lint-service
+            - test-service
+            - test-migrator
+          filters:
+            branches:
+              only:
+                - canary
+
+
+      # Skip these jobs if you're using this config as a reference
+      # These are for the second service in this project and are clones of the jobs above
+      - build-client-service:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - lint-client-service:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+          requires:
+            - build-client-service
+      - test-client-service:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+          requires:
+            - build-client-service
+      - dry-run-client-service:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - build-client-service
+          filters:
+            branches:
+              ignore:
+                - main
+                - canary-client-service
+      - scan-client-service:
+          requires:
+            - build-client-service
+          context:
+            - org-global
+            - github-readonly
+          filters:
+            branches:
+              ignore:
+                - main
+                - canary-client-service
+      - publish-deploy-client-service:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - lint-service
+            - lint-client-service
+            - test-service
+            - test-client-service
+            - test-migrator
+          filters:
+            branches:
+              only:
+                - main
+      - publish-deploy-client-service-canary:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - lint-client-service
+            - test-client-service
+          filters:
+            branches:
+              only:
+                - canary-client-service

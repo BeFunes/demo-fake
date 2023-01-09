@@ -1,0 +1,51 @@
+version: 2.1
+orbs:
+  run-reality-checker-orb:
+    executors:
+      reality-check-executor:
+        docker:
+          # the Docker image with Cypress dependencies
+          - image: cypress/included:8.4.1
+            environment:
+              ## this enables colors in the output
+              TERM: xterm
+        working_directory: ~/reality-checker
+    jobs:
+      run_reality_check_tests:
+        description: This job runs reality-check against the test environment passed via environment variables
+        executor:
+          name: reality-check-executor
+        steps:
+          - run-reality-check
+    commands:
+      run-reality-check:
+        description: "A command to run reality-check against a test environment"
+        steps:
+          - checkout:
+              path: ~/reality-checker
+          - run:
+              name: Install packages and dependencies
+              command: npm install
+          - run:
+              name: Install latest CircleCi CLI within the project
+              command: |
+                rm -rf ~/utils
+                mkdir ~/utils
+                curl -fLSs https://raw.githubusercontent.com/CircleCI-Public/circleci-cli/master/install.sh | VERSION=0.1.9066 DESTDIR=~/utils/ bash
+          - run:
+              name: Run setup scipts
+              command: cypress run --spec "cypress/integration/setup/*.js"
+          - run:
+              name: Run reality-check
+              command: npm test
+          - store_test_results:
+              path: results/junit
+          - store_artifacts:
+              path: cypress/screenshots
+              destination: cypress/screenshots
+workflows:
+  build:
+    jobs:
+      - run-reality-checker-orb/run_reality_check_tests:
+          name: Trigger and validate reality-check
+          context: server-common

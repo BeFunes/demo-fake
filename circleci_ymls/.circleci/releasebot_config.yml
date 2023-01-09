@@ -1,0 +1,61 @@
+version: 2.1
+
+orbs:
+  gcp-cli: circleci/gcp-cli@1.8.4
+
+commands:
+  initialize:
+    steps:
+      - checkout
+      - run:
+          name: GCloud version
+          command: gcloud version
+      - gcp-cli/initialize
+
+
+jobs:
+  build:
+    docker:
+      - image: "gcr.io/google.com/cloudsdktool/cloud-sdk:latest"
+    steps:
+      - initialize
+      - run:
+          name: Build latest releasebot image & push to GCR
+          command: gcloud builds submit --tag gcr.io/oxbot-testing-k8s/releasebot .
+  deploy:
+    docker:
+      - image: "gcr.io/google.com/cloudsdktool/cloud-sdk:latest"
+    steps:
+      - initialize
+      - run:
+          name: Deploy latest releasebot to Google Cloud Run
+          command: |
+            gcloud run deploy releasebot \
+            --image gcr.io/oxbot-testing-k8s/releasebot \
+            --set-env-vars PROJECT_ID=oxbot-testing-k8s \
+            --min-instances 1 \
+            --region us-east1
+  test:
+    docker:
+      - image: "node:16.13-stretch"
+    steps:
+      - checkout
+      - run: npm install
+      - run: npm run test
+
+workflows:
+  version: 2
+  test-build-deploy-workflow:
+    jobs:
+      - test
+      - build:
+          context: releasebot-release
+          requires:
+            - test
+      - deploy:
+          context: releasebot-release
+          requires:
+            - build
+          filters:
+            branches:
+              only: main

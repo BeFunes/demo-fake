@@ -1,0 +1,68 @@
+version: 2.0
+jobs:
+  build:
+    docker:
+      - image: python:2.7
+    working_directory: /gordon-test
+    steps:
+      - checkout
+
+      - run:
+          command: pip install -r requirements.txt
+          name: Install dependencies
+
+#      - run: apt-get update
+#      - run: apt-get install java
+#
+#      - run: wget -O /tmp/selenium-server-standalone-2.45.0.jar "http://selenium-release.storage.googleapis.com/2.45/selenium-server-standalone-2.45.0.jar"
+#
+#      - run:
+#          command: java -jar /tmp/selenium-server-standalone-2.45.0.jar
+#          background: true
+
+      - run:
+          command: setsid python -m SimpleHTTPServer 8080
+          pwd: /gordon-test/server-root
+          background: true
+
+      - run:
+          name: make some files
+          command: |
+            mkdir -p /tmp/my_artifacts
+            echo "first artifact" > /tmp/my_artifacts/first
+            echo "second artifact" > /tmp/my_artifacts/second
+
+      - run: sleep 180
+
+      - store_artifacts:
+          path: /tmp/my_artifacts
+          destination: text-data
+
+  deploy:
+    docker:
+      - image: python:2.7
+    working_directory: /gordon-test
+    steps:
+      - run:
+          command: echo "deploying! (not really) "
+          pwd: /
+
+      - run: echo "Upstream artifacts in ${CIRCLE_UPSTREAM_ARTIFACTS}"
+
+      - run: find ${CIRCLE_UPSTREAM_ARTIFACTS}
+
+      - run: cat ${CIRCLE_UPSTREAM_ARTIFACTS}/build/0/text-data/first
+
+      - run: cat ${CIRCLE_UPSTREAM_ARTIFACTS}/build/0/text-data/second
+
+workflows:
+  version: 2
+  build-n-deploy:
+    jobs:
+      - build
+      - deploy:
+          filters:
+            branches:
+              only: /m.ster/
+          requires:
+            - build

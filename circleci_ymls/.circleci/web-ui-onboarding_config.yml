@@ -1,0 +1,230 @@
+version: 2.1
+orbs:
+  web-ui-orb: sandbox/web-ui-orb@5.0.1
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+  cypress: cypress-io/cypress@1.29.0
+
+parameters:
+  run-scheduled:
+    type: boolean
+    default: false
+  run-scheduled-vulnerability-scan:
+    type: boolean
+    default: false
+
+references:
+  version_js: &version_js 12
+  version_cypress: &version_cypress 1
+  optimizely_sdk_key: &optimizely_sdk_key GfYszBpMkefBSwiiEkH3b3
+  hostname: &hostname app.circleci.com
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+  cypressnode14: # https://github.com/cypress-io/cypress-docker-images/tree/master/base/14.18.1
+    docker:
+      - image: cypress/base:14.18.1
+    working_directory: /home/circleci/web-ui
+    resource_class: large
+
+jobs:
+  # validate third party config files
+  validate-configs:
+    docker:
+      - image: circleci/node:14
+    working_directory: /home/circleci/web-ui
+    steps:
+      - checkout
+      - run:
+          name: Renovate
+          command: npx -p renovate renovate-config-validator
+  e2e-tests:
+    executor: cypressnode14
+    steps:
+      - checkout
+      - web-ui-orb/restore-js-deps:
+          cache_version: *version_js
+      - web-ui-orb/restore-cypress:
+          cache_version: *version_cypress
+      - run:
+          name: Start mocked environment
+          # - Next doesn't support building a static dev version of the website.
+          # - MSW expects the service worker to be at the root of the base URL
+          # (localhost:3000/projects/mockServiceWorker.js).
+          # - `yarn build` moves the files from public/* to _next/static/:build-id/static/*.
+          #
+          # This forces us to use `yarn dev` to run cypress which compiles the files on
+          # the fly and makes cypress run very slow. Cypress default timeout has
+          # been increased to 1 minutes to deal with this issue.
+          # The only other alternative currently possible is to build a custom
+          # Next server that serves `mockServiceWorker.js` at the root directory.
+          # Maintaining this custom server is currently not worth it.
+          command: yarn dev
+          background: true
+      - run:
+          name: Wait-on localhost:3000
+          command: npx wait-on "http://localhost:3000/projects"
+      - run:
+            name: Run Cypress tests
+            command: CYPRESS_CACHE_FOLDER=/home/circleci/.cache/Cypress CYPRESS_baseUrl=http://localhost:3000 yarn cypress run
+      - store_artifacts:
+          path: cypress/videos
+
+workflows:
+  version: 2
+  build-test-and-deploy:
+    unless: << pipeline.parameters.run-scheduled >>
+
+    jobs:
+      - web-ui-orb/dependencies:
+          name: dependencies
+          context: web-ui-npm
+          cache_version_js_dependencies: *version_js
+          cache_version_cypress_dependencies: *version_cypress
+      - web-ui-orb/test:
+          name: test
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+      - web-ui-orb/chromatic-snapshot:
+          name: chromatic-snapshot
+          executor: web-ui-orb/node-browsers-large
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+      - e2e-tests:
+          requires:
+            - dependencies
+      - web-ui-orb/build-static:
+          name: build-static
+          cache_version_js_dependencies: *version_js
+          context: web-ui-onboarding
+          executor: web-ui-orb/node-large
+          filters:
+            branches:
+              ignore: master
+          requires:
+            - dependencies
+      - web-ui-orb/build-and-deploy-static:
+          cache_version_js_dependencies: *version_js
+          name: build-and-deploy-static
+          bucket_name: circleci-web-ui-onboarding-assets/projects
+          cdn_url: https://assets-onboarding.circleci.com/projects
+          build_dir: './.next'
+          context: [web-ui-onboarding, web-ui-npm, web-ui-datadog]
+          executor: web-ui-orb/node-large
+          filters:
+            branches:
+              only:
+                - master
+                - canary
+          requires:
+            - dependencies
+      - validate-configs
+      - web-ui-orb/build-and-publish-container:
+          name: publish
+          image_name: web-ui-onboarding
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: org-global
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-\d\..+/
+          requires:
+            - test
+            - build-and-deploy-static
+            - e2e-tests
+      - web-ui-orb/deploy-container:
+          name: deploy
+          image_name: web-ui-onboarding
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: org-global
+          filters:
+            branches:
+              only: master
+          requires:
+            - publish
+      - web-ui-orb/build-and-publish-container:
+          name: vulnerability-scan-docker-image
+          image_name: web-ui-onboarding
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: org-global
+          filters:
+            branches:
+              ignore: master
+          requires:
+            - test
+            - build-static
+      - web-ui-orb/build-and-publish-container:
+          name: publish-canary
+          image_name: web-ui-onboarding
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: org-global
+          filters:
+            branches:
+              only: canary
+          requires:
+            - test
+            - build-and-deploy-static
+            - e2e-tests
+      - web-ui-orb/deploy-container:
+          name: deploy-canary
+          image_name: web-ui-onboarding
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: org-global
+          release_version: canary
+          values_file: k8s-canary-values.yml
+          requires:
+            - publish-canary
+      - scotty-orb/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          promotion_component_list: 'circleci/web-ui-onboarding'
+          requires:
+            - publish
+
+  scheduled-vulnerability-scan:
+    # This schedule has been set using the new Scheduled Pipeline feature.
+    # Right now (09/2021) there is no UI to configure it, so if you need to
+    # change it's behavior, you'll have to do it manualy:
+    # https://circleci.atlassian.net/wiki/spaces/CD/pages/6301483319/Schedule+Pipelines+Migration#Other-methods
+    # See the "PATCH" section.
+    when: << pipeline.parameters.run-scheduled-vulnerability-scan >>
+
+    jobs:
+      - web-ui-orb/dependencies:
+          name: dependencies
+          context: web-ui-npm
+          cache_version_js_dependencies: *version_js
+          cache_version_cypress_dependencies: *version_cypress
+      - web-ui-orb/build-static:
+          name: build-static
+          cache_version_js_dependencies: *version_js
+          context: web-ui-onboarding
+          executor: web-ui-orb/node-large
+          filters:
+            branches:
+              only: master
+          requires:
+            - dependencies
+      - web-ui-orb/build-and-publish-container:
+          name: scheduled-vulnerability-scan-docker-image
+          image_name: web-ui-onboarding
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: org-global
+          filters:
+            branches:
+              only: master
+          requires:
+            - build-static

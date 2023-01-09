@@ -1,0 +1,320 @@
+version: 2.1
+
+orbs:
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+  tests:
+    environment:
+      POSTGRESQL__DATABASE__URI: "jdbc:postgresql://localhost:5432/webhook?user=webhook"
+      WEBHOOK_SERVICE__RABBITMQ__URI: "amqp://localhost:5672"
+      VAULT__URL: "http://localhost:8200"
+      VAULT__MOUNT__TRANSIT: transit
+    docker:
+      - image: circleci/clojure-service:0.7-dev
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+      - image: rabbitmq:3.7.11-management-alpine
+      - image: circleci/vault-cci:0.3.41-d8ee23c
+        environment:
+          SKIP_SETCAP: skip
+      - image: postgres:11.8
+        environment:
+          POSTGRES_USER: webhook
+          POSTGRES_DB: webhook
+          POSTGRES_HOST_AUTH_METHOD: trust
+
+commands:
+  with_cache:
+    parameters:
+      steps: { type: steps }
+    steps:
+      - restore_cache:
+          keys:
+            - maven-{{ checksum ".circleci/config.yml" }}-{{ checksum "project.clj" }}
+      - steps: << parameters.steps >>
+      - save_cache:
+          key: maven-{{ checksum ".circleci/config.yml" }}-{{ checksum "project.clj" }}
+          paths: ["~/.m2"]
+  run_migrations:
+    steps:
+      - run:
+          name: Run Migrations
+          command: |
+            flyway -n -X -url=jdbc:postgresql://localhost:5432/webhook?user=webhook -connectRetries=60 -locations=filesystem:sql migrate
+
+jobs:
+  check-schema:
+    docker:
+      - image: circleci/clojure-service:0.7-dev
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+      - image: postgres:11.8
+        environment:
+          POSTGRES_USER: webhook
+          POSTGRES_DB: webhook
+          POSTGRES_HOST_AUTH_METHOD: trust
+    steps:
+      - checkout
+      - run_migrations
+      - run:
+          name: Generate schema.sql
+          environment:
+            PG_DUMP_COMMAND: pg_dump -h localhost
+            DATABASE: webhook
+            PGUSER: webhook
+          command: |
+            apt-get update && apt-get install -y postgresql-client
+            sql/dump_schema.sh
+      - store_artifacts:
+          path: sql/schema.sql
+      - run:
+          name: Make sure schema.sql is up to date
+          command: |
+            if ! git diff --exit-code HEAD -- sql/schema.sql; then
+              echo "schema.sql is out of date!"
+              echo "Either:"
+              echo "- run sql/dump_schema.sh, or"
+              echo "- download the schema.sql artifact"
+              exit 1;
+            fi
+  test:
+    executor: tests
+    steps:
+      - checkout
+      - run_migrations
+      - with_cache:
+          steps:
+            - run:
+                command: |
+                  apt-get update && apt-get install --assume-yes --no-install-recommends jq
+                name: Install jq
+            - run: ./docker-entrypoint.sh kaocha
+      - store_test_results:
+          path: build
+  codecov:
+    executor: tests
+    steps:
+      - checkout
+      - run_migrations
+      - with_cache:
+          steps:
+            - run:
+                command: |
+                  apt-get update && apt-get install --assume-yes --no-install-recommends jq
+                name: Install jq
+            - run: ./docker-entrypoint.sh kaocha --plugin cloverage
+      - store_artifacts:
+          path: target/coverage
+      - run:
+          name: Upload Results
+          when: always
+          command: bash <(curl -s https://codecov.io/bash)
+  uberjar:
+    docker:
+      - image: circleci/clojure-service:0.7-dev
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    steps:
+      - checkout
+      - with_cache:
+          steps:
+            - run:
+                name: Build Uberjar
+                command: |
+                  lein uberjar
+                  cp -v target/webhook-service-*-standalone.jar target/webhook-service-standalone.jar
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target/webhook-service-standalone.jar
+  deploy-migrator:
+    executor:
+      name: ccc
+    environment:
+      NAME: webhook-service-migrator
+      DOCKER_REGISTRY: all
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/webhook-service-migrator
+      DEPLOY_TYPE: helm
+      MIGRATIONS_SQL_PATH: sql/migrations
+      VALUES_FILE: deploy/k8s-migrator-values.yml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: publish
+      - run: deploy
+  canary:
+    executor:
+      name: ccc
+    environment:
+      NAME: webhook-service
+      DOCKER_REGISTRY: all
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/webhook-service
+      DOCKERFILE_PATH: Dockerfile
+      RELEASE_VERSION: v1-canary
+      VALUES_FILE: deploy/canary.yml
+      ATOMIC_DEPLOY: true
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run: /deploy/merge-values deploy/k8s-values.yml deploy/k8s-canary-overrides.yml > deploy/canary.yml
+      - run: publish
+      - run: deploy
+  deploy:
+    executor:
+      name: ccc
+    environment:
+      NAME: webhook-service
+      DOCKER_REGISTRY: all
+      DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/webhook-service
+      DOCKERFILE_PATH: Dockerfile
+      VALUES_FILE: deploy/k8s-values.yml
+      ATOMIC_DEPLOY: true
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run: publish
+      - run: deploy
+  twistlock-check:
+    executor:
+      name: ccc
+    environment:
+      NAME: webhook-service
+      DOCKERFILE_PATH: Dockerfile
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run: scan
+  clj-fmt:
+    executor: tests
+    steps:
+      - checkout
+      - with_cache:
+          steps:
+            - run:
+                name: Checking formatting
+                command: lein cljfmt check
+  e2e-test:
+    docker:
+      - image: cimg/base:2021.05
+    steps:
+      - run:
+          name: Kick off pipeline in webhook-tests
+          command: |
+            curl -f -X POST -H Circle-Token:$CIRCLE_TOKEN https://circleci.com/api/v2/project/github/circleci/webhook-tests/pipeline | tee pipeline.json
+            pipeline_id=$(cat pipeline.json | jq '.id' -r)
+            pipeline_num=$(cat pipeline.json | jq '.number' -r)
+            sleep 5
+            workflow_id=$(curl -s -f -H Circle-Token:$CIRCLE_TOKEN https://circleci.com/api/v2/pipeline/$pipeline_id/workflow | jq -r '.items[0].id')
+            workflow_url=https://app.circleci.com/pipelines/github/circleci/webhook-tests/$pipeline_num/workflows/$workflow_id
+            # store some info for the next step because env vars don't transfer over
+            echo $workflow_id > workflow-id.txt
+            echo $workflow_url > workflow-url.txt
+            # print the URL of the workflow for easier correlation
+            echo
+            echo E2E test workflow:
+            echo $workflow_url
+      - run:
+          name: Wait for test workflow to finish
+          command: |
+            # recall pipeline info from last step
+            workflow_id=$(cat workflow-id.txt)
+            workflow_url=$(cat workflow-url.txt)
+
+            # poll the pipeline's workflows over and over and wait for the workflow to reach a terminal state
+            get_status () {
+              curl -s -S -H Circle-Token:$CIRCLE_TOKEN https://circleci.com/api/v2/workflow/$workflow_id | jq -r '.status'
+            }
+            while true; do
+              status=$(get_status)
+              echo "Workflow $workflow_id is $status"
+              if [[ $status == "success" ]]; then
+                echo $workflow_url
+                exit 0
+              elif [[ $status == "failed" || $status == "canceled" ]]; then
+                echo $workflow_url
+                exit 1
+              fi
+              sleep 3
+            done
+
+workflows:
+  deploy:
+    jobs:
+      - clj-fmt:
+          context: org-global
+      - test:
+          context: org-global
+      - codecov:
+          context: org-global
+      - check-schema:
+          context: org-global
+      - uberjar:
+          context: org-global
+      - twistlock-check:
+          context: org-global
+          requires:
+            - test
+            - uberjar
+            - check-schema
+          filters:
+            branches:
+              ignore: main
+      - canary:
+          context: org-global
+          requires:
+            - test
+            - uberjar
+            - check-schema
+          filters:
+            branches:
+              only: canary
+      - deploy-migrator:
+          context: org-global
+          requires:
+            - test
+            - uberjar
+            - check-schema
+          filters:
+            branches:
+              only: main
+      - deploy:
+          context: org-global
+          requires:
+            - test
+            - uberjar
+            - check-schema
+            - deploy-migrator
+          filters:
+            branches:
+              only: main
+      - scotty-orb/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          promotion_component_list: "circleci/webhook-service circleci/webhook-service-migrator"
+          requires:
+            - deploy
+          filters:
+            branches:
+              only: main
+      - e2e-test:
+          requires:
+            - deploy
+          filters:
+            branches:
+              only: main

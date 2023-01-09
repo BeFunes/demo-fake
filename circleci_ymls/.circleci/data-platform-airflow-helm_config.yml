@@ -1,0 +1,162 @@
+---
+version: 2.1
+
+references:
+    dir: &dir ~/data-platform
+
+executors:
+    ccc:
+        working_directory: *dir
+        docker:
+            - image: circleci/command-convenience:0.1
+              auth:
+                  username: $DOCKER_HUB_USER
+                  password: $DOCKER_HUB_PASSWORD
+              environment:
+                  NAME: cci-airflow
+                  IMAGE_NAME: circleci/data-platform-airflow
+                  DOCKER_REGISTRY: ecr
+                  NAMESPACE: data
+                  DOCKERFILE_PATH: "./Dockerfile"
+                  HELM_CHART: "airflow-stable/airflow"
+                  UPSTREAM_CHART_VERSION: "8.6.0"
+                  CUSTOM_CHART: charts/airflow
+                  TWISTLOCK_ENFORCE: false
+    python:
+        docker:
+            - image: python:3.10
+        environment:
+            POETRY_VIRTUALENVS_PATH: /virtualenvs/envs
+            POETRY_CACHE_DIR: /virtualenvs/cache
+
+commands:
+    setup-python-dependencies:
+        description: Setup the python environment for testing and linting
+        steps:
+            - checkout
+            - restore_cache:
+                keys:
+                    - poetry-cache-v3-{{ arch }}-{{ .Branch }}-{{ checksum "poetry.lock" }}
+                    - poetry-cache-v3-{{ arch }}-{{ .Branch }}
+                    - poetry-cache-v3
+            - run: echo "export PATH=$HOME/.poetry/bin:$PATH" >> $BASH_ENV
+            - run: curl -sSL https://raw.githubusercontent.com/python-poetry/poetry/master/get-poetry.py | python -
+            - run: poetry install --no-root
+            - save_cache:
+                  key: poetry-cache-v3-{{ arch }}-{{ .Branch }}-{{ checksum "poetry.lock" }}
+                  paths: /virtualenvs
+
+    initialize:
+        description: Initial CI setup before CCC runs
+        parameters:
+            values_file:
+                type: string
+        steps:
+            - checkout
+            - setup_remote_docker
+            # Fetch upstream chart
+            - run: helm repo add airflow-stable https://airflow-helm.github.io/charts
+            - run: helm repo update
+            - run: helm fetch --untar --version "${UPSTREAM_CHART_VERSION}" --destination charts "${HELM_CHART}"
+            # Override some chart values with template that CCC expects
+            - run: cp charts/airflow/Chart.yaml /tmp/Chart.yaml
+            - run: /deploy/merge-values /tmp/Chart.yaml chart-CI-overrides.yml > charts/airflow/Chart.yaml
+            # Apply values now because CCC does not allow using custom values file with custom chart
+            - run: cp charts/airflow/values.yaml /tmp/values.yaml
+            - run: /deploy/merge-values values/values.yaml values/<< parameters.values_file >> > /tmp/overidden-values.yaml
+            - run: /deploy/merge-values /tmp/values.yaml /tmp/overidden-values.yaml > charts/airflow/values.yaml
+
+jobs:
+    lint:
+        executor: python
+        steps:
+            - setup-python-dependencies
+            - run: poetry run pylint airflow_dags
+    test:
+        executor: python
+        steps:
+            - setup-python-dependencies
+            - run: poetry run pytest
+    deploy:
+        executor: ccc
+        parameters:
+            environment:
+                type: string
+            namespace:
+                type: string
+        environment:
+            NAMESPACE: << parameters.namespace >>
+            RELEASE_VERSION: << parameters.environment >>
+        steps:
+            - initialize:
+                  values_file: "<< parameters.environment >>-values-overrides.yaml"
+            - run: publish
+            - run: deploy
+    dry-run:
+        executor: ccc
+        parameters:
+            environment:
+                type: string
+            namespace:
+                type: string
+        environment:
+            NAMESPACE: << parameters.namespace >>
+            RELEASE_VERSION: << parameters.environment >>
+        steps:
+            - initialize:
+                  values_file: "<< parameters.environment >>-values-overrides.yaml"
+            - run: scan
+            - run: /deploy/dry-run
+workflows:
+    commit:
+        jobs:
+            # lint, test, and scan
+            - lint
+            - test
+
+            # staging and dev deploy
+            - deploy:
+                  name: deploy-staging
+                  environment: staging
+                  namespace: data-staging
+                  context: org-global
+                  requires:
+                      - lint
+                      - test
+                  filters:
+                      branches:
+                          only:
+                              - master
+                              - dev
+            - dry-run:
+                  name: dry-run-staging
+                  environment: staging
+                  namespace: data-staging
+                  context: org-global
+                  filters:
+                      branches:
+                          ignore:
+                              - master
+                              - dev
+
+            # prod deploy
+            - deploy:
+                  environment: prod
+                  namespace: data
+                  context: org-global
+                  requires:
+                      - lint
+                      - test
+                  filters:
+                      branches:
+                          only:
+                              - master
+            - dry-run:
+                  environment: prod
+                  namespace: data
+                  context: org-global
+                  filters:
+                      branches:
+                          ignore:
+                              - master
+                              - dev

@@ -1,0 +1,86 @@
+version: 2.1
+
+parameters:
+  chart-version:
+    description: "The Helm chart version to use"
+    type: string
+    # renovate: registryUrl=https://honeycombio.github.io/helm-charts depName=honeycomb
+    default: "1.5.0"
+
+workflows:
+  version: 2
+  main:
+    jobs:
+      - helm-diff:
+          context: org-global
+          filters:
+            branches:
+              ignore: main
+      - helm-upgrade:
+          context: org-global
+          filters:
+            branches:
+              only: main
+
+
+commands:
+  setup-helm:
+    description: "Set up Helm"
+    steps:
+      - aws-eks/update-kubeconfig-with-authenticator:
+          cluster-name: cci-prod-a
+      - run: "chmod 0600 ~/.kube/config"
+      - helm/install-helm-client:
+          version: v3.8.0
+      - run: "helm repo add honeycomb https://honeycombio.github.io/helm-charts"
+      - run: "helm repo update"
+
+jobs:
+  helm-diff:
+    docker:
+      - image: cimg/python:3.10
+    steps:
+      - checkout
+      - setup-helm
+      - run:
+          command: |
+            curl -fL -o helm-diff.tar.gz "https://github.com/databus23/helm-diff/releases/download/v3.4.0/helm-diff-linux-amd64.tgz"
+            echo "d41074aaa7bffb39f4bda5bd633bc597f8c741d99500cb71da9e82679dfd3e05 helm-diff.tar.gz" | sha256sum -c --strict --check
+            mkdir -p ~/.local/share/helm/plugins
+            tar -C ~/.local/share/helm/plugins -zxf helm-diff.tar.gz
+      - run:
+          command: |
+            helm diff upgrade honeycomb honeycomb/honeycomb \
+              --context 3 \
+              --no-color \
+              --suppress Secret \
+              --install \
+              --namespace sre \
+              --reset-values \
+              -f ./values.yaml \
+              --version << pipeline.parameters.chart-version >> | tee helm-upgrade.diff
+      - run:
+          command: |
+            scripts/post-helm-diff-to-github helm-upgrade.diff
+
+  helm-upgrade:
+    docker:
+      - image: cimg/python:3.10
+    steps:
+      - checkout
+      - setup-helm
+      - run:
+          no_output_timeout: 20m
+          command: |
+            helm upgrade honeycomb honeycomb/honeycomb \
+              --install \
+              --namespace sre \
+              --reset-values \
+              -f ./values.yaml \
+              --atomic \
+              --timeout 15m0s \
+              --version << pipeline.parameters.chart-version >>
+
+orbs:
+  aws-eks: circleci/aws-eks@2.2.0
+  helm: circleci/helm@1.2.0

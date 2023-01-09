@@ -1,0 +1,14 @@
+version: 2.1
+
+jobs:
+  echo-test:
+    docker:
+      - image: cimg/go:1.17
+    parallelism: 1
+    steps:
+      - run: "circleci tests split"
+
+workflows:
+  test:
+    jobs:
+      - echo-test

@@ -1,0 +1,286 @@
+version: 2.1
+
+commands:
+  check-smc-test:
+    description: "Check the Haiku from within macOS VM"
+    steps:
+      - run:
+          name: Run SMC check
+          command: strings /System/Library/Extensions/Dont\ Steal\ Mac\ OS\ X.kext/Contents/MacOS/Dont\ Steal\ Mac\ OS\ X
+  python-perf:
+    description: "Download and run a Python 3 through pyenv, and time the build for benchmarking"
+    parameters:
+      version:
+        default: "3.7.13"
+        type: string
+    steps:
+      - run:
+          name: Install dependencies for python-perf
+          command: |
+            brew install bzip2 lbzip2 lzlib openssl zlib pyenv || true
+      - run:
+          name: Time build for building python
+          command: bash benchmarks/install-python-pyenv.sh << parameters.version >>
+      - store_artifacts:
+          path: python-<< parameters.version >>-time.txt
+  benchmark-git-clone:
+    steps:
+      - run:
+          name: Benchmark Git Clone
+          command: |
+            time git clone https://github.com/mozilla-mobile/firefox-ios
+            du -sh firefox-ios
+  version-info:
+    steps:
+      - checkout
+      - run: 
+          name: Brew version
+          command: brew -v
+      - run:
+          name: OS Version Check
+          command: sw_vers
+      - run:
+          name: Check IP
+          command: ifconfig | grep 'inet '
+      - run: 
+          name: Xcode Version
+          command: xcodebuild -version
+  check-disk:
+    steps:
+      - run:
+          name: Diskutil & df
+          command: diskutil list && df -h
+  test-disk-io:
+    steps:
+      # - run:
+      #     name: Benchmark read & write
+      #     command: |
+      #         write=$(dd if=/dev/zero bs=2048k of=tstfile count=1024 2>&1 | grep sec | awk '{print $1 / 1024 / 1024 / $5, "MB/sec" }')
+      #         read=$(dd if=tstfile bs=2048k of=/dev/null count=1024 2>&1 | grep sec | awk '{print $1 / 1024 / 1024 / $5, "MB/sec" }')
+      #         echo "---------------------"
+      #         echo "Read Speed is: $read"
+      #         echo "Write Speed is: $write"
+      #         echo "---------------------"
+        - run:
+            name: Install python@3.9
+            command: |
+                brew install python@3.9 || true
+                brew link --force python@3.9 || true
+        - run:
+            name: Run disk speed check
+            command: |
+                python3 benchmarks/disk.py
+  test-vmware-tools:
+    steps:
+      - run:
+          name: VMware Tools CLI
+          command: /Library/Application\ Support/VMware\ Tools/vmware-tools-cli -v
+  test-xcode-build:
+    steps: # a series of commands to run
+      - run:
+          # run our tests using xcode's cli tool `xcodebuild`
+          name: Run Unit Tests
+          command: xcodebuild test -scheme circleci-demo-macos
+      - run:
+          # build our application
+          name: Build Application
+          command: xcodebuild
+      - run:
+          name: Compress app for storage
+          command: zip -r app.zip build/Release/circleci-demo-macos.app
+      - run:
+          name: Version Check
+          command: sw_vers
+      - run:
+          name: Check IP
+          command: ifconfig | grep 'inet '
+      - run: 
+          name: Xcode Version
+          command: xcodebuild -version
+      - store_artifacts:
+          path: app.zip
+          destination: app
+  test-cocoapod:
+    steps:
+      - run:
+          name: Check dir
+          command: ls -la ~/
+      - run:
+          name: Check dir
+          command: ls -la ~/.cocoapods/
+      - run:
+          name: Check config
+          command: cat ~/.cocoapods/config.yaml
+  test-certs:
+    steps:
+      - run: 
+          name: List all certs - Distiller
+          command: security find-certificate -a
+      - run:
+          name: List all certs - Sudo
+          command: sudo security find-certificate -a
+      - run:
+          name: Check certs - AppleWWDR
+          command: sudo security find-certificate -a -c "Apple Worldwide"
+      - run:
+          name: Check expiration dates
+          command: sudo security find-certificate -c "Apple Worldwide Developer Relations Certification Authority" -p | openssl x509 -text | grep "Not After"
+
+jobs:
+  dc_fleet_test:
+    parameters:
+      image-version:
+        type: string
+      resource:
+        type: string
+      parallel-level:
+        type: integer
+    macos:
+      xcode: << parameters.image-version >>
+    resource_class: << parameters.resource >>
+    parallelism: << parameters.parallel-level >>
+    steps:
+      - checkout
+      - check-disk
+      - test-disk-io
+      - version-info
+  dh_fleet_test:
+    parameters:
+      image-version:
+        type: string
+      resource:
+        type: string
+    macos:
+      xcode: << parameters.image-version >>
+    resource_class: << parameters.resource >>
+    steps:
+      - checkout
+      - check-disk
+      - test-disk-io
+      - version-info
+  latest-dc:
+    parameters:
+      image-version:
+        type: string
+      parallel-level:
+        type: integer
+    macos:
+      xcode: << parameters.image-version >>
+    resource_class: macos.x86.medium.gen2
+    parallelism: << parameters.parallel-level >>
+    steps:
+      - checkout
+      - check-smc-test
+      - version-info
+      - check-disk
+      - test-disk-io
+      - python-perf
+      - benchmark-git-clone
+  internal-medium-dc-test-13-2-1:
+    macos:
+      xcode: "13.2.1"
+    resource_class: macos.medium.test
+    parallelism: 4
+    steps:
+      - checkout
+      - check-smc-test
+      - version-info
+      - check-disk
+      - test-disk-io
+      - python-perf
+  internal-latest:
+    macos:
+      xcode: "13.3.1"
+    resource_class: macos.medium.test
+    parallelism: 1
+    steps:
+      - checkout
+      - check-smc-test
+      - version-info
+      - check-disk
+      - test-disk-io
+      - python-perf
+      - benchmark-git-clone
+  latest-dh:
+    macos:
+      xcode: "13.3"
+    resource_class: macos.x86.metal.gen1
+    steps:
+      - checkout
+      - check-disk
+      - test-disk-io
+      - version-info
+      # - test-xcode-build # Temporary comment out until codesigning on DH is fixed
+  placeholder:
+    docker:
+      - image: cimg/base:2021.04
+    steps:
+      - run: 
+          name: Date
+          command: date
+  medium:
+    docker:
+      - image: cimg/base:2021.04
+    steps:
+      - run: 
+          name: Date
+          command: date
+  large:
+    docker:
+      - image: cimg/base:2021.04
+    steps:
+      - run: 
+          name: Date
+          command: date
+  gen2:
+    docker:
+      - image: cimg/base:2021.04
+    steps:
+      - run: 
+          name: Date
+          command: date
+
+workflows:
+  test-all-images:
+    jobs:
+      - latest-dc:
+          image-version: "13.3"
+          parallel-level: 10
+      - gen2
+      - dc_fleet_test:
+          requires:
+            - gen2
+          matrix:
+            alias: "dc_fleet_test_gen2"
+            parameters:
+              resource: ["macos.x86.medium.gen2"]
+              image-version: ["13.3", "13.2", "13.1", "13.0", "12.5", "12.4", "12.3", "12.2", "12.1", "12.0", "11.7", "11.6", "11.5", "11.4", "10.3"]
+              parallel-level: [1]
+      - medium
+      - dc_fleet_test:
+          requires:
+            - medium
+          matrix:
+            alias: "dc_fleet_test_medium"
+            parameters:
+              resource: ["medium"]
+              image-version: ["13.3", "13.2", "13.1", "13.0", "12.5", "12.4", "12.3", "12.2", "12.1", "12.0", "11.7", "11.6", "11.5", "11.4", "10.3"]
+              parallel-level: [1]
+      - large
+      - dc_fleet_test:
+          requires:
+            - large
+          matrix:
+            alias: "dc_fleet_test_large"
+            parameters:
+              resource: ["large"]
+              image-version: ["13.3", "13.2", "13.1", "13.0", "12.5", "12.4", "12.3", "12.2", "12.1", "12.0", "11.7", "11.6", "11.5", "11.4", "10.3"]
+              parallel-level: [1]
+      # - latest-dh
+      # Takes 10 Hours to execute, use with caution.
+      # - dh_fleet_test:
+      #     matrix:
+      #       parameters:
+      #         resource: [macos.x86.metal.gen1]
+      #         image-version: ["13.3.0", "13.2.1", "13.1.0", "13.0.0", "12.5.1", "12.4.0", "12.3.0", "12.2.0", "12.1.1", "12.0.1", "11.7.0", "11.6.0", "11.5.0", "11.4.1"]
+      

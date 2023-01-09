@@ -1,0 +1,306 @@
+version: 2.1
+
+orbs:
+  shellcheck: circleci/shellcheck@1.3.3
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+
+references:
+  restore-m2-cache: &restore-m2-cache
+    restore_cache:
+      keys:
+        - v1-jars-{{ checksum "project.clj" }}
+        - v1-jars-
+  save-m2-cache: &save-m2-cache
+    save_cache:
+      key: v1-jars-{{ checksum "project.clj" }}
+      paths:
+        - /root/.m2
+  download-dependencies: &download-dependencies
+    run:
+      name: Download dependencies
+      command: lein deps
+  configuration: &configuration
+    POSTGRESQL__DB__URI: jdbc:postgresql://localhost:5432/cron_service?user=cron_service
+    CRON_SERVICE__CONSUMER_RABBITMQ__URI: "amqp://guest:guest@localhost:5672"
+    CRON_SERVICE__CONSUMER_RABBITMQ__QUEUE_NAME: "cron-service"
+    CRON_SERVICE__MISFIRE_THRESHOLD_MILLISECONDS: "6000"
+    CRON_SERVICE__MAX_DELAY_MINUTES: "1"
+    CRON_SERVICE__PRODUCER_RABBITMQ__URI: "amqp://guest:guest@localhost:5672"
+    HEALTH_CHECK_PORT: "4261"
+  database-image: &database-image
+    image: postgres:12-alpine
+    environment:
+      POSTGRES_USER: cron_service
+      POSTGRES_DB: cron_service
+      POSTGRES_PASSWORD: cron_service_password
+  run-database-migrations: &run-database-migrations
+    run:
+      name: Run database migrations
+      command: |
+        dockerize -wait tcp://localhost:5432 -timeout 1m
+        flyway -url=jdbc:postgresql://localhost:5432/cron_service -user=cron_service -locations=filesystem:migrator/sql migrate
+
+jobs:
+  test:
+    docker:
+      - image: circleci/clojure-service:0.5-dev
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+      - image: rabbitmq:3.6-management-alpine
+      - *database-image
+    working_directory: /code
+    environment:
+      LEIN_ROOT: "true"
+      JVM_OPTS: -Xmx1024m
+    steps:
+      - checkout
+      - *restore-m2-cache
+      - *download-dependencies
+      - *save-m2-cache
+      - *run-database-migrations
+      - run:
+          name: Run tests
+          command: |
+            lein test \
+              --plugin kaocha.plugin/junit-xml \
+              --junit-xml-file target/test-results/results.xml
+          environment:
+            <<: *configuration
+      - store_test_results:
+          path: target/test-results
+      - store_artifacts:
+          path: target/test-results
+          destination: raw-test-results
+
+  code-coverage:
+    docker:
+      - image: circleci/clojure-service:0.5-dev
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+      - image: rabbitmq:3.6-management-alpine
+      - *database-image
+    working_directory: /code
+    environment:
+      LEIN_ROOT: "true"
+      JVM_OPTS: -Xmx1024m
+    steps:
+      - checkout
+      - *restore-m2-cache
+      - *download-dependencies
+      - *save-m2-cache
+      - *run-database-migrations
+      - run:
+          name: Generate code coverage
+          command: lein with-profile dev,test cloverage --ns-exclude-regex dev --ns-exclude-regex user --codecov
+          environment:
+            <<: *configuration
+      - store_artifacts:
+          path: target/coverage
+          destination: raw-coverage-data
+      - run:
+          name: Upload code coverage report to codecov.io
+          command: |
+            curl --include --verbose --request POST --header 'Accept: text/plain' --data-binary @target/coverage/codecov.json "https://codecov.io/upload/v2?service=circleci&token=$CODECOV_TOKEN&commit=$CIRCLE_SHA1&branch=$CIRCLE_BRANCH&build=$CIRCLE_BUILD_NUM&job=$CIRCLE_NODE_INDEX&build_url=$CIRCLE_BUILD_URL&slug=$CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME&pr=${CI_PULL_REQUEST##*/}"
+
+  build-uberjar:
+    docker:
+      - image: circleci/clojure-service:0.5-dev
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    working_directory: /code
+    steps:
+      - checkout
+      - *restore-m2-cache
+      - run: lein uberjar
+      - *save-m2-cache
+      - run: mv target/cron-service-*-standalone.jar target/cron-service-standalone.jar
+      - persist_to_workspace:
+          root: .
+          paths: target/cron-service-standalone.jar
+
+  vulnerability-scan:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: cron-service
+          DOCKER_REGISTRY: none
+          DEPLOY_CLOJURE_JARFILE: target/cron-service-standalone.jar
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run:
+          command: publish
+
+  publish-service:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: cron-service
+          DOCKER_REGISTRY: all
+          DEPLOY_TYPE: helm
+          DEPLOY_CLOJURE_JARFILE: target/cron-service-standalone.jar
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/cron-service
+          VALUES_FILE: k8s-values.yml
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run:
+          name: Helm publish
+          command: publish
+      - run: mv docker_image.tag docker_image.service.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.service.tag
+
+  deploy-service:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: cron-service
+          DOCKER_REGISTRY: all
+          DEPLOY_TYPE: helm
+          DEPLOY_CLOJURE_JARFILE: target/cron-service-standalone.jar
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/cron-service
+          VALUES_FILE: k8s-values.yml
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run: mv docker_image.service.tag docker_image.tag
+      - setup_remote_docker
+      - run:
+          name: Helm deploy
+          command: deploy
+
+  publish-migrator:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: cron-service-migrator
+          DOCKER_REGISTRY: all
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/cron-service-migrator
+          DOCKERFILE_PATH: /root/project/migrator/Dockerfile
+          VALUES_FILE: migrator/k8s-values.yml
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run:
+          name: Publish docker image to ECR and Dockerhub
+          command: cd migrator && publish
+      - run: mv migrator/docker_image.tag docker_image.migrator.tag
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.migrator.tag
+
+  deploy-migrator:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: cron-service-migrator
+          DOCKER_REGISTRY: all
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/cron-service-migrator
+          MIGRATIONS_SQL_PATH: migrator/sql
+          VALUES_FILE: migrator/k8s-values.yml
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - setup_remote_docker
+      - run: mv docker_image.migrator.tag docker_image.tag
+      - run:
+          name: Helm deploy
+          command: deploy
+
+workflows:
+  version: 2
+  build:
+    jobs:
+      - shellcheck/check:
+          path: scripts/
+          pattern: '*'
+      - test:
+          context: org-global
+      - code-coverage:
+          context: org-global
+      - build-uberjar:
+          context: org-global
+      - publish-service:
+          context: org-global
+          requires:
+            - build-uberjar
+            - test
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-\d\..+/
+      - vulnerability-scan:
+          context: org-global
+          requires:
+            - build-uberjar
+          filters:
+            branches:
+              ignore:
+                - master
+                - /^server-\d\..+/
+      - deploy-service:
+          context: org-global
+          requires:
+            - publish-service
+            - deploy-migrator
+          filters:
+            branches:
+              only:
+                - master
+      - publish-migrator:
+          context: org-global
+          requires:
+            - test
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-\d\..+/
+      - deploy-migrator:
+          context: org-global
+          requires:
+            - publish-migrator
+          filters:
+            branches:
+              only:
+                - master
+      - scotty-orb/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          promotion_component_list: "circleci/cron-service circleci/cron-service-migrator"
+          requires:
+            - publish-service
+            - publish-migrator

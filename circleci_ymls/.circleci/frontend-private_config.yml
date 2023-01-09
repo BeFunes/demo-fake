@@ -1,0 +1,733 @@
+version: 2.0
+
+references:
+
+  container_config: &container_config
+    docker:
+      - image: clojure:lein-2.8.1
+    working_directory: /root/frontend
+
+  workspace_root: &workspace_root
+    /tmp/workspace
+
+  attach_workspace: &attach_workspace
+    attach_workspace:
+      at: *workspace_root
+
+  restore_repo: &restore_repo
+    restore_cache:
+      keys:
+        - v3-repo-{{ .Branch }}-{{ .Revision }}
+        - v3-repo-{{ .Branch }}
+        - v3-repo
+
+
+  js_deps_cache_key: &js_deps_cache_key
+    v10-dependency-js-deps-{{ checksum "yarn.lock" }}
+  js_deps_backup_cache_key: &js_deps_backup_cache_key
+    v10-dependency-js-deps
+
+  restore_js_deps: &restore_js_deps
+    restore_cache:
+      keys:
+        - *js_deps_cache_key
+        - *js_deps_backup_cache_key
+
+  jars_cache_key: &jars_cache_key
+    v8-dependency-jars-{{ checksum "project.clj" }}
+  jars_backup_cache_key: &jars_backup_cache_key
+    v8-dependency-jars
+
+  restore_jars: &restore_jars
+    restore_cache:
+      keys:
+        - *jars_cache_key
+        - *jars_backup_cache_key
+
+  eslint_rules_deps_cache_key: &eslint_rules_deps_cache_key
+    v1-dependency-eslint-rules-{{ checksum "eslint-rules/yarn.lock" }}
+  eslint_rules_deps_backup_cache_key: &eslint_rules_deps_backup_cache_key
+    v1-dependency-eslint-rules
+
+  restore_eslint_rules_deps: &restore_eslint_rules_deps
+    restore_cache:
+      keys:
+        - *eslint_rules_deps_cache_key
+        - *eslint_rules_deps_backup_cache_key
+
+jobs:
+  checkout_code:
+    <<: *container_config
+    steps:
+      - *restore_repo
+      - checkout
+
+      # create complete setup_project.cljs file, so it can be saved to the source cache for downstream jobs
+      - add_ssh_keys:
+          fingerprints: "f2:12:32:86:f2:20:74:1e:4e:f1:61:d6:40:67:e7:85"
+
+      - run:
+          name: git config
+          command: |
+            git config --global user.email "$CIRCLE_USERNAME@users.noreply.github.com"
+            git config --global user.name "$CIRCLE_USERNAME"
+
+      - run:
+          name: pull in onboarding templates from picard-templates
+          command: |
+            git clone git@github.com:circleci/picard-templates.git
+
+      - run:
+          name: generate yaml oneliners
+          working_directory: picard-templates
+          command: |
+            # replace newlines with the newline string literal \n
+            # use a weird delimiter, like %, because we're likely to add all kinds of chars to these templates
+
+            # generate yaml oneliners
+            for file in ./*.yml; do
+              echo "file: $file"
+              name=$(echo "$file" | sed -e 's%.yml%%')
+              echo "name: $name"
+              touch "$name-oneline"
+              bash /root/frontend/generate-oneline-yaml.sh "$file" > "$name-oneline"
+            done
+
+      - run:
+          name: replace placeholder text with full one-line yaml templates
+          command: |
+            bash replace-placeholder-yaml.sh \
+              "# Clojure CircleCI 2.0 Configuration File" \
+              picard-templates/clojure-oneline \
+              src-cljs/frontend/components/setup_project.cljs
+
+            bash replace-placeholder-yaml.sh \
+              "# Elixir CircleCI 2.0 Configuration File" \
+              picard-templates/elixir-oneline \
+              src-cljs/frontend/components/setup_project.cljs
+
+            bash replace-placeholder-yaml.sh \
+              "# Golang CircleCI 2.0 Configuration File" \
+              picard-templates/golang-oneline \
+              src-cljs/frontend/components/setup_project.cljs
+
+            bash replace-placeholder-yaml.sh \
+              "# Java Gradle CircleCI 2.0 Configuration File" \
+              picard-templates/java_gradle-oneline \
+              src-cljs/frontend/components/setup_project.cljs
+
+            bash replace-placeholder-yaml.sh \
+              "# Java Maven CircleCI 2.0 Configuration File" \
+              picard-templates/java_maven-oneline \
+              src-cljs/frontend/components/setup_project.cljs
+
+            bash replace-placeholder-yaml.sh \
+              "# Javascript Node CircleCI 2.0 Configuration File" \
+              picard-templates/node-oneline \
+              src-cljs/frontend/components/setup_project.cljs
+
+            bash replace-placeholder-yaml.sh \
+              "# PHP CircleCI 2.0 Configuration File" \
+              picard-templates/php-oneline \
+              src-cljs/frontend/components/setup_project.cljs
+
+            bash replace-placeholder-yaml.sh \
+              "# Python CircleCI 2.0 Configuration File" \
+              picard-templates/python-oneline \
+              src-cljs/frontend/components/setup_project.cljs
+
+            bash replace-placeholder-yaml.sh \
+              "# Ruby CircleCI 2.0 Configuration File" \
+              picard-templates/ruby-oneline \
+              src-cljs/frontend/components/setup_project.cljs
+
+            bash replace-placeholder-yaml.sh \
+              "# Scala CircleCI 2.0 Configuration File" \
+              picard-templates/scala-oneline \
+              src-cljs/frontend/components/setup_project.cljs
+
+            bash replace-placeholder-yaml.sh \
+              "# iOS CircleCI 2.0 Configuration File" \
+              picard-templates/ios-oneline \
+              src-cljs/frontend/components/setup_project.cljs
+
+            bash replace-placeholder-yaml.sh \
+              "# Default CircleCI 2.0 Configuration File" \
+              picard-templates/other-oneline \
+              src-cljs/frontend/components/setup_project.cljs
+
+            bash replace-placeholder-yaml.sh \
+              "# .NET CircleCI 2.0 Configuration File" \
+              picard-templates/dotnet-oneline \
+              src-cljs/frontend/components/setup_project.cljs
+
+      - run:
+          name: delete picard-templates dir so it doesn't get cached
+          command: rm -rf picard-templates
+
+      - store_artifacts:
+          path: /root/frontend/src-cljs/frontend/components/setup_project.cljs
+
+      - save_cache:
+          key: v3-repo-{{ .Branch }}-{{ .Revision }}
+          paths:
+            - .
+
+  clojure_dependencies:
+    <<: *container_config
+    steps:
+      - *restore_repo
+      - *restore_jars
+      - run:
+          command: lein deps
+      - save_cache:
+          key: *jars_cache_key
+          paths:
+            - /root/.m2
+
+  js_dependencies:
+    <<: *container_config
+    docker:
+      - image: node:10.22.0
+    steps:
+      - *restore_repo
+      - *restore_js_deps
+      - run:
+          name: 'Check for vulnerabilities'
+          command: |
+            set +e
+            yarn audit
+            EXIT_CODE=$?
+            if [ "$EXIT_CODE" -lt "16" ]; then
+              echo "No dependencies with CRITICAL severity or greater found"
+              exit 0
+            else
+              echo "Dependencies with CRITICAL severity or greater found"
+              exit $EXIT_CODE
+            fi
+      - run:
+          name: yarn dependencies
+          command: yarn install --frozen-lockfile
+      - save_cache:
+          key: *js_deps_cache_key
+          paths:
+            - /root/frontend/node_modules
+      - run:
+          name: install eslint rules dependencies
+          working_directory: /root/frontend/eslint-rules
+          command: yarn install
+      - save_cache:
+          key: *eslint_rules_deps_cache_key
+          paths:
+            - /root/frontend/eslint-rules/node_modules
+
+  js_format_check:
+    <<: *container_config
+    docker:
+      - image: node:10.22.0
+    steps:
+      - *restore_repo
+      - *restore_js_deps
+      - *restore_eslint_rules_deps
+      - run:
+          name: reinstall eslint rules
+          command: yarn run reinstall-eslint-rules
+      - run:
+          name: lint
+          command: yarn lint
+
+  js_flow_check:
+    <<: *container_config
+    docker:
+      - image: node:10.22.0
+    steps:
+      - *restore_repo
+      - *restore_js_deps
+      - run:
+          name: update schema
+          command: yarn get-schema
+      - run:
+          name: generate types
+          command: yarn get-types
+      - run:
+          name: static type check
+          command: yarn flow
+
+  js_test:
+    <<: *container_config
+    docker:
+      - image: node:10.22.0
+        environment:
+          JEST_JUNIT_OUTPUT: ./junit/jest/junit.xml
+    resource_class: xlarge
+    steps:
+      - *attach_workspace
+      - *restore_repo
+      - *restore_js_deps
+      - *restore_eslint_rules_deps
+      - run:
+          name: Restore compiled cljs from workspace
+          command: |
+            set -exu
+            mkdir -p resources/public/cljs
+            mv /tmp/workspace/compiled-cljs/* resources/public/cljs/
+      - run:
+          name: run js tests
+          # no need to build cljs here because it has already been built
+          command: yarn test-ci
+      - run:
+          name: run eslint rules tests
+          working_directory: /root/frontend/eslint-rules
+          command: yarn jest
+      - store_test_results:
+          path: junit
+      - run:
+          name: upload js code coverage
+          # note: 'root' is set to src-js in the package.json file
+          command: |
+            curl -fivX POST -H 'Accept: text/plain' \
+            --data-binary @coverage/coverage-final.json \
+            "https://codecov.io/upload/v2\
+            ?service=circleci\
+            &token=$CODECOV_TOKEN\
+            &commit=$CIRCLE_SHA1\
+            &branch=$CIRCLE_BRANCH\
+            &build=$CIRCLE_BUILD_NUM\
+            &job=$CIRCLE_NODE_INDEX\
+            &build_url=$CIRCLE_BUILD_URL\
+            &slug=$CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME\
+            &pr=$CIRCLE_PR_NUMBER" || true
+  #  Percy was bought by Browserstack and the authentication method changed. No one currently has access to approve changes.
+  #  Removing this build step temporarily so we can deploy.
+  #percy_snapshot:
+  #  <<: *container_config
+  #  docker:
+  #    - image: node:10.22.0
+  #  steps:
+  #    - *attach_workspace
+  #    - *restore_repo
+  #    - *restore_js_deps
+  #    - run:
+  #        name: Restore compiled cljs from workspace
+  #        command: |
+  #          set -exu
+  #          mkdir -p resources/public/cljs/
+  #          mv /tmp/workspace/compiled-cljs/* resources/public/cljs/
+  #    - run:
+  #        name: build storybook
+  #        command: STORYBOOK_PERCY=1 yarn build-storybook-ci
+  #    - run:
+  #        name: generate and upload storybook snapshots to Percy.io
+  #        command: yarn percy-storybook --widths=1280 --debug
+
+  js_build:
+    <<: *container_config
+    docker:
+      - image: node:10.22.0
+    steps:
+      - *restore_repo
+      - *restore_js_deps
+      - run:
+          name: Build development js bundle
+          command: yarn build-dev
+      - run:
+          name: Build production js bundle
+          command: yarn build
+      - run:
+          name: Move compiled js to workspace
+          command: |
+            set -exu
+            mkdir -p /tmp/workspace/compiled-js
+            mv resources/public/js/* /tmp/workspace/compiled-js/
+      - persist_to_workspace:
+          root: *workspace_root
+          paths:
+            - compiled-js
+
+  clojure_test:
+    <<: *container_config
+    steps:
+      - *restore_repo
+      - *restore_jars
+      - run:
+          name: lein test
+          command: lein test
+
+  cljs_test:
+    docker:
+      - image: docker:latest
+        environment:
+          IMAGE_TAG: ci-testing-image
+    working_directory: /root/frontend
+    steps:
+      - setup_remote_docker:
+          docker_layer_caching: true
+      # This is necessary because the docker:latest image doesn't have gnu tar
+      - run:
+          name: Install tar
+          command: |
+            set -x
+            apk update
+            apk add tar
+      - *attach_workspace
+      - *restore_repo
+      - *restore_jars
+      - *restore_js_deps
+      - run:
+          name: Restore compiled cljs from workspace
+          command: |
+            set -exu
+            mkdir -p resources/public/cljs
+            mv /tmp/workspace/compiled-cljs/test resources/public/cljs/
+      - run:
+          name: run tests
+          command: |
+            set -x
+            docker build -t "$IMAGE_TAG" ci-testing-image
+            CONTAINER_NAME=$(docker create --security-opt seccomp=unconfined $IMAGE_TAG bash -c 'cd /root/frontend && lein doo chrome-headless-no-sandbox test once' --rm)
+            docker cp . "$CONTAINER_NAME:/root/frontend"
+            docker cp /root/.m2/. "$CONTAINER_NAME:/root/.m2"
+            docker start -a $CONTAINER_NAME
+
+  cljsbuild_whitespace:
+    <<: *container_config
+    steps:
+      - *restore_repo
+      - *restore_jars
+      - run:
+          name: cljsbuild whitespace
+          command: lein cljsbuild once whitespace
+      - run:
+          name: Move compiled cljs to workspace
+          command: |
+            set -exu
+            mkdir -p /tmp/workspace/compiled-cljs
+            mv resources/public/cljs/whitespace /tmp/workspace/compiled-cljs/
+      - persist_to_workspace:
+          root: *workspace_root
+          paths:
+            - compiled-cljs/whitespace
+
+  cljsbuild_production:
+    <<: *container_config
+    steps:
+      - *restore_repo
+      - *restore_jars
+      - run:
+          name: cljsbuild production
+          command: lein cljsbuild once production
+      - run:
+          name: Move compiled cljs to workspace
+          command: |
+            set -exu
+            mkdir -p /tmp/workspace/compiled-cljs
+            mv resources/public/cljs/production /tmp/workspace/compiled-cljs/
+      - persist_to_workspace:
+          root: *workspace_root
+          paths:
+            - compiled-cljs/production
+      - store_artifacts:
+          path: /tmp/workspace/compiled-cljs/production/frontend.js.map
+
+  build_storybook_static:
+    <<: *container_config
+    docker:
+      - image: node:10.22.0
+    steps:
+      - *attach_workspace
+      - *restore_repo
+      - *restore_jars
+      - *restore_js_deps
+      - run:
+          name: Restore compiled cljs from workspace
+          command: |
+            set -exu
+            mkdir -p resources/public/cljs
+            mv /tmp/workspace/compiled-cljs/* resources/public/cljs/
+      - run:
+          name: Build storybook static assets
+          command: |
+            yarn run build-storybook*
+      - run:
+          name: Move storybook assets to workspace
+          command: |
+            set -exu
+            mv storybook-static /tmp/workspace/
+      - persist_to_workspace:
+          root: *workspace_root
+          paths:
+            - storybook-static
+
+  cljsbuild_test:
+    <<: *container_config
+    steps:
+      - *restore_repo
+      - *restore_jars
+      - run:
+          name: cljsbuild test
+          command: lein cljsbuild once test
+      - run:
+          name: Move compiled cljs to workspace
+          command: |
+            set -exu
+            mkdir -p /tmp/workspace/compiled-cljs
+            mv resources/public/cljs/test /tmp/workspace/compiled-cljs/
+      - persist_to_workspace:
+          root: *workspace_root
+          paths:
+            - compiled-cljs/test
+
+  precompile_assets:
+    <<: *container_config
+    steps:
+      - *attach_workspace
+      - *restore_repo
+      - *restore_jars
+      - *restore_js_deps
+      - run:
+          name: Restore compiled cljs from workspace
+          command: |
+            set -exu
+            mkdir -p resources/public/cljs
+            mv /tmp/workspace/compiled-cljs/* resources/public/cljs/
+      - run:
+          name: Restore compiled js from workspace
+          command: |
+            set -exu
+            mkdir -p resources/public/js
+            mv /tmp/workspace/compiled-js/* resources/public/js/
+      - run:
+          name: Install node/npm
+          command: |
+            curl -sL https://deb.nodesource.com/setup_4.x | bash -
+            apt-get install -y nodejs
+      - run:
+          name: precompile assets
+          command: |
+            source ~/.bashrc
+            lein run -m frontend.tasks.http/precompile-assets
+      - run:
+          name: Move compiled assets to workspace
+          command: mv resources /tmp/workspace/assets
+
+      - persist_to_workspace:
+          root: *workspace_root
+          paths:
+            - assets
+
+  upload:
+    docker:
+      - image: python:2.7
+        environment:
+          BUILD_JSON_PATH: integration-test-build.json
+    working_directory: /root/frontend
+    steps:
+      - *attach_workspace
+      - *restore_repo
+      - run:
+          name: Restore compiled assets from workspace
+          command: |
+            rm -r resources
+            mv /tmp/workspace/assets resources
+      - run:
+          name: Restore storybook assets from workspace
+          command: |
+            rm -rf storybook-static
+            mv /tmp/workspace/storybook-static storybook-static
+      - add-ssh-keys
+      - run:
+          name: Install AWS CLI
+          command: pip install awscli
+      - run:
+          name: deploy and trigger integration tests
+          command: |
+            set -ex
+            ssh-add -D
+            script/upload.sh
+
+  deploy:
+    docker:
+      - image: python:2.7
+        environment:
+          BUILD_JSON_PATH: integration-test-build.json
+    working_directory: /root/frontend
+    steps:
+      - *attach_workspace
+      - *restore_repo
+      - run:
+          name: Restore compiled assets from workspace
+          command: |
+            rm -r resources
+            mv /tmp/workspace/assets resources
+      - run:
+          name: Restore storybook assets from workspace
+          command: |
+            rm -rf storybook-static
+            mv /tmp/workspace/storybook-static storybook-static
+      - add-ssh-keys
+      - run:
+          name: Install AWS CLI
+          command: pip install awscli
+      - run:
+          name: deploy and trigger integration tests
+          command: |
+            set -ex
+            ssh-add -D
+            script/deploy.sh
+      - run:
+          name: Update Rollbar
+          command: script/rollbar.sh
+      - run:
+          name: Deploy storybook to S3 if tests pass and branch is Master
+          command: script/deploy-storybook.sh
+      - store_artifacts:
+          path: /tmp/workspace/compiled-cljs/production/frontend.js.map
+
+  upload-server-assets:
+    docker:
+      - image: python:2.7
+        environment:
+          BUILD_JSON_PATH: integration-test-build.json
+    working_directory: /root/frontend
+    steps:
+      - *attach_workspace
+      - *restore_repo
+      - run:
+          name: Restore compiled assets from workspace
+          command: |
+            rm -r resources
+            mv /tmp/workspace/assets resources
+      - add-ssh-keys
+      - run:
+          name: Install AWS CLI
+          command: pip install awscli
+      - run:
+          name: deploy and trigger integration tests
+          command: |
+            set -ex
+            ssh-add -D
+            script/upload-server-assets.sh
+
+workflows:
+  version: 2
+
+  build_test_deploy:
+    jobs:
+      - checkout_code
+      - js_dependencies:
+          requires:
+            - checkout_code
+      - js_format_check:
+          requires:
+            - js_dependencies
+      - js_flow_check:
+          requires:
+            - js_dependencies
+      - js_test:
+          requires:
+            - cljsbuild_production
+            - js_dependencies
+      # - percy_snapshot:
+      #    requires:
+      #      - cljsbuild_production
+      #      - js_dependencies
+      - js_build:
+          requires:
+            - js_dependencies
+      - clojure_dependencies:
+          requires:
+            - checkout_code
+      - clojure_test:
+          requires:
+            - js_dependencies
+            - clojure_dependencies
+            - checkout_code
+      - cljs_test:
+          requires:
+            - js_dependencies
+            - clojure_dependencies
+            - checkout_code
+            - cljsbuild_test
+      - cljsbuild_test:
+          requires:
+            - js_dependencies
+            - clojure_dependencies
+            - checkout_code
+      - cljsbuild_whitespace:
+          requires:
+            - js_dependencies
+            - clojure_dependencies
+            - checkout_code
+      - cljsbuild_production:
+          requires:
+            - js_dependencies
+            - clojure_dependencies
+            - checkout_code
+      - build_storybook_static:
+          requires:
+            - js_dependencies
+            - clojure_dependencies
+            - checkout_code
+            - cljsbuild_production
+          filters:
+            branches:
+              only: master
+      - precompile_assets:
+          requires:
+            - js_build
+            - clojure_dependencies
+            - cljsbuild_whitespace
+            - cljsbuild_production
+            - checkout_code
+      - upload:
+          requires:
+            - build_storybook_static
+            - precompile_assets
+            - js_flow_check
+            - js_format_check
+            - js_test
+            - cljs_test
+            - clojure_test
+            - checkout_code
+          filters:
+            branches:
+              only: master
+      - deploy:
+          requires:
+            - build_storybook_static
+            - precompile_assets
+            - js_flow_check
+            - js_format_check
+            - js_test
+            - cljs_test
+            - clojure_test
+            - checkout_code
+          filters:
+            branches:
+              only: master
+
+        upload-server-assets:
+          requires:
+            - build_storybook_static
+            - precompile_assets
+            # - js_flow_check
+            - js_format_check
+            - js_test
+            - cljs_test
+            - clojure_test
+            - checkout_code
+          filters:
+            branches:
+              only:
+                - /server-.*/
+dependencies:
+  post:
+    - lein cljsbuild once whitespace test production
+    - lein run -m frontend.tasks.http/precompile-assets
+
+
+test:
+  pre:
+    - git grep --color TODO | cat
+  post:
+    - lein doo chrome test once

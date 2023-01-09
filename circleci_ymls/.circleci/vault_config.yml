@@ -1,0 +1,292 @@
+---
+version: 2.1
+
+orbs:
+  aws-cli: circleci/aws-cli@3.1.1
+  path-filtering: circleci/path-filtering@0.1.2
+  continuation: circleci/continuation@0.2.0
+
+parameters:
+  run-setup:
+    type: boolean
+    default: true
+  run-vault-configuration:
+    type: boolean
+    default: false
+  run-vault-ctl:
+    type: boolean
+    default: false
+  run-vault-image-scan:
+    type: boolean
+    default: false
+  run-vault-image-publish-and-deploy:
+    type: boolean
+    default: false
+  verbosity:
+    description: Verbosity of Molecule output (higher is more verbose)
+    type: integer
+    default: 0
+
+setup: << pipeline.parameters.run-setup >>
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: cci-prod-vault
+          RELEASE_VERSION: a
+          MAJOR_VERSION: 1.10
+          DOCKER_REGISTRY: ecr
+          NAMESPACE: vault
+          DOCKERFILE_PATH: "./Dockerfile"
+          HELM_REPO: "https://helm.releases.hashicorp.com"
+          HELM_CHART: "vault"
+          UPSTREAM_CHART_VERSION: "0.20.1"
+          CUSTOM_CHART: charts/vault
+          TWISTLOCK_ENFORCE: false
+          CONFIGURE_ECR_REPO: true
+          ECR_OWNER_TEAM: InfraEng
+    working_directory: ~/src/kubernetes
+  integration:
+    machine:
+      image: ubuntu-2004:202107-02
+      docker_layer_caching: true
+    resource_class: xlarge
+  terraform:
+    docker:
+      - image: circleci/terraform:1.1.9-circle2
+        environment:
+          TF_VAR_vault_endpoint: https://cci-prod-vault-a.circleci.com:8200
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    shell: /bin/bash -eo pipefail -o nounset
+    working_directory: ~/src/configuration
+
+commands:
+  initialize:
+    description: Initial CI setup before CCC runs
+    steps:
+      - checkout:
+          path: ~/src
+      - setup_remote_docker
+      # Fetch upstream chart
+      - run: helm repo add hashicorp "${HELM_REPO}"
+      - run: helm repo update
+      - run: |
+          helm fetch \
+            --untar \
+            --version "${UPSTREAM_CHART_VERSION}" \
+            --destination charts \
+            "hashicorp/${HELM_CHART}"
+      - run:
+          name: generate Chart.yaml
+          command: |
+            /deploy/merge-values charts/vault/Chart.yaml chart-CI-overrides.yaml > /tmp/Chart.yaml
+            mv /tmp/Chart.yaml charts/vault/Chart.yaml
+      - run:
+          name: generate values.yaml
+          command: |
+            /deploy/merge-values charts/vault/values.yaml values.yaml values-CI-overrides.yaml > /tmp/values.yaml
+            mv /tmp/values.yaml charts/vault/values.yaml
+  install-go:
+    description: Install go
+    steps:
+      - run: apk --no-cache update
+      - run: apk --no-cache add go
+  login-to-vault:
+    steps:
+      - run:
+          name: Login to Vault
+          command: vault write -address=https://cci-prod-vault-a.circleci.com:8200 -field=token auth/circleci/login role=vault jwt="${CIRCLE_OIDC_TOKEN}" > ~/.vault-token
+
+jobs:
+  deploy:
+    executor: ccc
+    steps:
+      - initialize
+      - run: publish
+      - run: deploy
+  dry-run:
+    executor: ccc
+    steps:
+      - initialize
+      - run: scan
+      - run: /deploy/dry-run
+  molecule-test:
+    executor: integration
+    parameters:
+      scenario:
+        type: string
+        default: default
+    steps:
+      - checkout
+      - aws-cli/setup:
+          aws-access-key-id: ECR_AWS_ACCESS_KEY_ID
+          aws-secret-access-key: ECR_AWS_SECRET_ACCESS_KEY
+          profile-name: privaterepo
+      - run:
+          name: Log into ECR
+          command: |
+            aws --profile privaterepo ecr get-login-password \
+              --region us-east-1 | \
+            docker login \
+              --username AWS \
+              --password-stdin \
+              "https://183081753049.dkr.ecr.us-east-1.amazonaws.com"
+      - run:
+          name: Run molecule test
+          no_output_timeout: 25m
+          command: |
+            docker run -ti --rm \
+              -e MOLECULE_VERBOSITY=<< pipeline.parameters.verbosity >> \
+              -v $PWD:$PWD \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -w $PWD \
+            183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/ansible:5.7 molecule test \
+              --destroy never \
+              -s "<< parameters.scenario >>"
+  test-go:
+    executor: ccc
+    steps:
+      - checkout
+      - install-go
+      - run:
+          name: Unit test vaultctl
+          working_directory: ~/src/kubernetes/vaultctl
+          no_output_timeout: 2m
+          command: go test ./...
+  roll-cluster:
+    executor: ccc
+    steps:
+      - checkout
+      - install-go
+      - run:
+          name: Roll vault cluster using vaultctl
+          working_directory: ~/src/kubernetes/vaultctl
+          no_output_timeout: 10m
+          command: |
+            AWS_ACCESS_KEY_ID="${EKS_AWS_ACCESS_KEY_ID}" \
+            AWS_SECRET_ACCESS_KEY="${EKS_AWS_SECRET_ACCESS_KEY}" \
+            go run ./ rollCluster -n vault -N cci-prod-vault-a --vault-image-regex=".*vault"
+  custom-path-filtering:
+    parameters:
+      config-path:
+        default: .circleci/continue_config.yml
+        description: |
+          The location of the config to continue the pipeline with.
+        type: string
+      base-revision:
+        default: main
+        description: |
+          The revision to compare the current one against for the purpose of determining changed files.
+        type: string
+      mapping:
+        default: ""
+        description: |
+          Mapping of path regular expressions to pipeline parameters and values. One mapping per line, whitespace-delimited.
+        type: string
+    executor: path-filtering/default
+    steps:
+      - checkout
+      - path-filtering/set-parameters:
+          base-revision: << parameters.base-revision >>
+          mapping: << parameters.mapping >>
+          output-path: "/tmp/pipeline-parameters.json"
+      - run:
+          name: update pipeline-parameters
+          command: |
+            jq '{"run-setup": false} + .' /tmp/pipeline-parameters.json > /tmp/merged-pipeline-parameters.json
+      - continuation/continue:
+          configuration_path: << parameters.config-path >>
+          parameters: /tmp/merged-pipeline-parameters.json
+
+  terraform:
+    executor: terraform
+    circleci_ip_ranges: true
+    steps:
+      - checkout:
+          path: ~/src
+      - login-to-vault
+      - run:
+          name: terraform fmt
+          command: terraform fmt -check -diff -recursive
+      - run:
+          name: Running Terraform plan and apply
+          command: ./scripts/run-terraform.sh
+
+workflows:
+  setup:
+    when:
+      and:
+        - not:
+            equal: [main, << pipeline.git.branch >>]
+        - << pipeline.parameters.run-setup >>
+    jobs:
+      - custom-path-filtering:
+          config-path: .circleci/config.yml
+          mapping: |
+            .circleci/config.yml run-vault-configuration true
+            configuration/.* run-vault-configuration true
+            .circleci/config.yml run-vault-ctl true
+            molecule/.* run-vault-ctl true
+            vaultctl/.* run-vault-ctl true
+            .circleci/config.yml run-vault-image-scan true
+            kubernetes/.* run-vault-image-scan true
+  setup-main:
+    when:
+      and:
+        - equal: [main, << pipeline.git.branch >>]
+        - << pipeline.parameters.run-setup >>
+    jobs:
+      # set-parameters command will use the previous merged commit to compare with the HEAD commit to detect changes if head and base branch are the same.
+      # https://github.com/CircleCI-Public/path-filtering-orb/blob/main/src/scripts/create-parameters.py#L38-L42
+      - custom-path-filtering:
+          config-path: .circleci/config.yml
+          mapping: |
+            .circleci/config.yml run-vault-configuration true
+            configuration/.* run-vault-configuration true
+            .circleci/config.yml run-vault-image-publish-and-deploy true
+            kubernetes/.* run-vault-image-publish-and-deploy true
+
+  vault-image-scan:
+    when: << pipeline.parameters.run-vault-image-scan >>
+    jobs:
+      - dry-run:
+          context:
+            - org-global
+            - infra-admin-deploy
+  vault-image-publish-and-deploy:
+    when: << pipeline.parameters.run-vault-image-publish-and-deploy >>
+    jobs:
+      - deploy:
+          context:
+            - org-global
+            - infra-admin-deploy
+      - roll-cluster:
+          context: org-global
+          requires:
+            - deploy
+  vault-ctl:
+    when: << pipeline.parameters.run-vault-ctl >>
+    jobs:
+      - test-go:
+          context: org-global
+      - molecule-test:
+          context: org-global
+          matrix:
+            parameters:
+              scenario:
+                - default
+  vault-configuration:
+    when: << pipeline.parameters.run-vault-configuration >>
+    jobs:
+      - terraform:
+          context:
+            - org-global
+            - terraform
+            - vault

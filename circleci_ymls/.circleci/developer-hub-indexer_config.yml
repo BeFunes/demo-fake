@@ -1,0 +1,444 @@
+version: 2.1
+
+orbs:
+  go: circleci/go@1.7.0
+  aws-cli: circleci/aws-cli@2.0.3
+
+parameters:
+  index:
+    description: Index to populate/update.
+    default: ""
+    type: string
+
+commands:
+  datadog:
+    steps:
+      - when:
+          condition:
+            equal: [ << pipeline.git.branch >>, main ]
+          steps:
+            - run:
+                name: Send metric to Datadog
+                command: |
+                  curl  -X POST -H "Content-type: application/json" \
+                  --data "{
+                        \"title\": \"Successful Developer Hub Indexing\",
+                        \"text\": \"The developer hub was successfully indexed at `date`\",
+                        \"priority\": \"normal\",
+                        \"tags\": [
+                          \"repository:$CIRCLE_PROJECT_REPONAME\",
+                          \"job:$CIRCLE_JOB\",
+                          \"type:index\"
+                        ],
+                        \"alert_type\": \"success\",
+                        \"source_type_name\": \"CIRCLECI\",
+                        \"aggregation_key\": \"dev_hub_indexing\"
+                  }" \
+                  "https://app.datadoghq.com/api/v1/events?api_key=$DATADOG_API_KEY"
+
+jobs:
+  build:
+    docker:
+      - image: cimg/go:1.17
+    steps:
+      - checkout
+      - go/load-cache
+      - go/mod-download
+      - go/save-cache
+      - run:
+          name: Build indexer binary
+          command: go build -ldflags "-s -w" -o dev-indexer cmd/main.go
+      - persist_to_workspace:
+          root: .
+          paths: ["."]
+  test:
+    docker:
+      - image: cimg/go:1.17
+    steps:
+      - checkout
+      - go/load-cache
+      - go/mod-download
+      - go/save-cache
+      - run:
+          name: Test indexer components
+          command: go test ./...
+
+  index-docker-images:
+    parameters:
+      env:
+        type: enum
+        description: "Whether to run in development or production mode."
+        default: "development"
+        enum: ["development", "production"]
+    machine:
+      image: ubuntu-2004:202201-02
+    resource_class: large
+    parallelism: 15
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Run Docker indexer
+          environment:
+            INDEXER_ENVIRONMENT: <<parameters.env>>
+          command: |
+            # This job runs against either the dev or the production index depending on the provided context
+
+            # Log in to dockerhub to reduce rate limiting
+            echo $DOCKERHUB_PASSWORD | docker login --username $DOCKERHUB_USERNAME --password-stdin
+            IMAGE_NAME=''
+            if [[ "${CIRCLE_NODE_INDEX}" == 0 ]]
+            then
+              IMAGE_NAME=cimg/go
+            elif [[ "${CIRCLE_NODE_INDEX}" == 1 ]]
+            then
+              IMAGE_NAME=cimg/python
+            elif [[ "${CIRCLE_NODE_INDEX}" == 2 ]]
+            then
+              IMAGE_NAME=cimg/node
+            elif [[ "${CIRCLE_NODE_INDEX}" == 3 ]]
+            then
+              IMAGE_NAME=cimg/openjdk
+            elif [[ "${CIRCLE_NODE_INDEX}" == 4 ]]
+            then
+              IMAGE_NAME=cimg/rust
+            elif [[ "${CIRCLE_NODE_INDEX}" == 5 ]]
+            then
+              IMAGE_NAME=cimg/ruby
+            elif [[ "${CIRCLE_NODE_INDEX}" == 6 ]]
+            then
+              IMAGE_NAME=cimg/php
+            elif [[ "${CIRCLE_NODE_INDEX}" == 7 ]]
+            then
+              IMAGE_NAME=cimg/elixir
+            elif [[ "${CIRCLE_NODE_INDEX}" == 8 ]]
+            then
+              IMAGE_NAME=cimg/base
+            elif [[ "${CIRCLE_NODE_INDEX}" == 9 ]]
+            then
+              IMAGE_NAME=cimg/android
+            elif [[ "${CIRCLE_NODE_INDEX}" == 10 ]]
+            then
+              IMAGE_NAME=cimg/postgres
+            elif [[ "${CIRCLE_NODE_INDEX}" == 11 ]]
+            then
+              IMAGE_NAME=cimg/redis
+            elif [[ "${CIRCLE_NODE_INDEX}" == 12 ]]
+            then
+              IMAGE_NAME=cimg/mysql
+            elif [[ "${CIRCLE_NODE_INDEX}" == 13 ]]
+            then
+              IMAGE_NAME=cimg/mariadb
+            elif [[ "${CIRCLE_NODE_INDEX}" == 14 ]]
+            then
+              IMAGE_NAME=cimg/clojure
+            fi
+            echo "Analyzing image ${IMAGE_NAME}"
+            ./dev-indexer --index-docker --item=${IMAGE_NAME}
+      - datadog
+
+  index-orbs:
+    parameters:
+      env:
+        type: enum
+        description: "Whether to run in development or production mode."
+        default: "development"
+        enum: [ "development", "production" ]
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - attach_workspace:
+          at: .
+      - restore_cache:
+          keys: ["orb-index-v3"]
+      - run:
+          name: Run orb indexer
+          environment:
+            INDEXER_ENVIRONMENT: <<parameters.env>>
+          command: ./dev-indexer --index-orb
+      - save_cache:
+          key: orb-index-v3
+          paths:
+            - ./orb-cache.json
+      - datadog
+
+  index-machine-images:
+    parameters:
+      env:
+        type: enum
+        description: "Whether to run in development or production mode."
+        default: "development"
+        enum: [ "development", "production" ]
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Run machine indexer
+          environment:
+            INDEXER_ENVIRONMENT: <<parameters.env>>
+          command: ./dev-indexer --index-machine
+      - datadog
+
+  index-sample-apps:
+    parameters:
+      env:
+        type: enum
+        description: "Whether to run in development or production mode."
+        default: "development"
+        enum: [ "development", "production" ]
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Run sample project indexer
+          environment:
+            INDEXER_ENVIRONMENT: <<parameters.env>>
+          command: ./dev-indexer --index-sample
+      - datadog
+
+  # Meta jobs, e.g uploading images, backing up indexes.
+  backup_index:
+    docker:
+      - image: cimg/node:14.17.6
+        environment:
+          YARN_CACHE_FOLDER: /home/circleci/project/.cache
+    parameters:
+      index-name:
+        description: Index name to export
+        type: string
+        default: ""
+    steps:
+      - run:
+          name: Install algolia-cli
+          command: sudo npm install -g @algolia/cli
+      - run:
+          name: Export index settings
+          command: |
+            algolia getsettings \
+              -a $ALGOLIA_APP_ID \
+              -k $ALGOLIA_API_KEY \
+              -n << parameters.index-name >> \
+              > index_settings.json
+      - run:
+          name: Check exported index settings
+          command: |
+            cat index_settings.json
+            CHECK_RESULT=$(cat index_settings.json | jq '.ranking | length > 0')
+            if [ "$CHECK_RESULT" != "true" ]; then
+              echo "Verification of $ALGOLIA_INDEX_NAME index's settings failed."
+              exit 1
+            fi
+      - store_artifacts:
+          path: ~/project/index_settings.json
+      - run:
+          name: Export index data
+          command: |
+            algolia export \
+              -a $ALGOLIA_APP_ID \
+              -k $ALGOLIA_API_KEY \
+              -n << parameters.index-name >>
+      - run:
+          name: Check exported index data
+          command: |
+            INDEX_SIZE=$(cat algolia-index-<< parameters.index-name >>-1.json | jq 'length')
+            echo "Number of records exported: $INDEX_SIZE"
+            if [ "$INDEX_SIZE" -lt 1 ]; then
+              echo "Verification of $ALGOLIA_INDEX_NAME's exported index data failed."
+              exit 1
+            fi
+      - store_artifacts:
+          path: ~/project/algolia-index-<< parameters.index-name >>-1.json
+      - when:
+          condition:
+            equal: [ << pipeline.git.branch >>, main ]
+          steps:
+            - run:
+                name: Send metric to Datadog
+                command: |
+                  curl  -X POST -H "Content-type: application/json" \
+                  --data "{
+                        \"title\": \"Developer Hub Index << parameters.index-name >> Backup\",
+                        \"text\": \"Dev hub index << parameters.index-name >> was successfully backed up at `date`\",
+                        \"priority\": \"normal\",
+                        \"tags\": [
+                          \"repository:$CIRCLE_PROJECT_REPONAME\",
+                          \"job:$CIRCLE_JOB\",
+                          \"type:backup\"
+                        ],
+                        \"alert_type\": \"success\",
+                        \"source_type_name\": \"CIRCLECI\",
+                        \"aggregation_key\": \"dev_hub_index_<< parameters.index-name >>_backup\"
+                  }" \
+                  "https://app.datadoghq.com/api/v1/events?api_key=$DATADOG_API_KEY"
+
+  upload_orb_logos:
+    docker:
+      - image: cimg/python:3.9.7
+    steps:
+      - checkout
+      - aws-cli/setup
+      - restore_cache:
+          keys:
+            - cache-py397-{{ checksum ".circleci/sync_scripts/Pipfile.lock" }}
+      - run:
+          name: Install Python dependencies
+          command: |
+            cd .circleci/sync_scripts/
+            pipenv sync --dev
+      - when:
+          condition:
+            not:
+              equal: [ << pipeline.git.branch >>, main ]
+          steps:
+            - run:
+                name: Set mock env vars for test
+                command: |
+                  echo 'export ORB_ASSETS_BUCKET_NAME=test-bucket' >> $BASH_ENV
+                  echo 'export ORB_ASSETS_DOMAIN_NAME=https://assets-developer-hub-orbs.circleci.com/' >> $BASH_ENV
+                  echo 'export AWS_DEFAULT_REGION=us-east-1' >> $BASH_ENV
+      - run:
+          name: Run tests
+          command: |
+            cd .circleci/sync_scripts
+            # pipenv run pylint --py3k *.py
+            pipenv run pytest -rP test_logo_uploader.py
+      - when:
+          condition:
+            equal: [ << pipeline.git.branch >>, main ]
+          steps:
+            - run:
+                name: Upload logos
+                command: |
+                  cd .circleci/sync_scripts
+                  pipenv run python3 logo_uploader.py
+      - save_cache:
+          key: cache-{{ checksum ".circleci/sync_scripts/Pipfile.lock" }}
+          paths:
+            - ~/.local
+            - ~/.cache
+
+workflows:
+  # Build and index development indices for testing.
+  # The "real" indexing is done with scheduled pipelines, as seen later in the config.
+  build-and-index:
+    jobs:
+      - build:
+          name: Build Indexer
+          filters:
+            branches:
+              ignore: [ "main" ]
+      - test:
+          name: Test Indexer Components
+          filters:
+            branches:
+              ignore: [ "main" ]
+      - upload_orb_logos:
+          name: Test Orb Logo Sync
+          filters:
+            branches:
+              ignore: [ "main" ]
+      - index-docker-images:
+          name: Index Docker Images (dev)
+          requires: ["Build Indexer", "Test Indexer Components"]
+      - index-orbs:
+          name: Index Orbs (dev)
+          requires: ["Build Indexer", "Test Indexer Components"]
+      - index-machine-images:
+          name: Index Machine Images (dev)
+          requires: ["Build Indexer", "Test Indexer Components"]
+      - index-sample-apps:
+          name: Index Sample Apps (dev)
+          requires: ["Build Indexer", "Test Indexer Components"]
+
+      # This is legitimately useful for restoring development indexes if something messed up.
+      - backup_index:
+          matrix:
+            parameters:
+              index-name: [ "images_dev", "image_details_dev", "image_software_details_dev", "machine_images_dev", "orbs-dev", "sample_apps_dev" ]
+          requires: ["Index Docker Images (dev)", "Index Orbs (dev)", "Index Machine Images (dev)", "Index Sample Apps (dev)"]
+
+  # Standalone job that updates orb images. Only runs on main push.
+  update-orb-logos:
+    when:
+      equal: [ <<pipeline.parameters.index>>, "" ]
+    jobs:
+      - upload_orb_logos:
+          name: Upload Orb Logos
+          context: developer-hub-orbs-assets
+          filters:
+            branches:
+              only: [ "main" ]
+
+  # The following are jobs triggered by scheduled pipelines. This is considered "production" workflows.
+  index-docker:
+    when:
+      equal: [<<pipeline.parameters.index>>, "docker"]
+    jobs:
+      - build:
+          name: Build Indexer
+      - index-docker-images:
+          name: Index Docker Images (prod)
+          requires: ["Build Indexer"]
+          env: "production"
+      - backup_index:
+          matrix:
+            parameters:
+              index-name: [ "images_prod", "image_details_prod", "image_software_details_prod" ]
+          requires: [ "Index Docker Images (prod)" ]
+
+  index-machine:
+    # Machine images do not currently need to be run on a scheduled flow, hence the omission. When we can reach out to
+    # an API to index them, we can fix this and remove the branch filter.
+    when:
+      equal: [<<pipeline.parameters.index>>, ""]
+    jobs:
+      - build:
+          name: Build Indexer
+          filters:
+            branches:
+              only: [ "main" ]
+      - index-machine-images:
+          name: Index Machine Images (prod)
+          requires: ["Build Indexer"]
+          env: "production"
+      - backup_index:
+          matrix:
+            parameters:
+              index-name: [ "machine_images_prod" ]
+          requires: [ "Index Machine Images (prod)" ]
+
+  index-orbs:
+    when:
+      equal: [<<pipeline.parameters.index>>, "orbs"]
+    jobs:
+      - build:
+          name: Build Indexer
+      - index-orbs:
+          name: Index Orbs (prod)
+          requires: ["Build Indexer"]
+          env: "production"
+      - backup_index:
+          matrix:
+            parameters:
+              index-name: [ "orbs-prod" ]
+          requires: [ "Index Orbs (prod)" ]
+
+  index-sample-apps:
+    when:
+      equal: [<<pipeline.parameters.index>>, "sample-apps"]
+    jobs:
+      - build:
+          name: Build Indexer
+      - index-orbs:
+          name: Index Sample Apps (prod)
+          requires: ["Build Indexer"]
+          env: "production"
+      - backup_index:
+          matrix:
+            parameters:
+              index-name: [ "sample_apps_dev" ]
+          requires: [ "Index Sample Apps (prod)"]

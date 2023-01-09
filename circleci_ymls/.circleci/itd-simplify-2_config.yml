@@ -1,0 +1,77 @@
+version: 2.1
+
+executors:
+  ccc:
+    docker:
+    - image: circleci/command-convenience:0.1
+      auth:
+        username: $DOCKER_HUB_USER
+        password: $DOCKER_HUB_PASSWORD
+
+jobs:
+  deploy:
+    executor: ccc
+    environment:
+      NAMESPACE: internal-tools
+      NAME: itd-ae-prospecting
+      VALUES_FILE: values.yml
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /tmp/workspace
+      - run: cp /tmp/workspace/docker_image.tag .
+      - setup_remote_docker
+      - run: deploy
+
+  dry-run-publish:
+    executor: ccc
+    environment:
+      NAME: itd-ae-prospecting
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: ecr
+      CONFIGURE_ECR_REPO: true
+      ECR_OWNER_TEAM: ITD
+      VALUES_FILE: values.yml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: /deploy/dry-run
+
+  publish:
+    executor: ccc
+    environment:
+      NAME: itd-ae-prospecting
+      DOCKERFILE_PATH: Dockerfile
+      DOCKER_REGISTRY: ecr
+      TWISTLOCK_ENFORCE: false
+      ECR_OWNER_TEAM: ITD
+      CONFIGURE_ECR_REPO: true
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: publish
+      - persist_to_workspace:
+          root: .
+          paths: docker_image.tag
+
+workflows:
+  version: 2
+  publish-deploy:
+    jobs:
+      - dry-run-publish:
+          context: org-global
+          filters:
+            branches:
+              ignore: master
+      - deploy:
+          context: org-global
+          filters:
+            branches:
+              only: master
+          requires:
+            - publish
+      - publish:
+          context: org-global
+          filters:
+            branches:
+              only: master

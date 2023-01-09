@@ -1,0 +1,166 @@
+version: 2.1
+
+references:
+  name: &name change-event-collector
+
+executors:
+  go:
+    docker:
+      - image: circleci/go-service:0.1-dev
+        auth:
+          username: $RO_DOCKER_HUB_USERNAME
+          password: $RO_DOCKER_HUB_PASSWORD
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+jobs:
+  build:
+    executor: go
+    working_directory: ~/change-event-collector
+    steps:
+      - checkout:
+          path: ~/change-event-collector
+      - run: task go-service:private-go-mod-init
+      - run: task go-service:build GO_BINARY_NAME=change-event-collector
+      - persist_to_workspace:
+          root: ~/change-event-collector
+          paths:
+            - bin
+
+  lint:
+    executor: go
+    steps:
+      - checkout
+      - run: task go-service:private-go-mod-init
+      - run: task lint
+      - run: task lint-go-mod
+
+  test:
+    executor: go
+    steps:
+      - checkout
+      - run: task go-service:private-go-mod-init
+      - run: task install-deps
+      - run: task verify-gen-files
+      - run: task ci:test RESULTS_DIR=/tmp/test-results
+      - store_test_results:
+          path: /tmp/test-results
+
+  dry-run:
+    executor: ccc
+    environment:
+      NAME: *name
+      VALUES_FILE: k8s-values.yml
+      NAMESPACE: change-event-collector
+      GO_BINARY_PATH: ./bin/change-event-collector
+    working_directory: ~/change-event-collector
+    steps:
+      - checkout:
+          path: ~/change-event-collector
+      - attach_workspace:
+          at: ~/change-event-collector
+      - setup_remote_docker
+      - run: scan
+      - run: /deploy/dry-run
+
+  publish-deploy:
+    executor: ccc
+    environment:
+      NAME: *name
+      DOCKER_REGISTRY: ecr
+      VALUES_FILE: k8s-values.yml
+      NAMESPACE: change-event-collector
+
+      CONFIGURE_ECR_REPO: yes
+      ECR_OWNER_TEAM: MeowDivision
+      GO_BINARY_PATH: ./bin/change-event-collector
+    working_directory: ~/change-event-collector
+    steps:
+      - checkout:
+          path: ~/change-event-collector
+      - attach_workspace:
+          at: ~/change-event-collector
+      - setup_remote_docker
+      - run: publish
+      - run: deploy
+
+  publish-deploy-canary:
+    executor: ccc
+    environment:
+      NAME: *name
+      DOCKER_REGISTRY: ecr
+      VALUES_FILE: canary.yml
+      RELEASE_VERSION: canary
+      DEPLOY_ENVIRONMENT: canary
+      NAMESPACE: change-event-collector
+
+      CONFIGURE_ECR_REPO: yes
+      ECR_OWNER_TEAM: MeowDivision
+      GO_BINARY_PATH: ./bin/change-event-collector
+    working_directory: ~/change-event-collector
+    steps:
+      - checkout:
+          path: ~/change-event-collector
+      - attach_workspace:
+          at: ~/change-event-collector
+      - setup_remote_docker
+      - run: publish
+      - run: /deploy/merge-values k8s-values.yml canary-overrides.yml > canary.yml
+      - run: deploy
+
+workflows:
+  deploy:
+    jobs:
+      - build:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - lint:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - test:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - dry-run:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - build
+            - lint
+            - test
+          filters:
+            branches:
+              ignore:
+                - main
+                - canary
+      - publish-deploy:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - build
+            - lint
+            - test
+          filters:
+            branches:
+              only:
+                - main
+      - publish-deploy-canary:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - build
+            - lint
+            - test
+          filters:
+            branches:
+              only:
+                - canary

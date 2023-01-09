@@ -1,0 +1,16 @@
+#########################################
+#        CIRCLECI Workflow Config       #
+#########################################
+
+version: 2.1
+orbs:
+  shellcheck: circleci/shellcheck@2.2.0
+workflows:
+  on_commit:
+    jobs:
+      - shellcheck/check:
+          dir: .
+
+#########################################
+#        CIRCLECI Jobs Config           #
+#########################################

@@ -1,0 +1,258 @@
+version: 2.1
+orbs:
+  web-ui-orb: sandbox/web-ui-orb@5.0.1
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+
+references:
+  version_js: &version_js 7
+  version_cypress: &version_cypress 1
+  optimizely_sdk_key: &optimizely_sdk_key GfYszBpMkefBSwiiEkH3b3
+  hostname: &hostname app.circleci.com
+
+parameters:
+    run-schedule:
+      type: boolean
+      default: false
+
+commands:
+  inject-npm-token:
+    steps:
+      - run:
+          name: Inject NPM Token into build script
+          command: 
+            sed 's:docker build:docker build --build-arg NPM_TOKEN=$NPM_TOKEN:'
+            -i /publish/scripts/create-image.sh
+  verify-npm-token:
+    steps:
+      - run:
+          name: Check for NPM_TOKEN
+          command: |
+            if [ -z "$NPM_TOKEN" ]; then
+              echo "Error: The environment variable NPM_TOKEN is empty. Please ensure the environment variable NPM_TOKEN has been added (you likely need the web-ui-npm context)"
+              exit 1
+            fi
+  restore-next-cache:
+    description: "Restore NextJS build cache"
+    steps: 
+      - restore_cache:
+          keys: 
+            - next-{{arch}}-{{checksum "yarn.lock"}}
+  restore-yarn-cache:
+    description: "Restore node_modules cache"
+    steps:
+      - restore_cache:
+          keys: 
+            - v7-dependency-js-deps-{{ checksum "yarn.lock" }}
+executors:
+  docker-executor: # for use with CCC. need a different image than the others to prevent errors
+    docker:
+       - image: circleci/node:14
+    working_directory: /mnt/ramdisk
+    resource_class: medium+
+  ci-node:
+    docker:
+       - image: cimg/node:14.18.2
+    resource_class: medium+
+    working_directory: /mnt/ramdisk
+
+jobs:
+  build-and-scan-twistlock:
+    # builds the docker image and runs twistlock scan without publishing
+    executor: docker-executor
+    docker: 
+      - image: &ccc_image circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: web-ui-user-settings # image name
+          DOCKERFILE_PATH: Dockerfile
+    steps:
+      - checkout
+      - verify-npm-token
+      - restore-next-cache
+      - setup_remote_docker:
+          docker_layer_caching: true
+          version: 20.10.11
+      - inject-npm-token
+      - run: scan # https://github.com/circleci/command-convenience-containers/blob/main/publish/bin/scan
+  build-next-app:
+    executor: ci-node
+    steps:
+      - checkout
+      - restore-yarn-cache
+      - restore-next-cache
+      - run:
+          name: 'Login to npm'
+          command: echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
+      - run:
+          name: Install yarn deps 
+          command: yarn install --frozen-lockfile 
+      - run:
+          name: Build nextjs app
+          command: BUILD_ID="$CIRCLE_SHA1" yarn build
+      - save_cache:
+          paths: 
+            - src/.next
+            - .next 
+          key: next-{{arch}}-{{checksum "yarn.lock"}}
+      - persist_to_workspace:
+          paths:
+            - src/.next
+            - .next
+          root: . 
+workflows:
+  version: 2
+
+  scheduled-vulnerability-scan:
+    when: <<pipeline.parameters.run-schedule>>
+    jobs:
+      - web-ui-orb/dependencies:
+          name: dependencies
+          context: web-ui-npm
+          cache_version_js_dependencies: *version_js
+          cache_version_cypress_dependencies: *version_cypress
+      - web-ui-orb/build-static:
+          name: build-static
+          cache_version_js_dependencies: *version_js
+          context: [web-ui-user-settings-assets, web-ui-npm]
+          filters:
+            branches:
+              only: master
+          requires:
+            - dependencies
+      - web-ui-orb/build-and-publish-container:
+          name: scheduled-vulnerability-scan-docker-image
+          image_name: web-ui-user-settings
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          scan_only: true
+          context: [org-global, web-ui-npm]
+          filters:
+            branches:
+              only: master
+          requires:
+            - build-static
+
+  build-test-and-deploy:
+    jobs:
+      - web-ui-orb/dependencies:
+          name: dependencies
+          context: web-ui-npm
+          cache_version_js_dependencies: *version_js
+          cache_version_cypress_dependencies: *version_cypress
+      - web-ui-orb/storybook-build:
+          name: storybook-build
+          build_storybook_command: NODE_ENV=test yarn build-storybook -s ./src
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+      - web-ui-orb/test:
+          name: test
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+      - web-ui-orb/chromatic-snapshot:
+          name: chromatic-snapshot
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+            - storybook-build
+      - web-ui-orb/test-production-docker-image:
+          name: test-production-docker-image
+          image_name: web-ui-user-settings
+          cache_version_js_dependencies: *version_js
+          optimizely_sdk_key: *optimizely_sdk_key
+          hostname: *hostname
+          requires:
+            - dependencies
+          context: [org-global, web-ui-npm]
+      - web-ui-orb/build-and-deploy-static:
+          cache_version_js_dependencies: *version_js
+          name: build-and-deploy-static
+          bucket_name: circleci-web-ui-account-assets/settings/user
+          build_dir: .next
+          cdn_url: http://assets-account.circleci.com/settings/user
+          context: [web-ui-user-settings-assets, web-ui-npm, web-ui-datadog]
+          filters:
+            branches:
+              only:
+                - master
+                - canary
+          requires:
+            - dependencies
+      - web-ui-orb/build-and-publish-container:
+          name: publish
+          image_name: web-ui-user-settings
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [org-global, web-ui-npm]
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-\d\..+/
+          requires:
+            - test
+            - build-and-deploy-static
+            - test-production-docker-image
+      - web-ui-orb/deploy-container:
+          name: deploy
+          image_name: web-ui-user-settings
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [org-global, web-ui-npm]
+          filters:
+            branches:
+              only: master
+          requires:
+            - publish
+      - scotty-orb/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          promotion_component_list: 'circleci/web-ui-user-settings'
+          requires:
+            - publish
+      - web-ui-orb/build-and-publish-container:
+          name: publish-canary
+          image_name: web-ui-user-settings
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [org-global, web-ui-npm]
+          filters:
+            branches:
+              only: canary
+          requires:
+            - test
+            - build-and-deploy-static
+            - test-production-docker-image
+      - web-ui-orb/deploy-container:
+          name: deploy-canary
+          image_name: web-ui-user-settings
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: [org-global, web-ui-npm]
+          release_version: canary
+          values_file: k8s-canary-values.yml
+          requires:
+            - publish-canary
+      - build-and-scan-twistlock:
+          filters:
+            branches:
+              ignore:
+              - master
+              - canary
+              - /^server-\d\..+/
+          context: [web-ui-npm, org-global]
+          requires:
+            - build-next-app
+      - build-next-app:
+          filters:
+            branches:
+              ignore:
+              - master
+              - canary
+              - /^server-\d\..+/
+          context: [web-ui-npm, org-global]
+          requires:
+            - dependencies

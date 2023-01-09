@@ -1,0 +1,55 @@
+version: 2.1
+workflows:
+  version: 2
+  test-and-deploy:
+    jobs:
+      - pytest
+      - deploy:
+          context:
+            - secops-lacework-deploy
+            - secops-custom-state-handler
+          requires: [pytest]
+          filters:
+            branches:
+              only: main
+
+
+executors:
+  generic:
+      docker:
+        - image: circleci/python:3.9
+
+commands:
+  install_deps:
+    steps:
+      - restore_cache:
+          keys:
+            - v1-lacework-iac-pipenv-{{ checksum "requirements.txt" }}
+
+      - run: pip3 install -r ~/project/requirements.txt
+
+      - save_cache:
+          key: v1-lacework-iac-pipenv-{{ checksum "requirements.txt" }}
+          paths:
+            - "lacework/iac/.venv"
+
+jobs:
+  pytest:
+      executor: generic
+      steps:
+        - checkout:
+            path: ~/project
+        - install_deps
+        - run:
+            name: running test
+            command: pytest .
+  deploy:
+      executor: generic
+      steps:
+        - checkout:
+              path: ~/project
+        - install_deps
+        - run:
+            name: deploy changes
+            command: python update_query.py; python update_policy.py
+  

@@ -1,0 +1,84 @@
+version: 2.1
+
+orbs:
+  web-ui-orb: sandbox/web-ui-orb@3.9.0
+
+references:
+  version_js: &version_js 3
+  version_cypress: &version_cypress 2
+  image_name: &image_name 'developer-hub'
+  # dev env sdk key
+  optimizely_sdk_key: &optimizely_sdk_key GfYszBpMkefBSwiiEkH3b3
+
+workflows:
+  build-test-and-deploy:
+    jobs:
+      - web-ui-orb/dependencies:
+          name: dependencies
+          context: web-ui-npm
+          cache_version_js_dependencies: *version_js
+          cache_version_cypress_dependencies: *version_cypress
+      - web-ui-orb/test:
+          name: test
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+      - web-ui-orb/chromatic-snapshot:
+          name: chromatic-snapshot
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+      - web-ui-orb/test-production-docker-image:
+          name: test-production-docker-image
+          image_name: *image_name
+          cache_version_js_dependencies: *version_js
+          optimizely_sdk_key: *optimizely_sdk_key
+          proxy-graphql: true
+          hostname: ''
+          requires:
+            - dependencies
+          context: web-ui-npm
+      - web-ui-orb/build-and-deploy-static:
+          cache_version_js_dependencies: *version_js
+          name: build-and-deploy-static
+          bucket_name: circleci-web-ui-developer-hub-assets
+          cdn_url: http://assets-developer.circleci.com
+          context: web-ui-developer-hub-assets
+          build_dir: ./.next
+          filters:
+            branches:
+              only:
+                - master
+                - canary
+          requires:
+            - dependencies
+      - web-ui-orb/build-and-deploy-container:
+          name: deploy
+          image_name: *image_name
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          should_deploy: true
+          context: [web-ui-npm, org-global]
+          filters:
+            branches:
+              only: master
+          requires:
+            - test
+            - build-and-deploy-static
+            - test-production-docker-image
+      - web-ui-orb/build-and-deploy-container:
+          name: deploy-canary
+          image_name: *image_name
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          should_deploy: true
+          context: [web-ui-npm, org-global]
+          release_version: canary
+          values_file: k8s-canary-values.yml
+          filters:
+            branches:
+              only: canary
+          requires:
+            - test
+            - build-and-deploy-static
+            - test-production-docker-image

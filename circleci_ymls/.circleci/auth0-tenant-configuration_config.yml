@@ -1,0 +1,236 @@
+version: 2.1
+
+orbs:
+  slack: circleci/slack@4.4.2
+
+jobs:
+  smoke-test:
+    parameters:
+      auth0-domain:
+        description: The target Auth0 domain, e.g. "circleci-prod.us.auth0.com"
+        type: string
+    docker:
+      - image: cimg/node:16.1.0-browsers
+    steps:
+      - checkout
+      - run:
+          working_directory: smoke-test
+          command: npm install
+      - run:
+          name: Get Auth0 management API token
+          command: |
+            curl --request POST \
+              --url 'https://<< parameters.auth0-domain >>/oauth/token' \
+              --header 'content-type: application/x-www-form-urlencoded' \
+              --data grant_type=client_credentials \
+              --data "client_id=$AUTH0_CLIENT_ID" \
+              --data "client_secret=$AUTH0_CLIENT_SECRET" \
+              --data 'audience=https://<< parameters.auth0-domain >>/api/v2/' \
+                | jq -r .access_token > management-api-token.txt
+      - run:
+          name: Create smoke-test application in Auth0
+          command: |
+            curl --request POST \
+                --url 'https://<< parameters.auth0-domain >>/api/v2/clients' \
+                --header "Content-Type: application/json" \
+                --header "Authorization: Bearer `cat management-api-token.txt`" \
+                --data @./smoke-test/smoke-test-application.json \
+                 | jq -r .client_id > smoke-test-client-id.txt
+      - run:
+          name: Get connection id for username-password-authentication
+          command: |
+            curl --request GET \
+                --url "https://<< parameters.auth0-domain >>/api/v2/connections" \
+                --header "Content-Type: application/json" \
+                --header "Authorization: Bearer `cat management-api-token.txt`" \
+                 | jq -r '.[] | select(.strategy == "auth0") | .id' > connection-id.txt
+      - run:
+          name: Enabled connection for smoke-test application in Auth0
+          command: |
+            curl --request PATCH \
+                --url "https://<< parameters.auth0-domain >>/api/v2/connections/`cat connection-id.txt`" \
+                --header "Content-Type: application/json" \
+                --header "Authorization: Bearer `cat management-api-token.txt`" \
+                --data "{\"enabled_clients\": [\"`cat smoke-test-client-id.txt`\"]}"
+      - run:
+          name: Generate password reset ticket
+          command: |
+            curl --request POST \
+              --url "https://<< parameters.auth0-domain >>/api/v2/tickets/password-change" \
+              --header "Content-Type: application/json" \
+              --header "Authorization: Bearer `cat management-api-token.txt`" \
+              --data "{
+                    \"connection_id\": \"`cat connection-id.txt`\",
+                    \"email\": \"smoke-test-password-reset@example.com\",
+                    \"result_url\": \"https://circleci.com/auth/signup\"
+                  }" \
+              | jq -r .ticket > password-reset-url.txt
+      - run:
+          name: Configure Node.js example
+          command: |
+            echo "CLIENT_ID=`cat smoke-test-client-id.txt`
+                  ISSUER_BASE_URL=https://<< parameters.auth0-domain >>
+                  SECRET="`openssl rand -hex 32`"
+                  PORT=3000" > smoke-test/.env
+      - run:
+          name: Run smoke tests with Cypress
+          working_directory: smoke-test
+          command: |
+            export CYPRESS_PASSWORD_RESET_URL=`cat ../password-reset-url.txt`
+            export CYPRESS_ISSUER_BASE_URL=https://<< parameters.auth0-domain >>
+            npm run test
+      - run:
+          when: always
+          name: Delete test user in Auth0
+          command: |
+            curl -X DELETE \
+              --url "https://<< parameters.auth0-domain >>/api/v2/connections/`cat connection-id.txt`/users?email=smoke-test@examples.com" \
+              --header "Content-Type: application/json" \
+              --header "Authorization: Bearer `cat management-api-token.txt`"
+      - run:
+          when: always
+          name: Delete smoke-test application in Auth0
+          command: |
+            curl -X DELETE  -H "Authorization: Bearer `cat management-api-token.txt`" \
+               https://<< parameters.auth0-domain >>/api/v2/clients/`cat smoke-test-client-id.txt`
+      - store_artifacts:
+          path: smoke-test/cypress/screenshots
+      - store_artifacts:
+          path: smoke-test/cypress/videos
+      - slack/notify:
+          event: fail
+          channel: identities-reminders
+          custom: |
+            {
+            	"blocks": [
+            		{
+            			"type": "section",
+            			"text": {
+            				"type": "mrkdwn",
+            				"text": "<https://circleci.com/workflow-run/${CIRCLE_WORKFLOW_ID}|:circle-fail: $CIRCLE_PROJECT_REPONAME> smoke tests *failed!*"
+            			}
+            		},
+            		{
+            			"type": "context",
+            			"elements": [
+            				{
+            					"type": "mrkdwn",
+            					"text": "$CIRCLE_BRANCH | $CIRCLE_USERNAME"
+            				}
+            			]
+            		}
+            	]
+            }
+      - slack/notify:
+          branch_pattern: main
+          event: pass
+          channel: identities-reminders
+          custom: |
+            {
+            	"blocks": [
+            		{
+            			"type": "section",
+            			"text": {
+            				"type": "mrkdwn",
+            				"text": "<https://circleci.com/workflow-run/${CIRCLE_WORKFLOW_ID}|:large_purple_circle: $CIRCLE_PROJECT_REPONAME> workflow is awaiting approval"
+            			}
+            		},
+            		{
+            			"type": "context",
+            			"elements": [
+            				{
+            					"type": "mrkdwn",
+            					"text": "$CIRCLE_BRANCH | $CIRCLE_USERNAME"
+            				}
+            			]
+            		}
+            	]
+            }
+
+  deploy-auth0-config:
+    parameters:
+      auth0-domain:
+        description: The target Auth0 domain, e.g. "circleci-prod.us.auth0.com"
+        type: string
+    docker:
+      - image: cimg/node:16.1.0
+    steps:
+      - checkout
+      - run:
+          name: Install dependencies
+          command: npm install
+      - run:
+          name: Configure Auth0
+          command: |
+            jq '. += {
+              "AUTH0_DOMAIN": "<< parameters.auth0-domain >>",
+              "AUTH0_CLIENT_ID": env.AUTH0_CLIENT_ID,
+              "AUTH0_CLIENT_SECRET": env.AUTH0_CLIENT_SECRET,
+              "AUTH0_KEYWORD_REPLACE_MAPPINGS": {
+                "AUTH0_TENANT_DOMAIN": "<< parameters.auth0-domain >>",
+                "CIRCLECI_LOGIN_URL": "https://circleci.com/auth/signup",
+                "MAILGUN_API_KEY": env.MAILGUN_API_KEY,
+                "EVENTS_SECRET": env.EVENTS_SECRET,
+                "GITHUB_CLIENT_ID": env.GITHUB_OAUTH_APP_CLIENT_ID,
+                "GITHUB_CLIENT_SECRET": env.GITHUB_OAUTH_APP_CLIENT_SECRET,
+                "BITBUCKET_KEY": env.BITBUCKET_OAUTH_APP_KEY,
+                "BITBUCKET_SECRET": env.BITBUCKET_OAUTH_APP_SECRET,
+                "GITLAB_OAUTH_APP_SECRET": env.GITLAB_OAUTH_APP_SECRET,
+                "GITLAB_OAUTH_APP_KEY": env.GITLAB_OAUTH_APP_KEY
+              }
+            }' \
+              < cli-config.template.json > cli-config.json
+      - run:
+          name: Copy page templates to auth0 configuration
+          command: cp ./templates/*.html ./circleci-prod/pages
+      - run:
+          name: Deploy Auth0 config to << parameters.auth0-domain >>
+          command: npx a0deploy deploy -c cli-config.json -i ./circleci-prod
+
+workflows:
+  version: 2
+  deploy:
+    jobs:
+      # deploy to staging tenant and smoke test
+      - deploy-auth0-config:
+          name: deploy-staging
+          auth0-domain: circleci-staging.us.auth0.com
+          context: auth0-staging
+          filters:
+            branches:
+              only:
+                - staging
+                - main
+      - smoke-test:
+          name: smoke-test-staging
+          requires:
+            - deploy-staging
+          auth0-domain: circleci-staging.us.auth0.com
+          context:
+            - auth0-staging
+            - slack-notifications
+          filters:
+            branches:
+              only:
+                - staging
+                - main
+      # ...then if this is main branch, wait for approval, and deploy to prod tenant
+      - approve-deployment:
+          type: approval
+          context: auth0-prod
+          requires:
+            - smoke-test-staging
+          filters:
+            branches:
+              only:
+                - main
+      - deploy-auth0-config:
+          name: deploy-prod
+          auth0-domain: circleci-prod.us.auth0.com
+          context: auth0-prod
+          requires:
+            - approve-deployment
+          filters:
+            branches:
+              only:
+                - main

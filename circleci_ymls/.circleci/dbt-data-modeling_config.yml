@@ -1,0 +1,163 @@
+version: 2.1
+
+references:
+  project: &project dbt-data-modeling
+  dir: &dir ~/dbt_data_modeling
+  ccc-job: &ccc-job
+  catalog: &catalog target/catalog.json
+
+  python-image: &python-image
+    image: python:3.8
+
+executors:
+  ccc:
+    working_directory: *dir
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: *project
+          DOCKER_REGISTRY: ecr
+          NAMESPACE: data
+          DOCKERFILE_PATH: "deploy/default/Dockerfile"
+          DEPLOY_CONTAINER_NAME: "183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/dbt-data-modeling"
+  python:
+    docker:
+      - *python-image
+    environment:
+      POETRY_VIRTUALENVS_PATH: /virtualenvs/envs
+      POETRY_CACHE_DIR: /virtualenvs/cache
+
+commands:
+  setup-python-dependencies:
+    description: Setup the python environment for testing and linting
+    steps:
+      - checkout:
+          path: ~/project
+      - restore_cache:
+          keys:
+            - v1-poetry-cache-{{ arch }}-{{ .Branch }}-{{ checksum "poetry.lock" }}
+            - v1-poetry-cache-{{ arch }}-{{ .Branch }}
+            - v1-poetry-cache
+      - run: echo "export PATH=$HOME/.poetry/bin:$PATH" >> $BASH_ENV
+      - run: curl -sSL https://raw.githubusercontent.com/python-poetry/poetry/master/get-poetry.py | python -
+      - run: poetry install
+      - save_cache:
+          key: v1-poetry-cache-{{ arch }}-{{ .Branch }}-{{ checksum "poetry.lock" }}
+          paths: /virtualenvs
+  publish:
+    description: Run cci publish to building and push the docker container.
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: publish
+      - store_artifacts:
+          path: ccc-image-scan-results
+
+jobs:
+  lint:
+    executor: python
+    steps:
+      - setup-python-dependencies
+      - run: poetry run pylint dbt_data_modeling
+      - run: poetry run mypy dbt_data_modeling
+      - run: poetry run yamllint resources
+
+  test:
+    executor: python
+    steps:
+      - setup-python-dependencies
+      - run:
+          name: run tests
+          command: |
+            mkdir test-results
+            poetry run pytest --junitxml=test-results/junit.xml
+      - store_test_results:
+          path: test-results
+      - store_artifacts:
+          path: test-results
+
+  publish-branch:
+    executor: ccc
+    steps:
+      - publish
+
+  dbt-build-ci:
+    executor: python
+    steps:
+      - setup-python-dependencies
+      - run: poetry run dbt deps --project-dir resources
+      - run:
+          name: compile dbt manifest in master branch
+          # use --target prod so the --defer will work correctly
+          command: |
+            git checkout master
+            poetry run dbt debug --project-dir resources --target prod
+            poetry run dbt compile --project-dir resources --target prod
+            mv resources/target/manifest.json .
+      - run: git checkout ${CIRCLE_BRANCH}
+      # separate run and test because "dbt build" will fail all downstream if upstream tests fail. We still want to see all tests results if the test failure is from production
+      # currently there is a version bug with state:modified.body, we will add state:modified.body back once we update dbt to be 1.0.4;
+      - run: poetry run dbt run --models state:modified --defer --state ~/project --exclude tag:skip-ci --project-dir resources -x
+      - run: poetry run dbt test --models state:modified --defer --state ~/project --exclude tag:skip-ci --project-dir resources
+  publish-latest:
+    executor: ccc
+    steps:
+      - publish
+    environment:
+      CONTAINER_VERSION: latest
+
+  dbt-cloud-deploy:
+    docker:
+      - image: cimg/python:3.8.11
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    steps:
+      - checkout
+      - run: pip install requests
+      - run:
+          name: deploy-dbt-models
+          command: python .circleci/prod_dbt_cloud_slimci.py
+
+workflows:
+  commit:
+    jobs:
+      # lint and test
+      - lint
+      - test
+      # staging and dev deploy
+      - publish-branch:
+          context: org-global
+          requires:
+            - lint
+            - test
+      - dbt-build-ci:
+          context: dbt-ci-cd
+          requires:
+            - lint
+            - test
+          filters:
+            branches:
+              ignore:
+                - master
+      # prod deploy
+      - publish-latest:
+          context: org-global
+          filters:
+            branches:
+              only:
+                - master
+          requires:
+            - lint
+            - test
+      - dbt-cloud-deploy:
+          filters:
+            branches:
+              only:
+                - master
+          requires:
+            - lint
+            - test

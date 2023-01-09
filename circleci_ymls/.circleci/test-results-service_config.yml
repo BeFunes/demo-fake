@@ -1,0 +1,215 @@
+version: 2.1
+
+orbs:
+  scotty-orb: cci-releng/scotty-orb@0.0.2
+
+workflows:
+  version: 2
+  build_test_deploy:
+    jobs:
+      - test:
+          context: org-global
+      - coverage:
+          context: org-global
+      - build_uberjar:
+          context: org-global
+      - test_container_build:
+          context: org-global
+          requires:
+            - build_uberjar
+          filters:
+            branches:
+              ignore:
+                - master
+                - canary
+                - /^server-\d\..+/
+      - helm-package:
+          context: org-global
+      - deploy-canary:
+          context: org-global
+          requires:
+            - test
+            - build_uberjar
+          filters:
+            branches:
+              only: canary
+      - publish:
+          context: org-global
+          requires:
+            - test
+            - build_uberjar
+          filters:
+            branches:
+              only:
+                - master
+                - /^server-\d\..+/
+      - deploy:
+          context: org-global
+          requires:
+            - publish
+          filters:
+            branches:
+              only: master
+      - scotty-orb/promote-to-server:
+          name: promote-to-server
+          context: org-global
+          promotion_component_list: "circleci/test-results"
+          requires:
+            - publish
+
+references:
+  restore_m2_cache: &restore_m2_cache
+    restore_cache:
+      keys:
+        - t-r-s-jars-v2-{{ checksum "project.clj" }}
+        - t-r-s-jars-v2-
+  download_dependencies: &download_dependencies
+    run:
+      name: Download dependencies
+      command: lein deps
+  save_m2_cache: &save_m2_cache
+    save_cache:
+      key: t-r-s-jars-v2-{{ checksum "project.clj" }}
+      paths:
+        - ~/.m2
+
+executors:
+  clojure:
+    docker:
+      - image: circleci/clojure-service:0.6-dev
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: test-results
+          DEPLOY_CLOJURE_JARFILE: test-results-standalone.jar
+          DOCKER_REGISTRY: all
+          CUSTOM_CHART: chart
+
+jobs:
+  test:
+    executor: clojure
+    working_directory: ~/test-results-service
+    steps:
+      - checkout
+      - *restore_m2_cache
+      - *download_dependencies
+      - *save_m2_cache
+      - run:
+          name: Check code formatting
+          command: lein cljfmt check
+      - run:
+          name: Run the tests
+          command: lein test
+  coverage:
+    executor: clojure
+    working_directory: ~/test-results-service
+    steps:
+      - checkout
+      - *restore_m2_cache
+      - *download_dependencies
+      - *save_m2_cache
+      - run:
+          name: Generate coverage data
+          command: lein cloverage
+      - store_artifacts:
+          path: target/coverage
+  build_uberjar:
+    executor: clojure
+    working_directory: ~/test-results-service
+    steps:
+      - checkout
+      - *restore_m2_cache
+      - *download_dependencies
+      - *save_m2_cache
+      - run:
+          name: Build an uberjar
+          command: |
+            lein change repositories assoc '"circle-s3"' {}
+            lein change repositories assoc '"circle-s3-snapshots"' {}
+            lein uberjar
+            mv target/test-results-service*-standalone.jar target/test-results-standalone.jar
+      - persist_to_workspace:
+          root: target
+          paths:
+            - "test-results-standalone.jar"
+      - store_artifacts:
+          path: target/test-results-standalone.jar
+  test_container_build:
+    executor: ccc
+    working_directory: ~/test-results-service
+    steps:
+      - setup_remote_docker
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          command: publish
+          environment:
+            DOCKER_REGISTRY: none
+      - store_artifacts:
+          path: ccc-image-scan-results
+  helm-package:
+    executor: ccc
+    working_directory: ~/test-results-service
+    steps:
+      - checkout
+      - run:
+          name: Validate Helm packaging
+          command: |
+            /deploy/scripts/dry-run.sh | tee helm-package.txt
+          environment:
+            NAME: test-results
+            DEPLOY_CONTAINER_NAME: example.com/circleci/test-results
+            CUSTOM_CHART: chart
+      - store_artifacts:
+          path: helm-package.txt
+  deploy-canary:
+    executor: ccc
+    environment:
+      ROLLBAR_ENVIRONMENT: canary
+      RELEASE_VERSION: canary
+    working_directory: ~/test-results-service
+    steps:
+      - setup_remote_docker
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Substitute Helm chart values
+          command: |
+            sed -i'.bak' 's/canary: false/canary: true/' chart/values.yaml
+      - run: publish
+      - run: deploy
+      - store_artifacts:
+          path: ccc-image-scan-results
+  publish:
+    executor: ccc
+    working_directory: ~/test-results-service/deploy
+    steps:
+      - setup_remote_docker
+      - checkout
+      - attach_workspace:
+          at: .
+      - run: publish
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.tag
+      - store_artifacts:
+          path: ccc-image-scan-results
+  deploy:
+    executor: ccc
+    working_directory: ~/test-results-service/deploy
+    steps:
+      - setup_remote_docker
+      - checkout
+      - attach_workspace:
+          at: .
+      - run: deploy

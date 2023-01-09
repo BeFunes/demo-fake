@@ -1,0 +1,12 @@
+version: 2.1
+jobs:
+  build:
+    docker: 
+      - image: circleci/python:3.8 # the primary container, where your job's commands are run
+    environment:
+      CIRCLECI_API_KEY: foo
+    steps:
+      - checkout # check out the code in the project directory
+      - run: pip install -r requirements.txt -r test-requirements.txt
+      - run: python3 -m unittest tests/test_end_to_end.py
+      

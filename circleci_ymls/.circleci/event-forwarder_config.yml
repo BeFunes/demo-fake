@@ -1,0 +1,185 @@
+version: 2.1
+
+executors:
+  go:
+    docker:
+      - image: circleci/go-service:0.1-dev
+        auth:
+          username: $RO_DOCKER_HUB_USERNAME
+          password: $RO_DOCKER_HUB_PASSWORD
+
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+jobs:
+  build-service:
+    executor: go
+    working_directory: ~/event-forwarder
+    steps:
+      - checkout:
+          path: ~/event-forwarder
+      - run: task go-service:build GO_BINARY_NAME=service
+      - persist_to_workspace:
+          root: .
+          paths:
+            - bin/service
+
+  lint-service:
+    executor: go
+    working_directory: ~/event-forwarder
+    steps:
+      - checkout:
+          path: ~/event-forwarder
+      - run: task go-service:private-go-mod-init
+      - run: task lint
+      - run: task lint-go-mod
+
+  test-service:
+    executor: go
+    working_directory: ~/event-forwarder
+    steps:
+      - checkout:
+          path: ~/event-forwarder
+      - run: task go-service:private-go-mod-init
+      - run: task ci:test RESULTS_DIR=/tmp/test-results
+      - store_test_results:
+          path: /tmp/test-results
+
+  scan-service:
+    executor:
+      name: ccc
+    environment:
+      NAME: event-forwarder
+      GO_BINARY_PATH: bin/service
+      TWISTCLI_DEBUG: true
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: scan
+      - store_artifacts:
+          path: ccc-image-scan-results
+          destination: event-forwarder/ccc-image-scan-results
+
+  dry-run-service:
+    executor: ccc
+    environment:
+      NAME: event-forwarder
+      VALUES_FILE: ./values.yml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: /deploy/dry-run
+
+  publish-deploy-service:
+    executor: ccc
+    environment:
+      NAME: event-forwarder
+      GO_BINARY_PATH: bin/service
+
+      DOCKER_REGISTRY: ecr
+      VALUES_FILE: values.yml
+
+      CONFIGURE_ECR_REPO: yes
+      ECR_OWNER_TEAM: DataPlatform
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: publish
+      - run: deploy
+
+  publish-deploy-service-canary:
+    executor: ccc
+    environment:
+      NAME: event-forwarder
+      GO_BINARY_PATH: bin/service
+
+      DOCKER_REGISTRY: ecr
+      VALUES_FILE: ./canary.yml
+      RELEASE_VERSION: canary
+      DEPLOY_ENVIRONMENT: canary
+
+      CONFIGURE_ECR_REPO: yes
+      ECR_OWNER_TEAM: DataPlatform
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: publish
+      - run: /deploy/merge-values values.yml canary-overrides.yml > canary.yml
+      - run: deploy
+
+
+workflows:
+  deploy:
+    jobs:
+      - build-service:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - lint-service:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+          requires:
+            - build-service
+      - test-service:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+          requires:
+            - build-service
+      - dry-run-service:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - build-service
+          filters:
+            branches:
+              # diffs are included automatically by actual deploys
+              ignore:
+                - main
+                - canary
+      - scan-service:
+          requires:
+            - build-service
+          context:
+            - org-global
+            - github-readonly
+          filters:
+            branches:
+              # fret not, scans are run on main as part of the real publish
+              ignore:
+                - main
+                - canary
+      - publish-deploy-service:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - lint-service
+            - test-service
+          filters:
+            branches:
+              only:
+                - main
+      - publish-deploy-service-canary:
+          context:
+            - org-global
+            - github-readonly
+          requires:
+            - lint-service
+            - test-service
+          filters:
+            branches:
+              only:
+                - canary

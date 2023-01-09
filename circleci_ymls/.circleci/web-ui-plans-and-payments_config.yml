@@ -1,0 +1,225 @@
+version: 2.1
+
+orbs:
+  web-ui-orb: sandbox/web-ui-orb@5.0.0
+  slack: circleci/slack@4.10.1
+
+references:
+  version_js: &version_js 7
+  version_cypress: &version_cypress 1
+  optimizely_sdk_key: &optimizely_sdk_key GfYszBpMkefBSwiiEkH3b3
+  hostname: &hostname app.circleci.com
+
+commands:
+  restore-js-deps:
+    description: |
+      Retrieve and restore javascript dependencies from cache.
+    parameters:
+      cache_version:
+        default: 1
+        description:
+          The version number of the cached js dependencies to retrieve.
+        type: integer
+    steps:
+      - restore_cache:
+          keys:
+            - v<< parameters.cache_version >>-dependency-js-deps-{{ checksum
+              "yarn.lock" }}
+            - v<< parameters.cache_version >>-dependency-js-deps
+
+jobs:
+  generate-types:
+    parameters:
+      cache_version_js_dependencies:
+        description:
+          The version number of the cached dependencies to retrieve and save for
+          app js dependencies.
+        type: integer
+        default: 1
+    docker:
+      - image: circleci/node:14
+    working_directory: /home/circleci/web-ui
+    steps:
+      - checkout
+      - restore-js-deps:
+          cache_version: << parameters.cache_version_js_dependencies >>
+      - run: yarn generate:graphql-types
+
+workflows:
+  version: 2
+
+  build-test-and-deploy:
+    when:
+      not:
+        equal: [scheduled_pipeline, << pipeline.trigger_source >>]
+    jobs:
+      - web-ui-orb/dependencies:
+          name: dependencies
+          context: web-ui-npm
+          cache_version_js_dependencies: *version_js
+          cache_version_cypress_dependencies: *version_cypress
+      - generate-types:
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+      - web-ui-orb/storybook-build:
+          name: storybook-build
+          build_storybook_command:
+            NODE_ENV=test yarn build-storybook -s ./public,./src
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+      - web-ui-orb/test:
+          name: unit-tests
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+      - web-ui-orb/chromatic-snapshot:
+          name: chromatic-snapshot
+          cache_version_js_dependencies: *version_js
+          requires:
+            - dependencies
+            - storybook-build
+      - web-ui-orb/test-production-docker-image:
+          name: e2e-tests
+          image_name: web-ui-plans-and-payments
+          cache_version_js_dependencies: *version_js
+          optimizely_sdk_key: *optimizely_sdk_key
+          hostname: *hostname
+          parallelism: 3
+          resource_class: large
+          requires:
+            - build-static-test
+          context:
+            - web-ui-plans-and-payments-tests
+            - org-global
+      - web-ui-orb/build-static:
+          cache_version_js_dependencies: *version_js
+          name: build-static-test
+          context: web-ui-plans-and-payments-tests
+          requires:
+            - dependencies
+      - web-ui-orb/build-and-deploy-static:
+          cache_version_js_dependencies: *version_js
+          name: build-and-deploy-static
+          bucket_name: circleci-web-ui-plans-and-payments-assets
+          cdn_url: https://assets-plans-and-payments.circleci.com
+          context:
+            [web-ui-plans-and-payments-assets, web-ui-npm, web-ui-datadog]
+          filters:
+            branches:
+              only:
+                - master
+                - canary
+          requires:
+            - build-static-test
+          pre-steps:
+            - run:
+                name: Validate web-ui-plans-and-payments Environment Variables
+                command: |
+                  if [ -z "$CHARGIFY_PUBLIC_KEY" ]; then
+                    echo "Error: The environment variable CHARGIFY_PUBLIC_KEY is empty. Please ensure the environment variable CHARGIFY_PUBLIC_KEY has been added."
+                    exit 1
+                  fi
+                  if [ -z "$CHARGIFY_HOST" ]; then
+                    echo "Error: The environment variable CHARGIFY_HOST is empty. Please ensure the environment variable CHARGIFY_HOST has been added."
+                    exit 1
+                  fi
+      - web-ui-orb/build-and-publish-container:
+          name: build-container-image
+          image_name: web-ui-plans-and-payments
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          scan_only: true
+          context: org-global
+          filters:
+            branches:
+              ignore:
+                - master
+                - canary
+          requires:
+            - unit-tests
+            - build-static-test
+      - web-ui-orb/build-and-publish-container:
+          name: build-and-publish-container-image
+          image_name: web-ui-plans-and-payments
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: org-global
+          filters:
+            branches:
+              only: master
+          requires:
+            - unit-tests
+            - build-and-deploy-static
+            - e2e-tests
+      - web-ui-orb/build-and-publish-container:
+          name: build-and-publish-container-image-canary
+          image_name: web-ui-plans-and-payments
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: org-global
+          filters:
+            branches:
+              only: canary
+          requires:
+            - unit-tests
+            - build-and-deploy-static
+            - e2e-tests
+      - web-ui-orb/deploy-container:
+          name: deploy
+          image_name: web-ui-plans-and-payments
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: org-global
+          pipeline_id: << pipeline.id >>
+          filters:
+            branches:
+              only: master
+          requires:
+            - build-and-publish-container-image
+      - web-ui-orb/deploy-container:
+          name: deploy-canary
+          image_name: web-ui-plans-and-payments
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+          context: org-global
+          pipeline_id: << pipeline.id >>
+          release_version: canary
+          values_file: k8s-canary-values.yml
+          filters:
+            branches:
+              only: canary
+          requires:
+            - build-and-publish-container-image-canary
+
+  checkout-e2e:
+    when:
+      and:
+        - equal: [scheduled_pipeline, << pipeline.trigger_source >>]
+        - equal: ['checkout-e2e', << pipeline.schedule.name >>]
+    jobs:
+      - web-ui-orb/dependencies:
+          name: dependencies
+          context: web-ui-npm
+          cache_version_js_dependencies: *version_js
+          cache_version_cypress_dependencies: *version_cypress
+      - web-ui-orb/test-production-docker-image:
+          name: e2e-tests
+          image_name: web-ui-plans-and-payments
+          cache_version_js_dependencies: *version_js
+          optimizely_sdk_key: *optimizely_sdk_key
+          hostname: *hostname
+          resource_class: large
+          requires:
+            - dependencies
+          context:
+            - web-ui-plans-and-payments-tests
+            - org-global
+            - server-common
+          post-steps:
+            - slack/notify:
+                event: fail
+                channel: 'C027Z6TN5ND' # bxp-alerts channel ID
+                mentions: '@eng-buyerexperience'
+                template: basic_fail_1

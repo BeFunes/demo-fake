@@ -1,0 +1,368 @@
+version: 2.1
+
+ccc_image: &ccc_image
+  image: circleci/command-convenience:0.1
+  auth:
+    username: $DOCKER_HUB_USER
+    password: $DOCKER_HUB_PASSWORD
+
+# Using clj-service-image until there is a better Go option for working with the flyway executable.
+clj_service_img: &clj_service_img
+  image: circleci/clojure-service:0.7-dev
+  auth:
+    username: $RO_DOCKER_HUB_USERNAME
+    password: $RO_DOCKER_HUB_PASSWORD
+  environment:
+    DATABASE_URL: "jdbc:postgresql://localhost:5432/releasetracker?user=releasetracker"
+
+go_image: &go_image
+  image: circleci/go-service:0.1-dev
+  auth:
+    username: $RO_DOCKER_HUB_USERNAME
+    password: $RO_DOCKER_HUB_PASSWORD
+  environment:
+    POSTGRESQL_DATABASE_URI: "jdbc:postgresql://localhost:5432/releasetracker?user=releasetracker"
+
+posgtres_db_image: &postgres_db_image
+  image: cimg/postgres:14.2
+  environment:
+    POSTGRES_USER: releasetracker
+    POSTGRES_DB: releasetracker
+    POSTGRES_HOST_AUTH_METHOD: trust
+
+executors:
+  ccc:
+    docker:
+      - *ccc_image
+    environment:
+      NAME: << pipeline.parameters.release-name >>
+      ECR_OWNER_TEAM: Deploy
+  go:
+    docker:
+      - *go_image
+  go_with_db:
+    docker:
+      - *go_image
+      - *postgres_db_image
+  clj_service_with_db:
+    docker:
+      - *clj_service_img
+      - *postgres_db_image
+
+parameters:
+  release-name:
+    type: string
+    default: "release-tracker"
+  release-version:
+    type: string
+    default: "v1"
+
+commands:
+  install_postgres_client:
+    parameters:
+      distro:
+        default: "buster" # for supported values, see https://apt.postgresql.org/pub/repos/apt/dists/
+        type: string
+    steps:
+      - run:
+          name: Download PostgreSQL client
+          command: |
+            curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add -
+            echo "deb http://apt.postgresql.org/pub/repos/apt/ <<parameters.distro>>-pgdg main" | tee /etc/apt/sources.list.d/pgdg.list
+            apt-get update
+            apt-get install -y --no-install-recommends postgresql-client-14
+  install_task_binary:
+    parameters:
+      version:
+        default: "v3.12.1"
+        type: string
+      arch:
+        default: "amd64"
+        type: string
+    steps:
+      - run:
+          name: Download task binary
+          command: |
+            curl -L -J -O -v -k https://github.com/go-task/task/releases/download/<<parameters.version>>/task_linux_<<parameters.arch>>.deb
+            apt install ./task_linux_<<parameters.arch>>.deb
+  run_migrations:
+    steps:
+      - run:
+          name: Run database migrations
+          command: run-migrations
+          environment:
+            DATABASE_SCHEMA_TABLE: flyway_schema_history
+            DATABASE_MIGRATIONS: sql/migrations
+            DATABASE_USER: releasetracker
+            DATABASE_URL: "jdbc:postgresql://localhost:5432/releasetracker"
+  load_schema:
+    steps:
+      - run:
+          name: Load DB schema
+          command: psql --host localhost --port 5432 --username releasetracker releasetracker --file ~/release-tracker/sql/schema.sql --echo-all
+  add_read_only_user:
+    steps:
+      - run:
+          name: Add read-only user
+          command: |
+            psql --host localhost --port 5432 --username releasetracker releasetracker --echo-all \
+            --command 'CREATE ROLE readonlyuser LOGIN;' \
+            --command 'GRANT CONNECT ON DATABASE releasetracker TO readonlyuser;' \
+            --command 'GRANT SELECT ON ALL TABLES IN SCHEMA public to readonlyuser;'
+
+jobs:
+  build:
+    executor: go
+    working_directory: ~/release-tracker
+    steps:
+      - checkout:
+          path: ~/release-tracker
+      - run: task go-service:private-go-mod-init
+      - run: task go-service:build GO_BINARY_NAME=release-tracker
+      - persist_to_workspace:
+          root: ~/release-tracker
+          paths:
+            - bin
+  lint:
+    executor: go
+    working_directory: ~/release-tracker
+    steps:
+      - checkout:
+          path: ~/release-tracker
+      - run: task go-service:private-go-mod-init
+      - run: task lint
+      - run: task check-go-mod
+  test:
+    executor: go
+    working_directory: ~/release-tracker
+    steps:
+      - checkout:
+          path: ~/release-tracker
+      - run: task go-service:private-go-mod-init
+      - run: task ci:test RESULTS_DIR=/tmp/test-results COVERAGE_DIR=/coverage
+      - store_test_results:
+          path: /tmp/test-results
+      - store_artifacts:
+          path: /coverage
+  integration-test:
+    executor: go_with_db
+    working_directory: ~/release-tracker
+    steps:
+      - checkout:
+          path: ~/release-tracker
+      - install_postgres_client:
+          distro: bullseye
+      - load_schema
+      - add_read_only_user
+      - run: task go-service:private-go-mod-init
+      - run: task ci:integration-test RESULTS_DIR=/tmp/test-results
+      - store_test_results:
+          path: /tmp/test-results
+  check-migrations:
+    executor: go
+    steps:
+      - checkout
+      - run:
+          name: Check for out-of-order migrations
+          command: task check-migrations-order
+  check-schema:
+    executor: clj_service_with_db # Using clj-service until we have a better Go alternative.
+    steps:
+      - checkout
+      - install_postgres_client
+      - run_migrations
+      - install_task_binary
+      - run:
+          name: Generate schema.sql
+          environment:
+            PG_DUMP_COMMAND: pg_dump -h localhost
+            PG_DATABASE: releasetracker
+            PG_USER: releasetracker
+          command: task dump-schema
+      - store_artifacts:
+          path: sql/schema.sql
+      - run:
+          name: Make sure schema.sql is up to date
+          command: |
+            if ! git diff --exit-code HEAD -- sql/schema.sql; then
+              echo "schema.sql is out of date!"
+              echo "Either:"
+              echo "- regenerate the schema (see sql/README.md) or"
+              echo "- download the schema.sql artifact"
+              exit 1;
+            fi
+  check-openapi:
+    executor: go
+    steps:
+      - checkout
+      - run:
+          name: Check if OpenAPI spec is up-to-date
+          command: task ci:openapi-test
+  deploy-migrator:
+    executor: ccc
+    environment:
+      NAME: release-tracker-migrator
+      DOCKER_REGISTRY: ecr
+      CONFIGURE_ECR_REPO: "true"
+      MIGRATIONS_SQL_PATH: sql/migrations
+      VALUES_FILE: deploy/k8s-migrator-values.yml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: publish
+      - run: deploy
+  dry-run-deployment:
+    executor: ccc
+    environment:
+      GO_BINARY_PATH: ./bin/release-tracker
+      VALUES_FILE: deploy/k8s-values.yml
+    working_directory: ~/release-tracker
+    steps:
+      - checkout:
+          path: ~/release-tracker
+      - attach_workspace:
+          at: ~/release-tracker
+      - setup_remote_docker
+      - run: scan
+      - run: /deploy/dry-run
+  publish-service:
+    executor: ccc
+    environment:
+      DOCKER_REGISTRY: ecr
+      CONFIGURE_ECR_REPO: "true"
+      GO_BINARY_PATH: ./bin/release-tracker
+    working_directory: ~/release-tracker
+    steps:
+      - checkout:
+          path: ~/release-tracker
+      - attach_workspace:
+          at: ~/release-tracker
+      - setup_remote_docker
+      - run: publish
+      - persist_to_workspace:
+          root: ~/release-tracker
+          paths:
+            - docker_image.tag
+  deploy-service:
+    executor: ccc
+    environment:
+      ATOMIC_DEPLOY: "true"
+      VALUES_FILE: deploy/k8s-values.yml
+      RELEASE_VERSION: << pipeline.parameters.release-version >>
+    working_directory: ~/release-tracker
+    steps:
+      - checkout:
+          path: ~/release-tracker
+      - attach_workspace:
+          at: ~/release-tracker
+      - setup_remote_docker
+      - run: deploy
+  canary-deploy-service:
+    executor: ccc
+    environment:
+      ATOMIC_DEPLOY: "true"
+      VALUES_FILE: canary.yml
+      RELEASE_VERSION: << pipeline.parameters.release-version >>-canary
+    working_directory: ~/release-tracker
+    steps:
+      - checkout:
+          path: ~/release-tracker
+      - attach_workspace:
+          at: ~/release-tracker
+      - setup_remote_docker
+      - run: /deploy/merge-values deploy/k8s-values.yml deploy/k8s-canary-overrides.yml > canary.yml
+      - run: deploy
+
+workflows:
+  lint-test-publish-deploy:
+    jobs:
+      - lint:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - check-migrations:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - check-schema:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - test:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - integration-test:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - check-openapi:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - build:
+          context:
+            - dockerhub-readonly
+            - github-readonly
+      - dry-run-deployment:
+          context:
+            - org-global
+            - github-readonly
+            - dockerhub-readonly
+          requires:
+            - build
+          filters:
+            branches:
+              ignore:
+                - main
+                - canary
+      - deploy-migrator:
+          context:
+            - org-global
+          requires:
+            - check-migrations
+            - check-schema
+          filters:
+            branches:
+              only:
+                - main
+      - publish-service:
+          context:
+            - org-global
+            - github-readonly
+            - dockerhub-readonly
+          requires:
+            - build
+            - test
+            - integration-test
+            - lint
+            - check-openapi
+          filters:
+            branches:
+              only:
+                - main
+                - canary
+      - deploy-service:
+          context:
+            - org-global
+            - github-readonly
+            - dockerhub-readonly
+          requires:
+            - publish-service
+            - deploy-migrator
+          filters:
+            branches:
+              only:
+                - main
+      - canary-deploy-service:
+          context:
+            - org-global
+            - github-readonly
+            - dockerhub-readonly
+          requires:
+            - publish-service
+            - deploy-migrator
+          filters:
+            branches:
+              only:
+                - canary

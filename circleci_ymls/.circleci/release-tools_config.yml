@@ -1,0 +1,45 @@
+version: 2.1
+
+# allows us to use dynamic config feature
+setup: true
+
+orbs:
+  shellcheck: circleci/shellcheck@2.2.2
+  # the path-filtering orb is required to continue a pipeline based on
+  # the path of an updated fileset
+  path-filtering: circleci/path-filtering@0.1.2
+
+workflows:
+  version: 2
+
+  # the check-for-updates workflow is always triggered, regardless of the pipeline parameters.
+  # determines if we need to rebuild and push up any docker images
+  check-for-updates:
+    jobs:
+      # the path-filtering/filter job determines which pipeline
+      # parameters to update.
+      - path-filtering/filter:
+          name: Check for updated docker images
+          mapping: |
+            integration-workflow/.* run-build-integration-workflow-job true
+            release_branching/.* run-build-release-branching-job true
+          base-revision: main
+          config-path: .circleci/continue_config.yml
+          filters:
+            branches:
+              only:
+                - main
+      # shellcheck job, run on all changes
+      - shellcheck/check:
+          name: Run shellcheck
+          dir: .
+      # run 2.19 workflow on 2.19 tag
+      - path-filtering/filter:
+          name: Check for 2.19 Release tag
+          base-revision: main
+          config-path: .circleci/2-19-release-config.yml
+          filters:
+            tags:
+              only: /^server-2\.19\..*/
+            branches:
+              ignore: /.*/

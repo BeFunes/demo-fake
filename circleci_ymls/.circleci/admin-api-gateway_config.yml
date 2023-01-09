@@ -1,0 +1,225 @@
+version: 2.1
+
+orbs:
+  codecov: codecov/codecov@1.2.2
+  slack: circleci/slack@4.5.2
+
+executors:
+  # Base Docker image for Clojure services
+  # https://github.com/circleci/clojure-service-image
+  clj:
+    resource_class: large
+    docker:
+      - image: circleci/clojure-service:0.8-dev
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+      - image: redis:6-alpine
+        command: redis-server --port 6398 --requirepass password
+      - image: circleci/postgres:11.4-alpine-ram
+        environment:
+          PGPORT: 5498
+          PGUSER: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: admintoolingcommands
+
+  # Docker image for container-related shorthands
+  # https://github.com/circleci/command-convenience-containers
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+
+commands:
+  restore-deps:
+    description: "Restore maven deps from cache and run lein deps"
+    steps:
+      - restore_cache:
+          keys:
+            - maven-{{ checksum "project.clj" }}
+            - maven
+      - run:
+          name: Fetch dependencies
+          command: lein with-profile dev deps
+  save-deps:
+    description: "Save maven deps to cache"
+    steps:
+      - save_cache:
+          key: maven-{{ checksum "project.clj" }}
+          paths:
+            - ~/.m2
+
+jobs:
+  # Initialize the environment by pulling maven dependencies into ~/.m2 and caching them for future
+  # steps and future builds.
+  init-service:
+    executor:
+      name: clj
+    steps:
+      - checkout
+      - restore-deps
+      - save-deps
+
+  # Build the uberjar (the standalone JAR file that ends up deployed in production)
+  build-service-uberjar:
+    executor:
+      name: clj
+    steps:
+      - checkout
+      - restore-deps
+      - run:
+          name: Build uberjar
+          command: |
+            lein uberjar
+            cp -v target/admin-api-gateway-*-standalone.jar target/admin-api-gateway-standalone.jar
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target/admin-api-gateway-standalone.jar
+
+  # Runs linters on the Clojure code
+  lint-service:
+    executor:
+      name: clj
+    steps:
+      - checkout
+      - restore-deps
+      - run: lein clj-kondo
+      - run: lein eastwood
+      - run: lein cljfmt check
+
+  # Runs all the Clojure tests
+  test-service:
+    executor:
+      name: clj
+    steps:
+      - checkout
+      - restore-deps
+      # See the project.clj file for the differences between test and test-ci:
+      # Usually this means `test` plus coverage and junit output plugins
+      - run: lein test-ci
+      - store_test_results:
+          path: target/test-results
+      - codecov/upload
+
+  # Outputs the helm diff compared to helm's production charts
+  dry-run-service:
+    executor:
+      name: ccc
+    environment:
+      # These need to match the variables in your deployment job to get a meaningful diff
+      NAME: admin-api-gateway
+      VALUES_FILE: values.yml
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: /deploy/dry-run
+
+  # Runs a Twistlock/Prisma scan on feature branches
+  # See https://github.com/circleci/engineering/blob/master/howto/prisma-scan-for-vulns.md
+  scan-service:
+    executor:
+      name: ccc
+    environment:
+      NAME: admin-api-gateway
+      DEPLOY_CLOJURE_JARFILE: target/admin-api-gateway-standalone.jar
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - run: scan
+      - store_artifacts:
+          path: ccc-image-scan-results
+          destination: admin-api-gateway/ccc-image-scan-results
+
+  # Publishes to ECR/Docker Hub and deploys the service on main and canary branches
+  publish-deploy-service:
+    executor:
+      name: ccc
+    environment:
+      NAME: admin-api-gateway
+      DEPLOY_CLOJURE_JARFILE: target/admin-api-gateway-standalone.jar
+      DOCKER_REGISTRY: ecr
+      VALUES_FILE: values.yml # possibly overriden below
+      ATOMIC_DEPLOY: true # temporarily set for testing atomic deploy CCC feature
+      ATOMIC_TIMEOUT: "5m"
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: .
+      - when:
+          condition:
+            not: # exclusive rather than inclusive to protect against branches being renamed
+              equal: [main, << pipeline.git.branch >>]
+          steps:
+            - run:
+                name: Configure canary
+                command: |
+                  # These override default values from CCC and the executor.
+                  echo "export RELEASE_VERSION=canary" >> "${BASH_ENV}"
+                  echo "export ROLLBAR_ENVIRONMENT=canary" >> "${BASH_ENV}"
+                  echo "export VALUES_FILE=canary.yml" >> "${BASH_ENV}"
+                  /deploy/merge-values values.yml canary-overrides.yml > canary.yml
+      - run: publish
+      - run: deploy
+      - slack/notify:
+          event: fail
+          channel: C01UK1XTNUF # admin-tooling-alerts
+          mentions: '@admin-tooling-engineering'
+          template: basic_fail_1
+
+workflows:
+  build-test-deploy:
+    jobs:
+      - init-service:
+          context: org-global
+      - build-service-uberjar:
+          context: org-global
+          requires:
+            - init-service
+      - lint-service:
+          context: org-global
+          requires:
+            - init-service
+      - test-service:
+          context: org-global
+          requires:
+            - init-service
+      - dry-run-service:
+          context: org-global
+          requires:
+            - init-service
+          filters:
+            branches:
+              # diffs are included automatically by actual deploys
+              ignore:
+                - main
+                - canary
+      - scan-service:
+          context: org-global
+          requires:
+            - build-service-uberjar
+          filters:
+            branches:
+              # fret not, scans are run on main and canary too, as part of the real publish
+              ignore:
+                - main
+                - canary
+      - publish-deploy-service:
+          context:
+            - org-global
+            - admin-tooling-slack-notifications
+          requires:
+            - build-service-uberjar
+            - lint-service
+            - test-service
+          filters:
+            branches:
+              only:
+                - main
+                - canary

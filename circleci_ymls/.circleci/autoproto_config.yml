@@ -1,0 +1,122 @@
+version: 2.0
+
+references:
+  set-up-env: &set-up-env
+    run:
+      name: Set up env
+      command: |
+        set -o nounset
+        echo "export AUTOPROTO_LIBRARY_VERSION=$(cat workspace/.library-version)" >> "${CIRCLE_SHELL_ENV}"
+
+jobs:
+  build:
+    docker:
+    - image: clojure:lein-2.8.1
+    working_directory: /home/circleci/autoproto
+    steps:
+    - checkout
+
+    - attach_workspace:
+        at: workspace
+
+    - restore_cache:
+        keys:
+        - autoproto-svc-jars-{{ checksum "project.clj" }}
+
+    - *set-up-env
+
+    - run: lein deps
+
+    - save_cache:
+        key: autoproto-svc-jars-{{ checksum "project.clj" }}
+        paths:
+        - /root/.m2
+
+    # because for some reason, lein test isn't catching compile errors
+    - run:
+        name: lein check
+        command: lein check
+
+    - run:
+        name: Run tests
+        command: |
+          set -o pipefail
+          lein test 2>&1 | tee output.txt
+    - run:
+        name: Check for reflection warnings
+        command: |
+          ! grep -e '^Reflection warning, circleci\/autoproto\/' output.txt | grep -v -e "_test\.clj"
+
+  generate-version:
+    docker:
+    - image: clojure:lein-2.8.1
+    steps:
+    - run:
+        name: Generate the library version
+        command: |
+          set -o errexit
+          set -o nounset
+          version="0.1.${CIRCLE_BUILD_NUM}"
+          if [ "${CIRCLE_BRANCH:-}" = "main" ]; then
+            short_sha=${CIRCLE_SHA1:0:7}
+            version="${version}-${short_sha}"
+          fi
+          echo "${version}" > .library-version
+    - persist_to_workspace:
+        root: .
+        paths:
+        - .library-version
+
+  deploy:
+    docker:
+    - image: clojure:lein-2.8.1
+    working_directory: /home/circleci/autoproto
+    steps:
+    - add_ssh_keys:
+        fingerprints:
+        - "5c:9f:b8:7b:75:8a:52:3c:13:60:56:00:20:42:64:e8"
+    - checkout
+
+    - attach_workspace:
+        at: workspace
+
+    - *set-up-env
+
+    - restore_cache:
+        key: v1-autoproto-jars-circleci-{{ checksum "project.clj" }}
+
+    - run:
+        name: Deploy to circle-s3
+        command: |
+          lein version-spec
+          lein deploy circle-s3
+    - run:
+        name: discarding all changes
+        command: git checkout -- .
+
+    - run:
+        name: Tag the release
+        command: |
+            git tag "${AUTOPROTO_LIBRARY_VERSION}"
+            git push --tags
+
+    - save_cache:
+        key: v1-autoproto-jars-circleci-{{ checksum "project.clj" }}
+        paths:
+        - /home/circleci/.m2
+
+workflows:
+  version: 2
+  build-and-deploy:
+    jobs:
+    - generate-version
+    - build:
+        requires:
+        - generate-version
+    - deploy:
+        context: org-global
+        requires:
+        - build
+        filters:
+          branches:
+            only: main

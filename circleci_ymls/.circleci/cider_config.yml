@@ -1,0 +1,150 @@
+version: 2.1
+
+orbs:
+  macos: circleci/macos@2
+
+commands:
+  generate-test-secrets:
+    description: "Generate the xcconfig Test Secrets"
+    steps:
+      - run: bash .circleci/gen_secrets.sh
+
+jobs: 
+  test-swift:
+    macos:
+      xcode: 13.2.1
+    resource_class: macos.x86.medium.gen2
+    steps:
+      - checkout
+      - generate-test-secrets
+      - run:
+          name: Run Unit Tests
+          command: xcodebuild test -scheme Cider -destination 'platform=iOS Simulator,name=iPhone 11'
+
+  detox-e2e:
+    macos:
+      xcode: 13.2.1
+    resource_class: macos.x86.medium.gen2
+    steps:
+      - checkout
+      - run:
+          name: (brew) Install prerequisites
+          command: brew tap wix/brew && brew install applesimutils
+      - run:
+          name: (npm) Install detox-cli
+          command: npm install -g detox-cli
+      - run:
+          name: (npm) Install detox & mocha
+          command: npm install detox --save-dev --no-package-lock && npm install mocha --save-dev --no-package-lock
+      - run:
+          name: Detox Build
+          command: detox build --configuration ios
+      - run:
+          name: Detox Test
+          command: detox test --configuration ios --take-screenshots all --record-videos all
+      - store_artifacts:
+          path: artifacts
+  
+  dh-detox-e2e:
+    macos:
+      xcode: 13.2.1
+    resource_class: macos.x86.metal.gen1
+    steps:
+      - checkout
+      - run:
+          name: (brew) Install prerequisites
+          command: brew tap wix/brew && brew install applesimutils
+      - run:
+          name: (npm) Install detox-cli
+          command: npm install -g detox-cli
+      - run:
+          name: (npm) Install detox & mocha
+          command: npm install detox --save-dev --no-package-lock && npm install mocha --save-dev --no-package-lock
+      - run:
+          name: Detox Build
+          command: detox build --configuration ios
+      - run:
+          name: Detox Test
+          command: detox test --configuration ios --take-screenshots all --record-videos all
+      - store_artifacts:
+          path: artifacts
+
+  dc-fleet-fastlane-tests:
+    parameters:
+      resource:
+        type: string
+      parallel-level:
+        type: integer
+    macos:
+      xcode: 13.2.1
+    resource_class: << parameters.parallel-level >>
+    parallelism: << parameters.parallel-level >>
+    environment:
+      FL_OUTPUT_DIR: output
+      FASTLANE_LANE: tests
+    shell: /bin/bash --login -o pipefail
+    steps:
+      - checkout
+      - macos/switch-ruby:
+          version: "3"
+      - macos/preboot-simulator:
+          device: iPhone 13
+          version: "15.2"
+      - macos/preboot-simulator:
+          device: iPod touch (7th generation)
+          version: "15.2"
+      - restore_cache:
+          keys:
+            - gem-cache-v1-{{ arch }}-{{ .Branch }}-{{ checksum "Gemfile.lock" }}
+            - gem-cache-v1-{{ arch }}-{{ .Branch }}
+            - gem-cache-v1
+      - run:
+          name: Ruby Dependencies
+          command: bundle install --path vendor/bundle
+      - save_cache:
+          key: gem-cache-v1-{{ arch }}-{{ .Branch }}-{{ checksum "Gemfile.lock" }}
+          paths:
+            - vendor/bundle
+      - generate-test-secrets
+      - run:
+          name: fastlane
+          command: bundle exec fastlane $FASTLANE_LANE
+      - run:
+          name: Move important artifacts
+          command: |
+            mkdir -p /tmp/artifacts/build_reports/
+            cp output/scan/report.html /tmp/artifacts/build_reports/
+            cp output/scan/report.junit /tmp/artifacts/build_reports/
+            cp output/buildlogs/scan/Cider-Cider.log /tmp/artifacts/build_reports/
+            cp fastlane/report.xml /tmp/artifacts/build_reports/
+      - store_artifacts:
+          path: /tmp/artifacts/build_reports/
+      - store_test_results:
+          path: /tmp/artifacts/build_reports/
+
+workflows:
+  version: 2
+  test_build:
+    jobs:
+      - dc-fleet-fastlane-tests:
+          matrix:
+            alias: "dc_fleet_fastlane_tests_single"
+            parameters:
+              resource: ["macos.x86.medium.gen2"]
+              parallel-level: [1]
+      - detox-e2e:
+          requires:
+            - dc_fleet_fastlane_tests_single
+      - dh-detox-e2e:
+          requires:
+            - dc_fleet_fastlane_tests_single
+      - dc-fleet-fastlane-tests:
+          matrix:
+            alias: "dc_fleet_fastlane_tests"
+            parameters:
+              resource: ["macos.x86.medium.gen2","medium","large"]
+              parallel-level: [2]
+          requires:
+            - dc_fleet_fastlane_tests_single
+
+# VS Code Extension Version: 1.5.0

@@ -1,0 +1,57 @@
+version: 2.1
+
+workflows:
+  version: 2
+  ci:
+    jobs:
+      - test:
+          context: org-global
+      - publish:
+          context: org-global
+          requires:
+            - test
+          filters:
+            branches:
+              only: main 
+
+commands:
+  save_jar_cache:
+    steps:
+      - save_cache:
+          key: v1-jars-{{ checksum "project.clj" }}
+          paths: [~/.m2]
+  setup:
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-jars-{{ checksum "project.clj" }}
+            - v1-jars-
+
+jobs:
+  test:
+    docker:
+      - image: circleci/clojure-service:0.2-dev
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    steps:
+      - setup
+      - run:
+          command: lein cloverage --codecov
+      - save_jar_cache
+      - run:
+          name: Upload coverage data
+          command: |
+            bash <(curl -s https://codecov.io/bash)
+
+  publish:
+    docker:
+      - image: circleci/clojure-service:0.2-dev
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    steps:
+      - setup
+      - run: lein deploy circle-s3
+      - save_jar_cache

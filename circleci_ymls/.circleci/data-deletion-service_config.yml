@@ -1,0 +1,213 @@
+---
+version: 2.1
+
+orbs:
+  shellcheck: circleci/shellcheck@2.2.4
+  snyk: snyk/snyk@1.1.2
+
+executors:
+  golang:
+    docker:
+      - image: circleci/go-service:0.1-dev
+        auth:
+          username: $RO_DOCKER_HUB_USERNAME
+          password: $RO_DOCKER_HUB_PASSWORD
+    working_directory: ~/project
+
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    environment:
+      NAME: << pipeline.parameters.release-name >>
+      DOCKERFILE_PATH: Dockerfile
+      CONFIGURE_ECR_REPO: true
+      ECR_OWNER_TEAM: Security
+      EXTRA_DOCKER_BUILD_ARGS: '--secret id=github_user,env=GITHUB_USER --secret id=github_token,env=GITHUB_TOKEN'
+
+parameters:
+  release-name:
+    type: string
+    default: 'data-deletion-service'
+  release-version:
+    type: string
+    default: 'v1'
+
+commands:
+  setup:
+    steps:
+      - checkout
+      - run: git config --global url."https://$GITHUB_USER:$GITHUB_TOKEN@github.com/circleci/".insteadOf "https://github.com/circleci/"
+      - run: export GOPRIVATE=github.com/circleci/*
+      - run: go mod download
+      - run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.46.2
+      - run: go install gotest.tools/gotestsum@latest
+
+  store_results:
+    steps:
+      - run:
+          name: Strip ANSI codes from xunit output
+          when: always
+          command: |
+            # The test output produces ANSI codes, which the XML writer converts into annoying
+            # \0xfffd characters - we'll strip these out to make the XML a bit more readable
+            sed -i 's/�\[[0-9;]*[a-zA-Z]//g' test-reports/*.xml || true
+      - store_artifacts:
+          path: test-reports
+      - store_test_results:
+          path: test-reports
+
+jobs:
+  lint:
+    executor: golang
+    steps:
+      - setup
+      - run:
+          name: go tidy
+          command: go mod tidy -v
+      - run:
+          name: verify no changes
+          command: git diff --ignore-matching-lines='Generated on ' --exit-code
+      - run: mkdir -p test-reports
+      - run: golangci-lint run -c .golangci.yml ./... --out-format junit-xml | tee test-reports/lint.xml
+      - store_results
+  pii-schema:
+    machine:
+      image: ubuntu-2004:202107-02
+    steps:
+      - checkout
+      - run:
+          name: Check PII specs against schema
+          command: |
+            ajv_image_name="ajv-cli-docker"
+            docker build --tag ${ajv_image_name} -f internal/specs/Dockerfile "${PWD}"
+
+            # run against the test specs and actual specs
+            docker run -v "${PWD}/internal/specs/test-specs:/data/test-specs" -v "${PWD}/internal/specs/specs:/data" ${ajv_image_name} validate -s schema.json -d "test-specs/*.yaml" -d "*.yaml"
+
+  security-scans:
+    docker:
+      - image: cimg/go:1.18
+    steps:
+      - checkout
+      - run: git config --global url."https://$GITHUB_USER:$GITHUB_TOKEN@github.com/circleci/".insteadOf "https://github.com/circleci/"
+      - when:
+          condition:
+            equal: [ main, << pipeline.git.branch >> ]
+          steps:
+            - run:
+                name: Running snyk CLI on main branch; uploading results
+                command: echo "We are running snyk scan and uploading the results"
+            - snyk/scan:
+                fail-on-issues: false
+                severity-threshold: high
+                monitor-on-build: true
+                project: 'circleci/${CIRCLE_PROJECT_REPONAME}'
+                organization: "circleci-78h"
+      - unless:
+          condition:
+            equal: [ main, << pipeline.git.branch >> ]
+          steps:
+            - run:
+                name: Running snyk CLI on branch; no results uploading
+                command: echo "We are running snyk scan locally and NOT uploading the branch scan results"
+            - snyk/scan:
+                fail-on-issues: false
+                severity-threshold: high
+                monitor-on-build: false
+                project: 'circleci/${CIRCLE_PROJECT_REPONAME}/${CIRCLE_BRANCH}'
+                organization: "circleci-78h"
+
+  build-and-deploy:
+    executor: ccc
+    environment:
+      NAME: data-deletion-service
+      IMAGE_NAME: 'circleci/data-deletion-service'
+      DOCKER_BUILDKIT: 1
+      AWS_DEFAULT_REGION: us-east-1
+      RELEASE_VERSION: << pipeline.parameters.release-version >>
+      VALUES_FILE: values.yaml
+    steps:
+      - setup_remote_docker:
+          version: 20.10.11
+          docker_layer_caching: true
+      - run: docker version
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: publish docker image
+          command: |
+            set -x
+            if [[ "$CIRCLE_BRANCH" = "main" || "$CIRCLE_BRANCH" = "canary" ]]; then
+              # TODO change to all once dockerhub repo is ready
+              export DOCKER_REGISTRY=ecr
+            else
+              # this is how we tell CCC not to actually publish
+              export DOCKER_REGISTRY=none
+            fi
+            publish
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker_image.tag
+      - run:
+          name: deploy on merge to main
+          command: |
+            set -x
+            if [[ "$CIRCLE_BRANCH" = "main" ]]; then
+              deploy
+            fi
+  test:
+    docker:
+      - image: cimg/go:1.18
+      - image: circleci/postgres:11.4-alpine-ram
+        environment:
+          PGUSER: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+    resource_class: large
+    steps:
+      - setup
+      - run: export DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres
+      - run: go run ./cmd/migrate
+      - run:
+          name: run tests
+          command: |
+            mkdir -p test-reports
+            # -count=1 is used to forcibly disable test result caching
+            gotestsum --junitfile="test-reports/junit.xml" -- -race -p 1 -count=1 "${@:-./...}" -coverprofile=coverage.out -coverpkg=./...
+            go tool cover -html=coverage.out -o coverage.html
+            mv coverage.html /tmp/test-results
+      - store_artifacts:
+          path: /tmp/test-results
+      - store_results
+
+workflows:
+  main:
+    jobs:
+      - lint:
+          context: [github-readonly, dockerhub-readonly]
+      - shellcheck/check:
+          name: shellcheck-do
+          pattern: 'do'
+      - pii-schema:
+          context: org-global
+      - test:
+          context: [org-global, github-readonly, dockerhub-readonly]
+          requires:
+            - lint
+            # because we don't want to supply invalid PII specs
+            - pii-schema
+            # because we don't want to test against old generated files
+      - security-scans:
+          context: [ org-global, github-readonly ]
+      - build-and-deploy:
+          context: [org-global, github-readonly]
+          requires:
+            - lint
+            - shellcheck-do
+            - test

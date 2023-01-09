@@ -1,0 +1,214 @@
+version: 2.1
+
+references:
+    project: &project audit_ingest
+    dir: &dir ~/audit_ingest
+    ccc-job: &ccc-job
+    ccc-image: &ccc-image circleci/command-convenience:0.1
+
+executors:
+    ccc:
+        working_directory: *dir
+        docker:
+            - image: *ccc-image
+              auth:
+                  username: $DOCKER_HUB_USER
+                  password: $DOCKER_HUB_PASSWORD
+              environment:
+                  NAME: finance_audit_ingestion
+                  DOCKER_REGISTRY: ecr
+                  NAMESPACE: data
+                  DOCKERFILE_PATH: "./audit-ingest/Dockerfile"
+                  DEPLOY_CONTAINER_NAME: "183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/finance_audit_ingestion"
+    python:
+        docker:
+            - image: python:3.9
+              environment:
+                  POETRY_VIRTUALENVS_PATH: /virtualenvs/envs
+                  POETRY_CACHE_DIR: /virtualenvs/cache
+                  ODS_DB_PORT: "5432"
+                  SOURCE_DB_PORT: "5432"
+                  AWS_ACCESS_KEY_ID: "test_access_key"
+                  AWS_SECRET_ACCESS_KEY: "test_secret_access_key"
+            - image: postgres:12
+              environment:
+                  POSTGRES_USER: postgres
+                  POSTGRES_PASSWORD: postgres
+            - image: localstack/localstack
+              environment:
+                  SERVICES: s3
+                  DEBUG: 1
+                  DATA_DIR: /tmp/localstack/data
+                  START_WEB: 0
+
+
+commands:
+    setup-python-dependencies:
+        description: Setup the python environment for testing and linting
+        steps:
+            - checkout
+            - restore_cache:
+                  keys:
+                      - poetry-cache-v3-{{ arch }}-{{ .Branch }}-{{ checksum "poetry.lock" }}
+                      - poetry-cache-v3-{{ arch }}-{{ .Branch }}
+                      - poetry-cache-v3
+            - run: echo "export PATH=$HOME/.poetry/bin:$PATH" >> $BASH_ENV
+            - run: curl -sSL https://raw.githubusercontent.com/python-poetry/poetry/master/get-poetry.py | python -
+            - run: poetry install --no-root
+            - save_cache:
+                  key: poetry-cache-v3-{{ arch }}-{{ .Branch }}-{{ checksum "poetry.lock" }}
+                  paths: /virtualenvs
+    publish:
+        description: Run cci publish to building and push the docker container.
+        steps:
+            - checkout
+            - setup_remote_docker
+            - run: publish
+            - store_artifacts:
+                  path: ccc-image-scan-results
+    setup-postgres-dbs:
+        description: Initialize the postgres dbs we need for testing
+        steps:
+            - run:
+                  command: |
+                      apt-get update
+                      apt-get install -y software-properties-common
+                      apt-add-repository 'deb http://security.debian.org/debian-security stretch/updates main'
+                      apt update && apt install -y postgresql-client openjdk-8-jdk-headless
+                      PGPASSWORD=postgres createdb -h localhost -U postgres --no-password -O postgres dev-ods
+                      PGPASSWORD=postgres createdb -h localhost -U postgres --no-password -O postgres dev-sources
+                      PGPASSWORD=postgres psql -h localhost --port 5432 dev-sources postgres -f resources/setup_db.sql
+            - run: curl -L https://repo1.maven.org/maven2/org/flywaydb/flyway-commandline/6.3.1/flyway-commandline-6.3.1.tar.gz -o flyway-commandline-6.3.1.tar.gz
+            - run: tar -xzf flyway-commandline-6.3.1.tar.gz --strip-components=1
+            - run: rm flyway-commandline-6.3.1.tar.gz
+            - run: ./flyway -X -validateMigrationNaming=true -url=$FLYWAY_DB_URL -user=postgres -password=postgres -locations=filesystem:migrations/sql/ migrate
+
+    wait-for-localstack:
+        description: Waits for localstack to start.
+        steps:
+        - run:
+            name: Wait for localstack to start
+            command: |
+                curl \
+                -4 \
+                --retry 60 \
+                --retry-connrefused \
+                --retry-delay 1 \
+                --retry-max-time 60 \
+                'http://localhost:4566/health'
+
+
+jobs:
+    lint:
+        executor: python
+        steps:
+            - setup-python-dependencies
+            - run: poetry run pylint audit-ingest
+            - run: poetry run mypy audit-ingest/audit_ingest/
+    test:
+        executor: python
+        environment:
+            FLYWAY_DB_URL: jdbc:postgresql://localhost:5432/dev-ods
+        steps:
+            - setup-python-dependencies
+            - setup-postgres-dbs
+            - wait-for-localstack
+            - run: poetry run pytest
+    publish-branch:
+        executor: ccc
+        steps:
+            - publish
+    publish-latest:
+        executor: ccc
+        steps:
+            - publish
+        environment:
+            CONTAINER_VERSION: latest
+    publish-and-deploy-db-migrator:
+        working_directory: *dir
+        docker:
+            - image: *ccc-image
+              auth:
+                  username: $DOCKER_HUB_USER
+                  password: $DOCKER_HUB_PASSWORD
+              environment:
+                  NAME: finance-audit-ingestion-migrator
+                  IMAGE_NAME: circleci/finance_audit_ingestion_migrator
+                  DOCKER_REGISTRY: ecr
+                  DEPLOY_TYPE: helm
+                  NAMESPACE: data
+                  DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/finance_audit_ingestion_migrator
+                  MIGRATIONS_SQL_PATH: migrations/sql/
+                  VALUES_FILE: migrations/values.yaml
+        steps:
+            - checkout
+            - attach_workspace:
+                  at: *dir
+            - setup_remote_docker
+            - run: publish
+            - run: deploy
+    publish-and-deploy-db-migrator-snowflake:
+        working_directory: *dir
+        docker:
+            - image: *ccc-image
+              auth:
+                  username: $DOCKER_HUB_USER
+                  password: $DOCKER_HUB_PASSWORD
+              environment:
+                  NAME: finance-audit-snapshot-migrator
+                  IMAGE_NAME: circleci/finance_audit_ingestion_migrator
+                  DOCKER_REGISTRY: ecr
+                  DEPLOY_TYPE: helm
+                  NAMESPACE: data
+                  DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/finance_audit_ingestion_migrator
+                  MIGRATIONS_SQL_PATH: migrations/snowflake-sql/
+                  VALUES_FILE: migrations/snowflake-values.yaml
+        steps:
+            - checkout
+            - attach_workspace:
+                  at: *dir
+            - setup_remote_docker
+            - run: publish
+            - run: deploy
+
+workflows:
+    commit:
+        jobs:
+            # lint and test
+            - lint
+            - test
+            # staging and dev deploy
+            - publish-branch:
+                  context: org-global
+                  requires:
+                      - lint
+                      - test
+            # db migrations
+            - publish-and-deploy-db-migrator:
+                  filters:
+                      branches:
+                          only:
+                              - master
+                  requires:
+                      - lint
+                      - test
+                  context: org-global
+            - publish-and-deploy-db-migrator-snowflake:
+                  filters:
+                      branches:
+                          only:
+                              - master
+                  requires:
+                      - lint
+                      - test
+                  context: org-global
+            # prod deploy
+            - publish-latest:
+                  context: org-global
+                  filters:
+                      branches:
+                          only:
+                              - master
+                  requires:
+                      - publish-and-deploy-db-migrator
+                      - publish-and-deploy-db-migrator-snowflake

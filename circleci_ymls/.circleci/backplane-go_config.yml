@@ -1,0 +1,80 @@
+version: 2.1
+
+library_version: &major_minor_version "0.7"
+some_image_name: &my_image "cimg/node:latest"
+
+executors:
+  go:
+    docker:
+      - image: cimg/node:latest # Public image on Docker HUB namespace; Should be OK
+      - image: cimg/node:18.9.0 # Public image on Docker HUB namespace w/ specific version; Should be OK
+      - image: cimg/node:0000 # Non-existing image version (tag); Should be NOT OK
+      - image: node:latest # Public image on Docker HUB root namespace; Should be OK
+      - image: node:18781 # Non-existing image version (tag); Should be NOT OK
+      - image: *my_image # No validation with anchor, should be OK
+      - image: &goimage cimg/go:1.18 # With alias, should be OK (image exists)
+      - image: &testimage cimg/go:888 # With alias, should be NOT OK (image doesnt exist)
+      - image: cimg/go # No tag specified, should be NOT OK
+      - image: circleci/go-service:0.1-dev # Private image; Should be OK (no validation because of Auth)
+        auth:
+          username: $RO_DOCKER_HUB_USERNAME
+          password: $RO_DOCKER_HUB_PASSWORD
+  test:
+    docker:
+      - image: cimg/node:latest
+
+jobs:
+  lint:
+    executor: test
+    steps:
+      - checkout
+      - run: task lint
+      - run: task check-go-mod
+
+  test:
+    executor: go
+    steps:
+      - checkout
+      - run: task ci:test RESULTS_DIR=/tmp/test-results
+      - store_test_results:
+          path: /tmp/test-results
+
+  publish:
+    executor: go
+    environment:
+      MAJOR_MINOR_VERSION: *major_minor_version
+    steps:
+      - add_ssh_keys:
+          fingerprints:
+            - "8a:f0:50:55:e9:b4:36:70:42:14:40:17:52:6c:bb:ce"
+      - checkout
+      - run:
+          name: Set version
+          command: |
+            patch_version="${CIRCLE_BUILD_NUM}"
+            echo "export BACKPLANE_GO_VERSION=${MAJOR_MINOR_VERSION}.$patch_version" >> "${BASH_ENV}"
+      - run:
+          name: Tag the release
+          command: |
+            git config user.email "backplane@circleci.com"
+            git config user.name "Backplane Bot"
+            # Go expects version semantic tags to start with "v".
+            git tag "v$BACKPLANE_GO_VERSION"
+            git push --tags
+
+workflows:
+  publish:
+    jobs:
+      - lint:
+          context: dockerhub-readonly
+      - test:
+          context: dockerhub-readonly
+      - publish:
+          context: dockerhub-readonly
+          requires:
+            - lint
+            - test
+          filters:
+            branches:
+              only:
+                - main

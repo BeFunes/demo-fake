@@ -1,0 +1,285 @@
+version: 2.1
+
+references:
+  ccc_image: &ccc_image
+    circleci/command-convenience:0.1
+
+  clojure_image: &clojure_image
+    circleci/clojure-service:0.6-dev
+
+jobs:
+  test:
+    docker:
+      - image: *clojure_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+      - image: rabbitmq:3.7.15-management
+      - image: postgres:12.5-alpine
+        environment:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: zuora_service
+          POSTGRES_HOST_AUTH_METHOD: trust
+    working_directory: /root/zuora-service
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - v5-zuora-svc-jars-{{ checksum "server/project.clj" }}
+
+      - run:
+          name: Wait for Postgres
+          command: dockerize -wait tcp://localhost:5432 -timeout 1m
+
+      - run:
+          name: Run migrations
+          # the sleep seems keeping 'database "zuora_service" does not exist' error from happening
+          command: sleep 3 && flyway -url=jdbc:postgresql://localhost:5432/zuora_service -user=postgres -locations=filesystem:migrator/sql migrate
+
+      - run:
+          name: Wait for RabbitMQ
+          command: dockerize -wait tcp://localhost:15672 -timeout 1m
+
+      - run:
+          name: Run server linting and tests
+          # The constant-test linter gives false positives for vcr-clj's with-cassettes macro
+          command: lein do lint, test --plugin profiling --plugin junit-xml --junit-xml-file target/test-results/results.xml
+          working_directory: /root/zuora-service/server
+          environment:
+            STATSD__PORT: 8199
+            POSTGRESQL__ZUORA_SERVICE__URI: jdbc:postgresql://localhost/zuora_service?user=postgres
+            PLANS_SERVICE__RABBITMQ__URI: amqp://localhost:5672
+            RABBITMQ__URI: amqp://localhost:5672
+
+      - save_cache:
+          key: v5-zuora-svc-jars-{{ checksum "server/project.clj" }}
+          paths:
+            - /root/.m2
+
+      - store_test_results:
+          path: server/target/test-results
+
+  build:
+    docker:
+      - image: *clojure_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+    working_directory: /root/zuora-service
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - v1-zuora-service-{{ checksum "server/project.clj" }}
+            - v1-zuora-service-
+
+      - run:
+          name: Build production uberjar
+          working_directory: /root/zuora-service/server
+          command: |
+            lein uberjar
+            mv target/uberjar/zuora-service-*-standalone.jar ./zuora-service-standalone.jar
+            lein clean
+            mkdir -p target/uberjar
+            mv zuora-service-standalone.jar target/uberjar
+
+      - save_cache:
+          key: v1-zuora-service-{{ checksum "server/project.clj" }}
+          paths:
+            - /home/circleci/.m2
+
+      - persist_to_workspace:
+          root: server/target
+          paths:
+            - uberjar/zuora-service-standalone.jar
+
+  test-container-build:
+    working_directory: /root/zuora-service
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: zuora-service
+          DOCKERFILE_PATH: server.Dockerfile
+          DOCKER_REGISTRY: none
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /root/zuora-service/server/target
+      - setup_remote_docker
+      - run: publish
+      - store_artifacts:
+          path: ccc-image-scan-results
+
+  check-schema:
+    working_directory: /root/zuora-service
+    docker:
+      - image: *clojure_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+      - image: postgres:9.5.16
+        environment:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: zuora_service
+    steps:
+      - checkout
+      - run:
+          name: Download PostgreSQL client
+          command: |
+            apt-get update
+            apt-get install -y wget
+            wget -O /tmp/pgsql.tar.gz https://get.enterprisedb.com/postgresql/postgresql-9.5.16-1-linux-x64-binaries.tar.gz
+            cd /tmp
+            tar xvzf /tmp/pgsql.tar.gz
+      - restore_cache:
+          keys:
+            - v5-zuora-svc-jars-{{ checksum "server/project.clj" }}
+      - attach_workspace:
+          at: /root/zuora-service
+      - run:
+          name: Run migrations
+          # the sleep seems keeping 'database "zuora_service" does not exist' error from happening
+          command: sleep 3 && flyway -url=jdbc:postgresql://localhost:5432/zuora_service -user=postgres -locations=filesystem:migrator/sql -table=schema_version migrate
+      - run:
+          name: Dump migrated schema
+          command: |
+            env FILENAME="schema-after.sql" \
+              PG_DUMP_COMMAND="/tmp/pgsql/bin/pg_dump --host=localhost" \
+              DATABASE="zuora_service" \
+              ./scripts/dump-schema
+      - run:
+          name: Check that schema.sql accounts for migrations
+          command: |
+            # If the `diff` exit code is not zero, the schema.sql file is
+            # out-of date. Read https://github.com/circleci/plans-service/tree/master/migrator#creating-a-migration
+            # for instructions on creating migrations.
+            diff schema.sql schema-after.sql
+
+  deploy-migrator:
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: zuora-service-migrator
+          DOCKERFILE_PATH: migrator.Dockerfile
+          DOCKER_REGISTRY: ecr
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/zuora-service-migrator
+          VALUES_FILE: migrator/k8s-values.yaml
+          NAMESPACE: monetization
+    working_directory: /root/zuora-service
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          command: publish
+      - run:
+          command: deploy
+      - store_artifacts:
+          path: ccc-image-scan-results
+
+  deploy-service:
+    working_directory: /root/zuora-service
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: zuora-service
+          DOCKERFILE_PATH: server.Dockerfile
+          DOCKER_REGISTRY: ecr
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/zuora-service
+          VALUES_FILE: server/k8s-values.yaml
+          NAMESPACE: monetization
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /root/zuora-service/server/target
+      - setup_remote_docker
+      - run: publish
+      - run: deploy
+      - store_artifacts:
+          path: ccc-image-scan-results
+
+  # push your feature branch to the "canary" branch to get it deployed to a single pod
+  # run `helm delete --purge zuora-service-v1-canary` on kubectl when you have
+  # confirmed your change is safe (or not) to kill it
+  deploy-canary:
+    docker:
+      - image: *ccc_image
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: zuora-service
+          DOCKERFILE_PATH: server.Dockerfile
+          DOCKER_REGISTRY: ecr
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/zuora-service
+          VALUES_FILE: server/k8s-canary.yaml
+          RELEASE_VERSION: v1-canary
+          NAMESPACE: monetization
+    working_directory: /root/zuora-service
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /root/zuora-service/server/target
+      - setup_remote_docker
+      - run:
+          command: publish
+      - run:
+          command: deploy
+      - store_artifacts:
+          path: ccc-image-scan-results
+
+workflows:
+  version: 2
+  build-and-deploy:
+    jobs:
+      - test:
+          context: org-global
+      - build:
+          context: org-global
+          requires:
+            - test
+      - test-container-build:
+          context: org-global
+          requires:
+            - build
+          filters:
+            branches:
+              ignore:
+                - master
+                - canary
+      - check-schema:
+          context: org-global
+      - deploy-migrator:
+          context: org-global
+          requires:
+            - build
+          filters:
+            branches:
+              only: master
+      - deploy-service:
+          context: org-global
+          requires:
+            - deploy-migrator
+          filters:
+            branches:
+              only: master
+      - deploy-canary:
+          context: org-global
+          requires:
+            - build
+          filters:
+            branches:
+              only: canary

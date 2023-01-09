@@ -1,0 +1,164 @@
+version: 2.1
+
+ccc: &ccc circleci/command-convenience:0.1
+
+workflows:
+  version: 2
+  test-and-deploy:
+    jobs:
+      - test
+      - test-container-build:
+          context: org-global
+          filters:
+            branches:
+              ignore: master
+      - deploy:
+          context: org-global
+          requires:
+            - test
+          filters:
+            branches:
+              only: master
+      - deploy-canary:
+          context: org-global
+          requires:
+            - test
+          filters:
+            branches:
+              only: canary
+  weekly-rebuild-on-master:
+    jobs:
+      - test
+      - test-container-build:
+          context: org-global
+      - deploy:
+          context: org-global
+          requires:
+            - test
+    triggers:
+      - schedule:
+          cron: "0 8 * * 1"
+          filters:
+            branches:
+              only:
+                - master
+
+jobs:
+  test:
+    machine:
+      image: ubuntu-2004:2022.04.1
+      docker_layer_caching: true
+    environment:
+      # Keep the same project name as a local checkout, which will be in a directory named www-proxy
+      COMPOSE_PROJECT_NAME: www-proxy
+    steps:
+      - checkout
+      - run: docker-compose build
+      - run: docker-compose -f docker-compose-tests.yml build tests
+
+      # prevent a network create race condition
+      # https://github.com/moby/moby/issues/20648
+      - run: |
+          if [[ -z "$(docker network ls -q --filter 'name=^www-proxy$')" ]]; then
+            docker network create www-proxy
+          fi
+
+      - run:
+          background: true
+          command: docker-compose up
+      - run: docker-compose -f docker-compose-tests.yml run tests
+      - run:
+          name: Assert that logs exist but they don't contain tokens
+          command: |
+            set -euo pipefail
+
+            CIRCLE_TOKEN=MYSUPERSECRETCIRCLETOKEN
+
+            for x in {1..100}; do
+                curl -H "Host: circleci.com" http://localhost:8080/?circle-token=${CIRCLE_TOKEN} >/dev/null 2>&1 &
+            done
+
+            wait
+
+            # there are logs
+            docker-compose logs nginx | grep 'limiting requests' >/dev/null 2>&1
+
+            # the logs have `REDACTED` in them, because the credential was removed
+            docker-compose logs nginx | grep 'REDACTED' >/dev/null 2>&1
+
+            # there are no logs with the CIRCLE_TOKEN
+            ! docker-compose logs nginx | grep ${CIRCLE_TOKEN} >/dev/null 2>&1
+      - run:
+          name: "Ensure /var/log/nginx contains no spurious directory entries"
+          command: |
+            set -xu
+            cat - >/tmp/var-log-nginx-dirents-expected \<<'EOF'
+            /var/log/nginx/access.log
+            /var/log/nginx/error.log
+            EOF
+
+            diff -u \
+              <(docker-compose exec -T nginx find /var/log/nginx -mindepth 1 | sort) \
+              /tmp/var-log-nginx-dirents-expected
+
+            rm /tmp/var-log-nginx-dirents-expected
+
+  # The 'test-container-build' job runs through _most_ of the 'deploy' job but
+  # stops short of actually publishing the container image to a registry.
+  test-container-build:
+    docker:
+      - image: *ccc
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: www-proxy
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: none
+          TWISTLOCK_ENFORCE: false #https://circleci.atlassian.net/browse/INFRA-4340
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: publish
+
+  deploy:
+    docker:
+      - image: *ccc
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: www-proxy
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: all
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/www-proxy
+          VALUES_FILE: k8s-values.yaml
+          TWISTLOCK_ENFORCE: false #https://circleci.atlassian.net/browse/INFRA-4340
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: publish
+      - run: deploy
+
+  deploy-canary:
+    docker:
+      - image: *ccc
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: www-proxy
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: all
+          DEPLOY_TYPE: helm
+          DEPLOY_CONTAINER_NAME: 183081753049.dkr.ecr.us-east-1.amazonaws.com/circleci/www-proxy
+          VALUES_FILE: canary.yaml
+          RELEASE_VERSION: canary
+          TWISTLOCK_ENFORCE: false #https://circleci.atlassian.net/browse/INFRA-4340
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: /deploy/merge-values k8s-values.yaml canary-overrides.yaml > canary.yaml
+      - run: publish
+      - run: deploy

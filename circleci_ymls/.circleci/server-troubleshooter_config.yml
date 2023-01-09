@@ -1,0 +1,28 @@
+version: 2.1
+
+jobs:
+  publish-and-deploy:
+    docker:
+      - image: circleci/command-convenience:0.1.991-df8dc90
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: server-troubleshooter
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: dockerhub
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: TWISTLOCK_ENFORCE=false publish
+      - run: publish
+
+workflows:
+  version: 2
+  publish-deploy:
+    jobs:
+      - publish-and-deploy:
+          context: org-global
+          filters:
+            branches:
+              only: master

@@ -1,0 +1,81 @@
+---
+version: 2.1
+
+executors:
+  ccc:
+    docker:
+      - image: circleci/command-convenience:0.1
+        auth:
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        environment:
+          NAME: k8s-event-exporter
+          MAJOR_VERSION: "v0.11"
+          DOCKERFILE_PATH: Dockerfile
+          DOCKER_REGISTRY: ecr
+          IMAGE_NAME: circleci/k8s-event-exporter
+          RELEASE_SUFFIX: ""
+          NAMESPACE: event-blower
+          TWISTLOCK_ENFORCE: false
+          CONFIGURE_ECR_REPO: true
+          ECR_OWNER_TEAM: sre
+          CUSTOM_CHART: k8s-event-exporter
+
+commands:
+  initialize:
+    description: Initial CI setup before CCC runs
+    steps:
+      - checkout
+      - setup_remote_docker
+      # Inject the Docker image version(tag)
+      - run: sed "s/MAJOR_VERSION/$MAJOR_VERSION/g" Dockerfile > tmp && mv tmp Dockerfile
+      # Override some chart values with template that CCC expects
+      - run: cp k8s-event-exporter/Chart.yaml /tmp/Chart.yaml
+      # Inject the Helm appVersion
+      - run: sed "s/MAJOR_VERSION/$MAJOR_VERSION/g" /tmp/Chart.yaml > tmp && mv tmp /tmp/Chart.yaml
+      - run: /deploy/merge-values /tmp/Chart.yaml chart-CI-overrides.yml > k8s-event-exporter/Chart.yaml
+      # Apply values now because CCC does not allow using custom values file with custom chart
+      - run: cp k8s-event-exporter/values.yaml /tmp/values.yaml
+      - run: /deploy/merge-values /tmp/values.yaml values-prod.yml > k8s-event-exporter/values.yaml
+
+jobs:
+  test:
+    executor: ccc
+    steps:
+      - initialize
+      - run: |
+          scan
+      - run: |
+          /deploy/dry-run
+  install:
+    executor: ccc
+    steps:
+      - initialize
+      - run: |
+          export CONTAINER_VERSION="${MAJOR_VERSION}-${CIRCLE_BUILD_NUM}.$(git rev-parse --short HEAD)"
+          publish
+      - run: |
+          export CONTAINER_VERSION="${MAJOR_VERSION}-${CIRCLE_BUILD_NUM}.$(git rev-parse --short HEAD)"
+          deploy
+
+
+
+workflows:
+  version: 2
+  install-application:
+    jobs:
+      - test:
+          context:
+            - org-global
+            - infra-admin-deploy
+          filters:
+             branches:
+               ignore: main
+      - install:
+          context:
+            - org-global
+            - infra-admin-deploy
+          filters:
+            branches:
+              only: main
+

@@ -1,0 +1,76 @@
+version: 2.1
+
+executors:
+  asciidoc:
+    docker:
+      - image: asciidoctor/docker-asciidoctor:1.1.0
+
+jobs:
+  build-2:
+    executor: asciidoc
+    steps:
+      - checkout
+      - run:
+          name: Build asciidoc pdfs for Server 2.19
+          command: |
+            ./scripts/build_asciidoc_pdfs.sh
+      - store_artifacts: 
+          path: release/tmp/
+
+  build-3:
+    executor: asciidoc
+    steps:
+      - checkout
+      - run:
+          name: Build asciidoc pdfs for Server 3.0
+          command: |
+            ./scripts/build_pdf_3_beta.sh
+      - store_artifacts: 
+          path: release/tmp/
+      - persist_to_workspace:
+          root: release/tmp/
+          paths:
+            - .
+  release:
+    parameters:
+      server-version:
+        default: "3-beta"
+        type: enum
+        enum: ["3-beta"]
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - add_ssh_keys:
+          fingerprints:
+            - "bc:92:05:ee:1f:5a:49:4f:7f:98:a6:9d:b7:77:8e:05"
+      - attach_workspace:
+          at: ./release/<<parameters.server-version>>/tmp
+      - run:
+          name: check diff
+          command: |
+            bash scripts/check_diff_pdfs.sh <<parameters.server-version>>
+      - run:
+          name: setup git
+          command: |
+            git config --global user.name $GIT_USER
+            git config --global user.email $GIT_EMAIL
+      - run:
+          name: release PDFs
+          command: |
+            git add .
+            git commit -m '[ci skip] add new Server PDF'
+            git push origin master
+workflows:
+  workflow:
+    jobs:
+      - build-2
+      - build-3
+      - release:
+          requires:
+            - build-3
+          filters:
+            branches:
+              only:
+                - master
+          server-version: "3-beta"
