@@ -22,7 +22,7 @@ jobs:
           at: ~/project
       - run:
           name: Run tests
-          command: npm tests
+          command: npm test
       - store_test_results:
           path: junit.xml
 
