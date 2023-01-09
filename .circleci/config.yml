@@ -48,8 +48,6 @@ workflows:
   install-and-test:
     jobs:
       - install
-      - install
-      - install
       - approve:
           type: approval
           requires:
