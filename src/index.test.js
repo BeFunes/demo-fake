@@ -8,7 +8,7 @@ describe("tools/utils", function () {
         expected: 5000,
       },
       {
-        input: [8, 21],
+        input: [8, 20],
         expected: 4,
       },
       {
