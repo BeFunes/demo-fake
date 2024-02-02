@@ -16,6 +16,7 @@ jobs:
       - checkout
       - run: npm ci
       - run: npm run build
+      - run: echo "________________________________________________________"
       - persist_to_workspace:
           root: .
           paths:
