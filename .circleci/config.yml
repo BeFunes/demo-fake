@@ -7,6 +7,9 @@ jobs:
     steps:
       - checkout
       - run:
+          name: Sleep 10
+          command: sleep 10
+      - run:
           name: Install dependencies
           command: npm install
       - persist_to_workspace:
