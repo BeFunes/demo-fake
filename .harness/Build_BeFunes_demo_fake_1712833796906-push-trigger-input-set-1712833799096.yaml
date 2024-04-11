@@ -1,0 +1,14 @@
+inputSet:
+  name: Build_BeFunes_demo_fake_1712833796906-push-trigger-input-set
+  identifier: Build_BeFunes_demo_fake_1712833796906pushtriggerinputset
+  orgIdentifier: default
+  projectIdentifier: default_project
+  pipeline:
+    identifier: Build_BeFunes_demo_fake_1712833796906
+    properties:
+      ci:
+        codebase:
+          build:
+            type: branch
+            spec:
+              branch: <+trigger.branch>
