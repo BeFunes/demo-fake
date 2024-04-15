@@ -1,0 +1,14 @@
+inputSet:
+  name: Build_BeFunes_demo_fake_1713202908668-pr-trigger-input-set
+  identifier: Build_BeFunes_demo_fake_1713202908668prtriggerinputset
+  orgIdentifier: default
+  projectIdentifier: myproject
+  pipeline:
+    identifier: Build_BeFunes_demo_fake_1713202908668
+    properties:
+      ci:
+        codebase:
+          build:
+            type: PR
+            spec:
+              number: <+trigger.prNumber>
