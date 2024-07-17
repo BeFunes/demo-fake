@@ -48,13 +48,13 @@ workflows:
   install-and-test:
     jobs:
       - install
-      - approve:
-          type: approval
-          requires:
-            - install
+      # - approve:
+      #     type: approval
+      #     requires:
+      #       - install
       - test:
           requires:
-            - approve
+            - install
       - store-artifacts:
           requires:
-            - approve
+            - install
