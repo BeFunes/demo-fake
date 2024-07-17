@@ -52,5 +52,9 @@ workflows:
       #     type: approval
       #     requires:
       #       - install
-      - test
-      - store-artifacts
+      - test:
+          requires:
+            - install
+      - store-artifacts:
+          requires:
+            - install
