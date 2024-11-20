@@ -1,60 +1,52 @@
 version: 2.1
 
 jobs:
-  install:
+  lint:
     docker:
-      - image: cimg/node:17.9.1
+      - image: cimg/node:20.10.0
     steps:
       - checkout
-      - run:
-          name: Install dependencies
-          command: npm install
+      - run: npm ci
+      - run: npm run lint
+
+  build:
+    docker:
+      - image: cimg/node:20.10.0
+    steps:
+      - checkout
+      - run: npm ci
+      - run: npm run build
+      - run: echo "________________________________________________________"
       - persist_to_workspace:
-          root: ~/project
+          root: .
           paths:
-            - node_modules
+            - dist
 
   test:
     docker:
-      - image: cimg/node:17.9.1
+      - image: cimg/node:20.10.0
     steps:
       - checkout
-      - attach_workspace:
-          at: ~/project
-      - run:
-          name: Run tests
-          command: npm test
-      - store_test_results:
-          path: junit.xml
+      - run: npm ci
+      - run: npm run test
 
-  store-artifacts:
+  deploy:
     docker:
       - image: cimg/node:17.9.1
     steps:
-      - checkout
       - attach_workspace:
-          at: ~/project
-      - run:
-          name: Zip node_modules
-          command: zip -r node_modules.zip node_modules
-      - store_artifacts:
-          path: ~/project/node_modules.zip
-          destination: big-artifact.zip
-      - store_artifacts:
-          path: ~/project/package.json
-          destination: small-artifact.json
+          at: .
+      - run: echo "Pushing to production..."
 
 workflows:
-  install-and-test:
+  Build & Deploy:
     jobs:
-      - install
-      - approve:
-          type: approval
-          requires:
-            - install
+      - lint
       - test:
           requires:
-            - approve
-      - store-artifacts:
+            - lint
+      - build
+      - deploy:
           requires:
-            - approve
+            - test
+            - build
