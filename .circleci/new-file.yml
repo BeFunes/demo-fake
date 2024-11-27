@@ -5,15 +5,10 @@ jobs:
     docker:
       - image: cimg/node:17.9.1
     steps:
+      - checkout
       - run:
-          name: print pipeline.git.branch
-          command: echo "<< pipeline.git.branch >>"
-      # - run:
-      #     name: print pipeline.trigger_parameters.github_app.branch
-      #     command: echo "<< pipeline.trigger_parameters.github_app.branch >>"
-      - run:
-          name: print stuff
-          command: cat NEW FILE
+          name: cat README
+          command: cat README.md
 
 workflows:
   github-app-workflow:
