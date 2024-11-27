@@ -1,0 +1,21 @@
+version: 2.1
+
+jobs:
+  job1:
+    docker:
+      - image: cimg/node:17.9.1
+    steps:
+      - run:
+          name: print pipeline.git.branch
+          command: echo "<< pipeline.git.branch >>"
+      # - run:
+      #     name: print pipeline.trigger_parameters.github_app.branch
+      #     command: echo "<< pipeline.trigger_parameters.github_app.branch >>"
+      - run:
+          name: print stuff
+          command: cat NEW FILE
+
+workflows:
+  github-app-workflow:
+    jobs:
+      - job1
