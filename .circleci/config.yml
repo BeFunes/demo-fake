@@ -1,60 +1,21 @@
 version: 2.1
 
 jobs:
-  install:
+  fake-unit-tests:
     docker:
       - image: cimg/node:17.9.1
     steps:
-      - checkout
       - run:
-          name: Install dependencies
-          command: npm install
-      - persist_to_workspace:
-          root: ~/project
-          paths:
-            - node_modules
-
-  test:
-    docker:
-      - image: cimg/node:17.9.1
-    steps:
-      - checkout
-      - attach_workspace:
-          at: ~/project
+          name: print pipeline.git.branch
+          command: echo "<< pipeline.git.branch >>"
+      # - run:
+      #     name: print pipeline.trigger_parameters.github_app.branch
+      #     command: echo "<< pipeline.trigger_parameters.github_app.branch >>"
       - run:
-          name: Run tests
-          command: npm test
-      - store_test_results:
-          path: junit.xml
-
-  store-artifacts:
-    docker:
-      - image: cimg/node:17.9.1
-    steps:
-      - checkout
-      - attach_workspace:
-          at: ~/project
-      - run:
-          name: Zip node_modules
-          command: zip -r node_modules.zip node_modules
-      - store_artifacts:
-          path: ~/project/node_modules.zip
-          destination: big-artifact.zip
-      - store_artifacts:
-          path: ~/project/package.json
-          destination: small-artifact.json
+          name: print stuff
+          command: cat "HELLO"
 
 workflows:
-  install-and-test:
+  my-workflow:
     jobs:
-      - install
-      - approve:
-          type: approval
-          requires:
-            - install
-      - test:
-          requires:
-            - approve
-      - store-artifacts:
-          requires:
-            - approve
+      - fake-unit-tests
