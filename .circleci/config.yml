@@ -13,7 +13,7 @@ jobs:
       #     command: echo "<< pipeline.trigger_parameters.github_app.branch >>"
       - run:
           name: print stuff
-          command: cat "HELLO"
+          command: cat README.md
 
 workflows:
   my-workflow:
