@@ -13,7 +13,7 @@ jobs:
       - run:
           name: "Print event action (1)"
           environment:
-            EVENT_ACTION: echo << pipeline.trigger_parameters.webhook.body >> | jq '.payload.action'
+            EVENT_ACTION: echo '<< pipeline.trigger_parameters.webhook.body >>' | jq '.payload.action'
           command: echo "$EVENT_ACTION"
       # - run:
       #     name: "Print event action (2)"
