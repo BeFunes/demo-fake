@@ -6,12 +6,6 @@ jobs:
       - image: cimg/node:17.9.1
     steps:
       - checkout
-      - run:
-          name: cat README
-          command: cat README.md
-      - run:
-          name: echo
-          command: echo "This config is defined in NEW-trigger-repo"
 
 workflows:
   do_some_stuff:
