@@ -15,9 +15,11 @@ jobs:
           environment:
             EVENT_ACTION: << pipeline.trigger_parameters.webhook.body >> | sed 's/\\"/"/g' | jq '.action'
           command: echo "$EVENT_ACTION"
-      # - run:
-      #     name: "Print event action (2)"
-      #     command: echo << pipeline.trigger_parameters.webhook.body >> | jq '.payload.action'
+      - run:
+          name: "Print event action (2)"
+          command: |
+            EVENT_ACTION=$(echo '<< pipeline.trigger_parameters.webhook.body >>' | jq '.action')
+            echo "Action is: $EVENT_ACTION"
       
 workflows:
   do_some_stuff:
