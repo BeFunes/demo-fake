@@ -14,7 +14,7 @@ jobs:
           name: "Print event action"
           environment:
             EVENT_ACTION: << pipeline.trigger_parameters.webhook.body >> | jq .action
-          command: echo EVENT_ACTION
+          command: echo $EVENT_ACTION
 
 workflows:
   do_some_stuff:
