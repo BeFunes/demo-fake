@@ -1,60 +1,12 @@
 version: 2.1
 
 jobs:
-  install:
+  myjob:
     docker:
       - image: cimg/node:17.9.1
     steps:
       - checkout
-      - run:
-          name: Install dependencies
-          command: npm install
-      - persist_to_workspace:
-          root: ~/project
-          paths:
-            - node_modules
-
-  test:
-    docker:
-      - image: cimg/node:17.9.1
-    steps:
-      - checkout
-      - attach_workspace:
-          at: ~/project
-      - run:
-          name: Run tests
-          command: npm test
-      - store_test_results:
-          path: junit.xml
-
-  store-artifacts:
-    docker:
-      - image: cimg/node:17.9.1
-    steps:
-      - checkout
-      - attach_workspace:
-          at: ~/project
-      - run:
-          name: Zip node_modules
-          command: zip -r node_modules.zip node_modules
-      - store_artifacts:
-          path: ~/project/node_modules.zip
-          destination: big-artifact.zip
-      - store_artifacts:
-          path: ~/project/package.json
-          destination: small-artifact.json
 
 workflows:
-  install-and-test:
+  do_some_stuff:
     jobs:
-      - install
-      # - approve:
-      #     type: approval
-      #     requires:
-      #       - install
-      - test:
-          requires:
-            - install
-      - store-artifacts:
-          requires:
-            - install
