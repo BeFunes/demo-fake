@@ -10,3 +10,4 @@ jobs:
 workflows:
   do_some_stuff:
     jobs:
+      - myjob
