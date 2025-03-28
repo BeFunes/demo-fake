@@ -19,7 +19,9 @@ jobs:
           name: "Print event action (2)"
           command: |
             EVENT_ACTION=$(echo '<< pipeline.trigger_parameters.webhook.body >>' | jq '.action')
+            EVENT_BRANCH=$(echo '<< pipeline.trigger_parameters.webhook.body >>' | jq '.pull_request.head.ref')
             echo "Action is: $EVENT_ACTION"
+            echo "Branch is: $EVENT_BRANCH"
       
 workflows:
   do_some_stuff:
