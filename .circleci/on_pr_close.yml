@@ -9,7 +9,6 @@ jobs:
       - image: cimg/node:17.9.1
     steps:
       - checkout
-      - jq/install
       - run:
           name: "Extract webhook properties"
           command: |
