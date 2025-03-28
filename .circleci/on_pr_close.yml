@@ -11,7 +11,7 @@ jobs:
       - checkout
       - jq/install
       - run:
-          name: "Setup custom environment variables"
+          name: "Print event action"
           environment:
             EVENT_ACTION: << pipeline.trigger_parameters.webhook.body >> | jq .action
           command: echo EVENT_ACTION
