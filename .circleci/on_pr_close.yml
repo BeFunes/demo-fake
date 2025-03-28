@@ -1,0 +1,19 @@
+version: 2.1
+
+jobs:
+  myjob:
+    docker:
+      - image: cimg/node:17.9.1
+    steps:
+      - checkout
+      - jq/install
+      - run:
+          name: "Setup custom environment variables"
+          environment:
+            EVENT_ACTION: << pipeline.trigger_parameters.webhook.body >> | jq .action
+          command: echo EVENT_ACTION
+
+workflows:
+  do_some_stuff:
+    jobs:
+      - myjob
