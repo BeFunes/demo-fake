@@ -1,13 +1,33 @@
 version: 2.1
 
 jobs:
-  myjob:
+  my_job:
     docker:
       - image: cimg/node:17.9.1
     steps:
       - checkout
+      # - run:
+      #     name: cat README
+      #     command: cat README.md
+
+      # - run:
+      #     name: echo
+      #     command: echo "This config is defined in NEW-trigger-repo"
+      - run:
+          name: event.name
+          command: echo << pipeline.event.name >>
+      - run:
+          name: event.action
+          command: echo << pipeline.event.action >>
 
 workflows:
-  do_some_stuff:
+  runs-only-on-pull-request:
+    when: (pipeline.event.name == "pull_request" and pipeline.event.action == "labeled") or (pipeline.event.name == "pull_request" and pipeline.event.action == "synchronize")
     jobs:
-      - myjob
+      - my_job
+  runs-only-on-push:
+    when: pipeline.event.name == "push" 
+    jobs:
+      - my_job
+
+  
