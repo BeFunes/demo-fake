@@ -1,0 +1,22 @@
+version: 2.1
+
+jobs:
+  myjob:
+    docker:
+      - image: cimg/node:17.9.1
+    steps:
+      - checkout
+      - run:
+          name: cat "auto-tag"
+          command: |
+            echo "auto-tag"
+            echo <<pipeline.event.name>>
+            echo <<pipeline.event.github.head_commit.url>>
+            echo <<pipeline.git.revision>>
+            echo <<pipeline.git.commit.url>>
+      
+
+workflows:
+  end_to_end_tests:
+    jobs:
+      - myjob
