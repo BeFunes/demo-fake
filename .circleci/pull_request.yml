@@ -1,0 +1,19 @@
+version: 2.1
+
+jobs:
+  myjob:
+    docker:
+      - image: cimg/node:17.9.1
+    steps:
+      - checkout
+      - run:
+          name: cat README
+          command: cat README.md
+      - run:
+          name: echo
+          command: echo "pull request"
+
+workflows:
+  do_some_stuff:
+    jobs:
+      - myjob
